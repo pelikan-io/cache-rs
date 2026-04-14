@@ -175,9 +175,8 @@ impl S3Fifo {
         let optional = optional.unwrap_or(&[]);
 
         // Calculate aligned item size (same formula as segcache)
-        let size = (((ITEM_HDR_SIZE + key.len() + item::size_of(&value) + optional.len()) >> 3)
-            + 1)
-            << 3;
+        let size =
+            (((ITEM_HDR_SIZE + key.len() + item::size_of(&value) + optional.len()) >> 3) + 1) << 3;
 
         // Check if item is too large
         if size > self.heap_size {
@@ -391,13 +390,9 @@ impl S3Fifo {
     pub fn clear(&mut self) -> usize {
         let count = self.live_items;
 
-        while let Some(index) = self.small.pop_front() {
-            self.slab.free(index);
-        }
-        while let Some(index) = self.main.pop_front() {
-            self.slab.free(index);
-        }
-
+        self.small.clear();
+        self.main.clear();
+        self.slab.clear();
         self.hashtable.clear();
         self.ghost.clear();
         self.current_bytes = 0;
@@ -525,12 +520,10 @@ impl S3Fifo {
     /// Drain one non-tombstone item from the small queue. Returns true if an
     /// item was processed (promoted or evicted).
     fn drain_small_one(&mut self) -> bool {
-        loop {
-            match self.process_small_head() {
-                ProcessResult::Freed | ProcessResult::Moved => return true,
-                ProcessResult::Empty => return false,
-            }
-        }
+        matches!(
+            self.process_small_head(),
+            ProcessResult::Freed | ProcessResult::Moved
+        )
     }
 
     /// Pop the head of the small queue and process it according to S3-FIFO:

@@ -34,34 +34,19 @@ pub static HASH_REMOVE: Counter = Counter::new();
 pub static HASH_LOOKUP: Counter = Counter::new();
 
 // item related
-#[metric(
-    name = "s3fifo_item_insert",
-    description = "number of items inserted"
-)]
+#[metric(name = "s3fifo_item_insert", description = "number of items inserted")]
 pub static ITEM_INSERT: Counter = Counter::new();
 
-#[metric(
-    name = "s3fifo_item_replace",
-    description = "number of items replaced"
-)]
+#[metric(name = "s3fifo_item_replace", description = "number of items replaced")]
 pub static ITEM_REPLACE: Counter = Counter::new();
 
-#[metric(
-    name = "s3fifo_item_delete",
-    description = "number of items deleted"
-)]
+#[metric(name = "s3fifo_item_delete", description = "number of items deleted")]
 pub static ITEM_DELETE: Counter = Counter::new();
 
-#[metric(
-    name = "s3fifo_item_evict",
-    description = "number of items evicted"
-)]
+#[metric(name = "s3fifo_item_evict", description = "number of items evicted")]
 pub static ITEM_EVICT: Counter = Counter::new();
 
-#[metric(
-    name = "s3fifo_item_expire",
-    description = "number of items expired"
-)]
+#[metric(name = "s3fifo_item_expire", description = "number of items expired")]
 pub static ITEM_EXPIRE: Counter = Counter::new();
 
 #[metric(

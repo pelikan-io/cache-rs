@@ -56,14 +56,14 @@ fn delete() {
         .build()
         .expect("failed to create cache");
 
-    assert_eq!(cache.delete(b"key"), false);
+    assert!(!cache.delete(b"key"));
 
     cache
         .insert(b"key", b"value", None, Duration::ZERO)
         .expect("insert failed");
     assert_eq!(cache.items(), 1);
 
-    assert_eq!(cache.delete(b"key"), true);
+    assert!(cache.delete(b"key"));
     assert_eq!(cache.items(), 0);
     assert!(cache.get(b"key").is_none());
 }

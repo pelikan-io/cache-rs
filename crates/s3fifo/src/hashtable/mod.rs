@@ -195,8 +195,7 @@ impl HashTable {
 
         // No empty slot, try to chain a new bucket
         let primary = (hash & self.mask) as usize;
-        if chain_length < MAX_CHAIN_LEN as usize
-            && (self.next_to_chain as usize) < self.data.len()
+        if chain_length < MAX_CHAIN_LEN as usize && (self.next_to_chain as usize) < self.data.len()
         {
             // Chase to end of chain
             let mut last_bucket = primary;

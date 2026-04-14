@@ -3,9 +3,6 @@
 mod header;
 mod raw;
 
-#[cfg(any(feature = "magic", feature = "debug"))]
-pub(crate) use header::ITEM_MAGIC_SIZE;
-
 use crate::S3FifoError;
 use crate::Value;
 

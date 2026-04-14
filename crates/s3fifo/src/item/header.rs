@@ -31,13 +31,6 @@ pub const ITEM_HDR_SIZE: usize = std::mem::size_of::<crate::item::ItemHeader>();
 #[cfg(feature = "magic")]
 /// The magic bytes to store at the start of the item
 pub const ITEM_MAGIC: u32 = 0xDECAFBAD;
-#[cfg(feature = "magic")]
-/// The length of the item magic in bytes
-pub const ITEM_MAGIC_SIZE: usize = std::mem::size_of::<u32>();
-#[cfg(not(feature = "magic"))]
-#[allow(dead_code)]
-/// The length of the item magic in bytes
-pub const ITEM_MAGIC_SIZE: usize = 0;
 
 // masks and shifts
 // klen/vlen pack together

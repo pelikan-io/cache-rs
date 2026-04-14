@@ -61,13 +61,7 @@ impl Slab {
     }
 
     /// Allocate a new slab entry and return its index
-    pub fn allocate(
-        &mut self,
-        size: usize,
-        hash: u64,
-        expire_at: u32,
-        queue: Queue,
-    ) -> u32 {
+    pub fn allocate(&mut self, size: usize, hash: u64, expire_at: u32, queue: Queue) -> u32 {
         let data = vec![0u8; size].into_boxed_slice();
         let item_data = ItemData {
             data,
@@ -120,11 +114,6 @@ impl Slab {
             Some(SlabEntry::Occupied(data)) => Some(data),
             _ => None,
         }
-    }
-
-    /// Return the number of occupied (allocated) entries
-    pub fn len(&self) -> u32 {
-        self.len
     }
 
     /// Clear all entries

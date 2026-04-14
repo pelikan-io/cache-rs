@@ -95,9 +95,7 @@ fn integration_numeric() {
     let item = cache.wrapping_add(b"counter", 50).expect("add failed");
     assert_eq!(item.value(), 150_u64);
 
-    let item = cache
-        .saturating_sub(b"counter", 200)
-        .expect("sub failed");
+    let item = cache.saturating_sub(b"counter", 200).expect("sub failed");
     assert_eq!(item.value(), 0_u64);
 
     // Non-numeric wrapping_add should fail
