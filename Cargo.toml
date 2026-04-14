@@ -16,7 +16,6 @@ blake3 = "1.8.3"
 clocksource = "0.8.3"
 criterion = "0.8.2"
 datatier = { path = "crates/datatier", version = "0.1.0" }
-libc = "0.2.183"
 log = "0.4.29"
 memmap2 = "0.9.10"
 metriken = "0.7.0"

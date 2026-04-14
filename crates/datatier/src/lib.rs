@@ -9,9 +9,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{Error, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
-
 use memmap2::{MmapMut, MmapOptions};
 
 const PAGE_SIZE: usize = 4096;
@@ -699,7 +696,7 @@ mod tests {
     #[test]
     fn mmapfile_datapool() {
         let tempdir = TempDir::new().expect("failed to generate tempdir");
-        let mut path = tempdir.into_path();
+        let mut path = tempdir.keep();
         path.push("mmap_test.data");
 
         let magic_a = [0xDE, 0xCA, 0xFB, 0xAD];
@@ -748,7 +745,7 @@ mod tests {
     #[test]
     fn filebackedmemory_datapool() {
         let tempdir = TempDir::new().expect("failed to generate tempdir");
-        let mut path = tempdir.into_path();
+        let mut path = tempdir.keep();
         path.push("mmap_test.data");
 
         let magic_a = [0xDE, 0xCA, 0xFB, 0xAD];

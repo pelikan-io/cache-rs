@@ -11,7 +11,6 @@ license = { workspace = true }
 [dependencies]
 blake3 = { workspace = true }
 clocksource = { workspace = true }
-libc = { workspace = true }
 memmap2 = { workspace = true }
 
 [dev-dependencies]
