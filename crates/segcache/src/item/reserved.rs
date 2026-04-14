@@ -1,5 +1,5 @@
 // Copyright 2021 Twitter, Inc.
-// Copyright 2026 Pelikan Cache contributors
+// Copyright 2023 Pelikan Cache contributors
 // Licensed under the MIT and Apache-2.0 licenses
 
 //! A reserved item is an item which has been allocated, but has not been

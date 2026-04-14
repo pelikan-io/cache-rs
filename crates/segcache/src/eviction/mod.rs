@@ -1,5 +1,5 @@
 // Copyright 2021 Twitter, Inc.
-// Copyright 2026 Pelikan Cache contributors
+// Copyright 2023 Pelikan Cache contributors
 // Licensed under the MIT and Apache-2.0 licenses
 
 //! Eviction is used to select a segment to remove when the cache becomes full.
