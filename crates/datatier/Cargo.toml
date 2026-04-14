@@ -1,0 +1,17 @@
+[package]
+name = "datatier"
+version = "0.1.0"
+description = "Abstractions for byte storage pools"
+authors = ["Brian Martin <brian@pelikan.io>"]
+
+edition = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+blake3 = { workspace = true }
+clocksource = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.3.0"
