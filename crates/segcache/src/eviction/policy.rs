@@ -4,7 +4,7 @@
 
 /// Policies define the eviction strategy to be used. All eviction strategies
 /// exclude segments which are currently accepting new items.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug)]
 pub enum Policy {
     /// No eviction. When all the segments are full, inserts will fail until
     /// segments are freed by TTL expiration.
@@ -70,9 +70,9 @@ pub enum Policy {
     /// If a newly inserted key's hash is found in the ghost queue, the item
     /// is written directly to a main-pool segment instead of small.
     S3Fifo {
-        /// Percentage of total segments allocated to the small (probation)
-        /// pool. The remaining segments form the main pool. Typical values
-        /// are 5–20. Default: 10.
-        small_ratio: u8,
+        /// Ratio of total segments allocated to the small (probation)
+        /// pool, between 0.0 and 1.0. The remaining segments form the
+        /// main pool. Typical values are 0.05–0.20. Default: 0.10.
+        small_ratio: f64,
     },
 }

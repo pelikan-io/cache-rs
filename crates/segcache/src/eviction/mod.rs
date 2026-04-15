@@ -242,13 +242,13 @@ impl Eviction {
     }
 
     #[inline]
-    /// Returns the small-pool ratio for S3-FIFO (0–100). Returns 0 for
+    /// Returns the small-pool ratio for S3-FIFO (0.0–1.0). Returns 0.0 for
     /// non-S3Fifo policies.
-    pub fn small_ratio(&self) -> u8 {
+    pub fn small_ratio(&self) -> f64 {
         if let Policy::S3Fifo { small_ratio } = self.policy {
             small_ratio
         } else {
-            0
+            0.0
         }
     }
 }

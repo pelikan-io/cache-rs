@@ -1006,10 +1006,11 @@ impl Segments {
     ) -> Result<(), SegmentsError> {
         // Count segments in each pool to decide which to drain
         let (small_count, total_count) = self.pool_counts();
-        let small_ratio = self.evict.small_ratio() as u32;
+        let small_ratio = self.evict.small_ratio();
 
         // Prefer evicting from small if it exceeds its quota, otherwise main
-        let small_over_quota = total_count > 0 && small_count * 100 >= small_ratio * total_count;
+        let small_over_quota =
+            total_count > 0 && (small_count as f64 / total_count as f64) >= small_ratio;
 
         let (first_pool, second_pool) = if small_over_quota {
             (SegmentPool::Small, SegmentPool::Main)
