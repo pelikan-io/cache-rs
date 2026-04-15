@@ -3,7 +3,6 @@
 // Licensed under the MIT and Apache-2.0 licenses
 
 use crate::eviction::*;
-use crate::item::*;
 use crate::segments::*;
 use core::num::NonZeroU32;
 use datatier::*;

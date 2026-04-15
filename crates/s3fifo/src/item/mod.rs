@@ -1,13 +1,7 @@
 //! Items are the base unit of data stored within the cache.
 
-mod header;
-mod raw;
-
 use crate::S3FifoError;
-use crate::Value;
-
-pub(crate) use header::{ItemHeader, ITEM_HDR_SIZE};
-pub(crate) use raw::RawItem;
+use keyvalue::{RawItem, Value};
 
 /// Items are the base unit of data stored within the cache.
 pub struct Item {
@@ -55,13 +49,17 @@ impl Item {
     /// Perform a wrapping addition on the value. Returns an error if the item
     /// is not a numeric type.
     pub fn wrapping_add(&mut self, rhs: u64) -> Result<(), S3FifoError> {
-        self.raw.wrapping_add(rhs)
+        self.raw
+            .wrapping_add(rhs)
+            .map_err(|_| S3FifoError::NotNumeric)
     }
 
     /// Perform a saturating subtraction on the value. Returns an error if the
     /// item is not a numeric type.
     pub fn saturating_sub(&mut self, rhs: u64) -> Result<(), S3FifoError> {
-        self.raw.saturating_sub(rhs)
+        self.raw
+            .saturating_sub(rhs)
+            .map_err(|_| S3FifoError::NotNumeric)
     }
 }
 
@@ -71,12 +69,5 @@ impl std::fmt::Debug for Item {
             .field("cas", &self.cas())
             .field("raw", &self.raw)
             .finish()
-    }
-}
-
-pub fn size_of(value: &Value) -> usize {
-    match value {
-        Value::Bytes(v) => v.len(),
-        Value::U64(_) => core::mem::size_of::<u64>(),
     }
 }

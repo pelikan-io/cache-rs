@@ -175,8 +175,7 @@ impl S3Fifo {
         let optional = optional.unwrap_or(&[]);
 
         // Calculate aligned item size (same formula as segcache)
-        let size =
-            (((ITEM_HDR_SIZE + key.len() + item::size_of(&value) + optional.len()) >> 3) + 1) << 3;
+        let size = (((ITEM_HDR_SIZE + key.len() + size_of(&value) + optional.len()) >> 3) + 1) << 3;
 
         // Check if item is too large
         if size > self.heap_size {
@@ -418,7 +417,7 @@ impl S3Fifo {
 
         let entry = self.slab.get_mut(index).ok_or(S3FifoError::NotFound)?;
         let mut raw = RawItem::from_ptr(entry.data.as_mut_ptr());
-        raw.wrapping_add(rhs)?;
+        raw.wrapping_add(rhs).map_err(|_| S3FifoError::NotNumeric)?;
 
         let cas = self.hashtable.get_cas(hash);
         Ok(Item::new(raw, cas))
@@ -435,7 +434,8 @@ impl S3Fifo {
 
         let entry = self.slab.get_mut(index).ok_or(S3FifoError::NotFound)?;
         let mut raw = RawItem::from_ptr(entry.data.as_mut_ptr());
-        raw.saturating_sub(rhs)?;
+        raw.saturating_sub(rhs)
+            .map_err(|_| S3FifoError::NotNumeric)?;
 
         let cas = self.hashtable.get_cas(hash);
         Ok(Item::new(raw, cas))

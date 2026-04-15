@@ -34,7 +34,6 @@ mod hashtable;
 mod item;
 mod s3fifo;
 mod slab;
-mod value;
 
 #[cfg(feature = "metrics")]
 mod metrics;
@@ -48,12 +47,12 @@ pub use crate::s3fifo::S3Fifo;
 pub use builder::Builder;
 pub use error::S3FifoError;
 pub use item::Item;
-pub use value::Value;
+pub use keyvalue::Value;
 
 // items from submodules which are imported for convenience to the crate level
 pub(crate) use ghost::*;
 pub(crate) use hashtable::*;
-pub(crate) use item::*;
+pub(crate) use keyvalue::{size_of, RawItem, ITEM_HDR_SIZE};
 pub(crate) use slab::*;
 
 #[cfg(feature = "metrics")]

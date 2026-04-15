@@ -1,7 +1,7 @@
 //! A slab allocator for item storage. Each item is stored as a heap-allocated
 //! byte buffer with associated metadata for the S3-FIFO eviction algorithm.
 
-use crate::item::RawItem;
+use keyvalue::RawItem;
 
 /// Which FIFO queue an item belongs to
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

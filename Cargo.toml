@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/datatier",
+    "crates/keyvalue",
     "crates/s3fifo",
     "crates/segcache",
 ]
@@ -17,6 +18,7 @@ blake3 = "1.8.3"
 clocksource = "0.8.3"
 criterion = "0.8.2"
 datatier = { path = "crates/datatier", version = "0.1.0" }
+keyvalue = { path = "crates/keyvalue", version = "0.1.0" }
 s3fifo = { path = "crates/s3fifo", version = "0.1.0" }
 log = "0.4.29"
 memmap2 = "0.9.10"

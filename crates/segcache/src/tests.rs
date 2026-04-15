@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::hashtable::HashBucket;
-use crate::item::ITEM_HDR_SIZE;
+use keyvalue::ITEM_HDR_SIZE;
 use ::rand::Rng;
 use core::num::NonZeroU32;
 

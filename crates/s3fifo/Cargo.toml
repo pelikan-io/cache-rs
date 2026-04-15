@@ -16,7 +16,7 @@ harness = false
 [features]
 
 # enables setting/checking magic strings
-magic = []
+magic = ["keyvalue/magic"]
 
 # enables metrics
 metrics = ["metriken"]
@@ -30,6 +30,7 @@ default = ["metrics"]
 [dependencies]
 ahash = { workspace = true }
 clocksource = { workspace = true }
+keyvalue = { workspace = true, features = [] }
 log = { workspace = true }
 metriken = { workspace = true, optional = true }
 thiserror = { workspace = true }
