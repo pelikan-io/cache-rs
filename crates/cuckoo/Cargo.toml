@@ -1,0 +1,24 @@
+[package]
+name = "cuckoo-cache"
+version = "0.1.0"
+description = "Cuckoo hash based cache storage engine with fixed-size item slots"
+authors = ["Pelikan Cache contributors"]
+
+edition = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+
+[features]
+magic = ["keyvalue/magic"]
+metrics = ["metriken"]
+debug = ["magic"]
+default = ["metrics"]
+
+[dependencies]
+ahash = { workspace = true }
+clocksource = { workspace = true }
+keyvalue = { workspace = true, features = [] }
+log = { workspace = true }
+metriken = { workspace = true, optional = true }
+rand = { workspace = true, features = ["sys_rng"] }
+thiserror = { workspace = true }
