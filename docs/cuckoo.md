@@ -23,22 +23,26 @@ Key "coffee" ──▶ H₀ ──▶ slot 42
 
 All operations are O(1) with a small constant (at most 4 slot accesses for a hit, plus displacement work on insert).
 
-## Slot Layout
+## Item Layout
 
-Each slot is a fixed-size byte region (default 64 bytes) containing an expiration timestamp followed by the item data in [keyvalue](keyvalue.md) format:
+Each slot uses the [`TinyItem`](keyvalue.md#tinyitem) format from the keyvalue crate — a 6-byte packed header followed directly by key and value bytes:
 
 ```
 Slot (64 bytes default):
-┌────────────┬──────────────────────────────────────────────┐
-│   EXPIRE   │              Item Data                       │
-│   (u32)    │  [ItemHeader][optional][key][value]          │
-│  4 bytes   │  (keyvalue crate format)                     │
-└────────────┴──────────────────────────────────────────────┘
+┌──────────┬──────┬──────┬──────────┬──────────┐
+│  EXPIRE  │ KLEN │ VLEN │   KEY    │  VALUE   │
+│  (u32)   │ (u8) │ (u8) │          │          │
+│ 4 bytes  │ 1 b  │ 1 b  │          │          │
+└──────────┴──────┴──────┴──────────┴──────────┘
 ```
 
-A slot is considered empty when the key length in the item header is zero (all bytes zeroed).
+- `expire == 0`: empty slot (all bytes zeroed)
+- `expire == u32::MAX`: item with no expiry (TTL = 0)
+- `expire > 0 && expire < u32::MAX`: absolute expiry as seconds since cache creation
+- `vlen == 0`: value is a `u64` integer (8 bytes stored big-endian)
+- `vlen > 0`: value is a byte string of that length
 
-The per-item overhead is 4 bytes (expire) + 5 bytes (item header) = 9 bytes. For the default 64-byte slot, this leaves 55 bytes for key + value data.
+The per-item overhead is just 6 bytes. For the default 64-byte slot, this leaves 58 bytes for key + value data.
 
 ## Hashing
 
@@ -90,19 +94,19 @@ Unlike segcache's eager segment-based expiration, cuckoo-cache expires items **l
 - **Insert**: Pass 3 of the insertion algorithm checks all candidates for expired slots before attempting displacement or eviction.
 - **Displacement**: Expired items encountered during displacement chains are cleared and treated as free slots.
 
-Items that are never accessed again remain in their slots until another operation discovers them. The `expire` field stores seconds since cache creation; a value of 0 means no expiry.
+Items that are never accessed again remain in their slots until another operation discovers them.
 
 ## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `item_size` | 64 | Bytes per slot. Key + value + 9 bytes overhead must fit. |
+| `item_size` | 64 | Bytes per slot. Key + value + 6 bytes header must fit. |
 | `nitem` | 1024 | Total number of slots (maximum item capacity). |
 | `max_displace` | 2 | Maximum displacement chain depth. Higher values reduce evictions but increase worst-case insertion cost. |
 | `policy` | `Random` | Eviction policy: `Random` or `Expire`. |
 | `max_ttl` | 2,592,000 | Maximum TTL in seconds (30 days). Higher values are clamped. |
 
-Total memory usage is `item_size × nitem` bytes for the data array, plus a small fixed overhead for the hash builders and metadata.
+Total memory usage is `item_size * nitem` bytes for the data array, plus a small fixed overhead for the hash builders and metadata.
 
 ## Feature Flags
 
@@ -148,7 +152,7 @@ let mut cache = CuckooCache::builder()
     .build();
 
 // Operations
-cache.insert(b"key", b"value", None, Duration::from_secs(300))?;
+cache.insert(b"key", b"value", Duration::from_secs(300))?;
 let item = cache.get(b"key");
 cache.delete(b"key");
 cache.wrapping_add(b"counter", 1)?;
@@ -176,10 +180,10 @@ cache.clear();
 | Aspect | cuckoo-cache | segcache |
 |--------|-------------|----------|
 | Item size | Fixed per slot | Variable (packed in segments) |
+| Item header | 6 bytes (`TinyItem`) | 5 bytes (`ItemHeader`) |
 | Lookup | O(1), check 4 slots | O(1), hash table + segment read |
 | Insertion worst case | Displacement chain (bounded) | Segment allocation + possible eviction |
 | Expiration | Lazy (on access) | Eager (segment-granular) |
 | Memory waste | Unused bytes in slots | Minimal (items packed tightly) |
-| Per-item overhead | 9 bytes + slot padding | 5 bytes (header) + 8 bytes (hash slot) |
 | Eviction granularity | Single item | Entire segment |
 | CAS | Not supported | Per-bucket CAS counter |
