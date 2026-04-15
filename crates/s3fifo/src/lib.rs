@@ -28,6 +28,7 @@ use clocksource::coarse::Instant;
 
 // submodules
 mod builder;
+mod clock;
 mod error;
 mod ghost;
 mod hashtable;
@@ -50,6 +51,7 @@ pub use item::Item;
 pub use keyvalue::Value;
 
 // items from submodules which are imported for convenience to the crate level
+pub(crate) use clock::*;
 pub(crate) use ghost::*;
 pub(crate) use hashtable::*;
 pub(crate) use keyvalue::{size_of, RawItem, ITEM_HDR_SIZE};

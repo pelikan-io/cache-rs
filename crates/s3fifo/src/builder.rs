@@ -130,7 +130,7 @@ impl Builder {
             hashtable,
             slab: Slab::new(self.heap_size)?,
             small: VecDeque::new(),
-            main: VecDeque::new(),
+            main: Clock::new(),
             ghost: GhostQueue::new(ghost_capacity),
             heap_size: self.heap_size,
             small_quota,

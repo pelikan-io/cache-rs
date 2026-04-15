@@ -5,16 +5,14 @@ use crate::*;
 
 use std::collections::VecDeque;
 
-/// A cache using the S3-FIFO eviction algorithm. S3-FIFO uses three FIFO
-/// queues — small, main, and ghost — to efficiently separate one-hit wonders
-/// from frequently accessed items. New items enter the small queue. Items
-/// accessed again are promoted to the main queue. A ghost queue of recently
-/// evicted key fingerprints enables fast re-admission.
+/// A cache using the S3-FIFO eviction algorithm. S3-FIFO uses a small FIFO
+/// queue for probation, a CLOCK ring for the main cache, and a ghost queue
+/// of recently evicted fingerprints for re-admission decisions.
 pub struct S3Fifo {
     pub(crate) hashtable: HashTable,
     pub(crate) slab: Slab,
     pub(crate) small: VecDeque<u32>,
-    pub(crate) main: VecDeque<u32>,
+    pub(crate) main: Clock,
     pub(crate) ghost: GhostQueue,
     pub(crate) heap_size: usize,
     pub(crate) small_quota: usize,
@@ -251,7 +249,7 @@ impl S3Fifo {
 
         // Add to the appropriate FIFO queue
         if use_main {
-            self.main.push_back(index);
+            self.main.push(index);
         } else {
             self.small.push_back(index);
             self.small_bytes += alloc_size;
@@ -561,7 +559,7 @@ impl S3Fifo {
             meta.queue = Queue::Main;
 
             self.small_bytes -= size;
-            self.main.push_back(index);
+            self.main.push(index);
 
             #[cfg(feature = "metrics")]
             ITEM_PROMOTE.increment();
@@ -583,7 +581,7 @@ impl S3Fifo {
     }
 
     fn process_main_head(&mut self) -> ProcessResult {
-        let index = match self.main.pop_front() {
+        let index = match self.main.peek_and_advance() {
             Some(idx) => idx,
             None => return ProcessResult::Empty,
         };
@@ -596,16 +594,21 @@ impl S3Fifo {
                 meta.alloc_size as usize,
                 meta.expire_at,
             ),
-            None => return ProcessResult::Freed,
+            None => {
+                self.main.remove_at_hand();
+                return ProcessResult::Freed;
+            }
         };
 
         if deleted {
+            self.main.remove_at_hand();
             self.slab.free(index);
             return self.process_main_head();
         }
 
         let now = self.current_secs();
         if expire_at > 0 && now >= expire_at {
+            self.main.remove_at_hand();
             self.hashtable.remove_by_index(hash, index);
             self.slab.free(index);
             self.current_bytes -= size;
@@ -618,16 +621,17 @@ impl S3Fifo {
         }
 
         if freq > 0 {
+            // CLOCK second chance: reset frequency, advance the hand.
+            // The item stays in place — no data movement.
             let meta = self.slab.get_mut(index).unwrap();
             meta.freq = 0;
-
-            self.main.push_back(index);
 
             #[cfg(feature = "metrics")]
             ITEM_REINSERT.increment();
 
             ProcessResult::Moved
         } else {
+            self.main.remove_at_hand();
             self.hashtable.remove_by_index(hash, index);
             self.slab.free(index);
             self.current_bytes -= size;
@@ -679,12 +683,15 @@ impl S3Fifo {
     }
 
     fn expire_queue_main(&mut self, now: u32) -> usize {
-        let mut queue = std::mem::take(&mut self.main);
         let mut count = 0;
-        let len = queue.len();
+        let scan_len = self.main.len();
 
-        for _ in 0..len {
-            let index = queue.pop_front().unwrap();
+        for _ in 0..scan_len {
+            let index = match self.main.peek_and_advance() {
+                Some(idx) => idx,
+                None => break,
+            };
+
             let (expired, hash, size, deleted) = match self.slab.get(index) {
                 Some(meta) if !meta.deleted => (
                     meta.expire_at > 0 && now >= meta.expire_at,
@@ -696,8 +703,10 @@ impl S3Fifo {
             };
 
             if deleted {
+                self.main.remove_at_hand();
                 self.slab.free(index);
             } else if expired {
+                self.main.remove_at_hand();
                 self.hashtable.remove_by_index(hash, index);
                 self.slab.free(index);
                 self.current_bytes -= size;
@@ -706,12 +715,10 @@ impl S3Fifo {
 
                 #[cfg(feature = "metrics")]
                 ITEM_EXPIRE.increment();
-            } else {
-                queue.push_back(index);
             }
+            // else: live item, hand already advanced past it
         }
 
-        self.main = queue;
         count
     }
 }
