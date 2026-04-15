@@ -1,26 +1,24 @@
 //! Core cuckoo cache implementation.
 //!
-//! Each item slot has the following layout:
+//! Each item slot uses the [`TinyItem`] layout from the keyvalue crate:
 //!
 //! ```text
-//! ┌────────────┬──────────────────────────────────────────────┐
-//! │   EXPIRE   │              Item Data                       │
-//! │   (u32)    │  [ItemHeader][optional][key][value]          │
-//! │  4 bytes   │  (keyvalue crate format)                     │
-//! └────────────┴──────────────────────────────────────────────┘
+//! ┌──────────┬──────┬──────┬──────────┬──────────┐
+//! │  EXPIRE  │ KLEN │ VLEN │   KEY    │  VALUE   │
+//! │  (u32)   │ (u8) │ (u8) │          │          │
+//! │ 4 bytes  │ 1 b  │ 1 b  │          │          │
+//! └──────────┴──────┴──────┴──────────┴──────────┘
 //! ```
 //!
-//! A slot is considered empty when the key length in the item header is zero.
+//! A slot is empty when `expire == 0` (all bytes zeroed).
+//! Integer values are signalled by `vlen == 0`.
 
 use crate::*;
 use ahash::RandomState;
 use clocksource::coarse::Instant;
 use core::hash::{BuildHasher, Hasher};
-use keyvalue::{RawItem, Value, ITEM_HDR_SIZE};
+use keyvalue::{TinyItem, Value, TINY_ITEM_HDR_SIZE};
 use rand::RngExt;
-
-/// Size of the per-slot expiration field in bytes.
-const EXPIRE_SIZE: usize = std::mem::size_of::<u32>();
 
 /// Fixed seeds for the four independent hash functions, analogous to the
 /// initialization vectors used in the C implementation.
@@ -70,9 +68,9 @@ impl CuckooCache {
 
     pub(crate) fn from_builder(b: Builder) -> Self {
         assert!(
-            b.item_size > EXPIRE_SIZE + ITEM_HDR_SIZE,
-            "item_size must be greater than {} bytes (overhead)",
-            EXPIRE_SIZE + ITEM_HDR_SIZE
+            b.item_size > TINY_ITEM_HDR_SIZE,
+            "item_size must be greater than {} bytes (header overhead)",
+            TINY_ITEM_HDR_SIZE
         );
         assert!(b.nitem > 0, "nitem must be positive");
 
@@ -111,40 +109,23 @@ impl CuckooCache {
         index * self.item_size
     }
 
-    /// Read the expiration timestamp for a slot.
-    #[inline]
-    fn slot_expire(&self, index: usize) -> u32 {
+    /// Get a [`TinyItem`] view of a slot.
+    fn slot_item(&self, index: usize) -> TinyItem {
         let off = self.slot_offset(index);
-        u32::from_le_bytes(self.data[off..off + EXPIRE_SIZE].try_into().unwrap())
+        unsafe { TinyItem::from_ptr((self.data.as_ptr() as *mut u8).add(off)) }
     }
 
-    /// Write the expiration timestamp for a slot.
-    #[inline]
-    fn set_slot_expire(&mut self, index: usize, expire: u32) {
-        let off = self.slot_offset(index);
-        self.data[off..off + EXPIRE_SIZE].copy_from_slice(&expire.to_le_bytes());
-    }
-
-    /// Get a [`RawItem`] view of a slot. The returned item borrows from the
-    /// cache's data buffer via a raw pointer.
-    fn slot_raw_item(&self, index: usize) -> RawItem {
-        let off = self.slot_offset(index) + EXPIRE_SIZE;
-        // SAFETY: pointer is within our allocated buffer. The slot layout
-        // guarantees at least `item_size - EXPIRE_SIZE` bytes from this offset.
-        unsafe { RawItem::from_ptr((self.data.as_ptr() as *mut u8).add(off)) }
-    }
-
-    /// Check whether a slot is empty (no item stored).
+    /// Check whether a slot is empty (expire == 0).
     #[inline]
     fn slot_is_empty(&self, index: usize) -> bool {
-        self.slot_raw_item(index).klen() == 0
+        self.slot_item(index).expire() == 0
     }
 
     /// Check whether a slot's item has expired.
     fn slot_is_expired(&self, index: usize) -> bool {
-        let expire = self.slot_expire(index);
-        if expire == 0 {
-            return false;
+        let expire = self.slot_item(index).expire();
+        if expire == 0 || expire == u32::MAX {
+            return false; // empty or no-expiry
         }
         let elapsed = (Instant::now() - self.started).as_secs();
         elapsed > expire
@@ -166,15 +147,12 @@ impl CuckooCache {
     }
 
     /// Write an item into a slot.
-    fn write_slot(&mut self, index: usize, key: &[u8], value: Value, optional: &[u8], expire: u32) {
+    fn write_slot(&mut self, index: usize, key: &[u8], value: Value, expire: u32) {
         self.clear_slot(index);
-        self.set_slot_expire(index, expire);
-
-        let off = self.slot_offset(index) + EXPIRE_SIZE;
-        // SAFETY: we have &mut self and the offset is within bounds.
+        let off = self.slot_offset(index);
         let ptr = unsafe { self.data.as_mut_ptr().add(off) };
-        let mut raw = RawItem::from_ptr(ptr);
-        raw.define(key, value, optional);
+        let mut item = TinyItem::from_ptr(ptr);
+        item.define(key, value, expire);
     }
 
     // -----------------------------------------------------------------------
@@ -195,7 +173,7 @@ impl CuckooCache {
     /// Compute the expiration timestamp for a given TTL.
     fn compute_expire(&self, ttl: std::time::Duration) -> u32 {
         if ttl.is_zero() {
-            return 0;
+            return u32::MAX; // no expiry
         }
         let secs = std::cmp::min(ttl.as_secs(), self.max_ttl as u64) as u32;
         let elapsed = (Instant::now() - self.started).as_secs();
@@ -228,9 +206,9 @@ impl CuckooCache {
 
     #[cfg(feature = "metrics")]
     fn decrement_item_metrics(&self, index: usize) {
-        let raw = self.slot_raw_item(index);
-        let klen = raw.klen() as i64;
-        let vlen = raw.header().vlen() as i64;
+        let item = self.slot_item(index);
+        let klen = item.klen() as i64;
+        let vlen = item.header().value_len() as i64;
         metrics::ITEM_CURRENT.sub(1);
         metrics::ITEM_KEY_BYTE.sub(klen);
         metrics::ITEM_VAL_BYTE.sub(vlen);
@@ -239,9 +217,9 @@ impl CuckooCache {
 
     #[cfg(feature = "metrics")]
     fn increment_item_metrics(&self, index: usize) {
-        let raw = self.slot_raw_item(index);
-        let klen = raw.klen() as i64;
-        let vlen = raw.header().vlen() as i64;
+        let item = self.slot_item(index);
+        let klen = item.klen() as i64;
+        let vlen = item.header().value_len() as i64;
         metrics::ITEM_CURRENT.add(1);
         metrics::ITEM_KEY_BYTE.add(klen);
         metrics::ITEM_VAL_BYTE.add(vlen);
@@ -278,12 +256,9 @@ impl CuckooCache {
             return false;
         }
 
-        // Copy the key so we can compute alternative positions while mutating
-        // self.data through the displacement chain.
-        let key_buf = self.slot_raw_item(pos).key().to_vec();
+        let key_buf = self.slot_item(pos).key().to_vec();
         let alts = self.positions(&key_buf);
 
-        // Prefer direct moves to empty or expired slots
         for &alt in &alts {
             if alt == pos {
                 continue;
@@ -303,7 +278,6 @@ impl CuckooCache {
             }
         }
 
-        // Try deeper displacement: free an alternative slot first, then move
         for &alt in &alts {
             if alt == pos {
                 continue;
@@ -319,19 +293,16 @@ impl CuckooCache {
         false
     }
 
-    /// Select a victim candidate index for eviction based on the configured
-    /// policy.
+    /// Select a victim candidate index for eviction.
     fn select_victim(&self, candidates: &[usize; D]) -> usize {
         match self.policy {
             Policy::Random => rand::rng().random::<u64>() as usize % D,
             Policy::Expire => {
-                // Prefer evicting the item with the nearest expiration time.
-                // Items with expire=0 (no expiry) are least preferred.
                 let mut best = 0;
                 let mut best_expire = u32::MAX;
                 for (i, &pos) in candidates.iter().enumerate() {
-                    let expire = self.slot_expire(pos);
-                    if expire != 0 && expire < best_expire {
+                    let expire = self.slot_item(pos).expire();
+                    if expire < best_expire {
                         best = i;
                         best_expire = expire;
                     }
@@ -345,34 +316,26 @@ impl CuckooCache {
     // Insertion helper
     // -----------------------------------------------------------------------
 
-    /// Find a slot for inserting a key following the cuckoo insertion
-    /// algorithm. Returns `(slot_index, is_update)`.
-    ///
-    /// The search order matches the C reference implementation:
-    /// 1. Existing (non-expired) matching key → update in place
-    /// 2. Empty slot
-    /// 3. Expired slot
-    /// 4. Displacement
-    /// 5. Eviction by policy
+    /// Find a slot for inserting a key. Returns `(slot_index, is_update)`.
     fn find_slot_for_insert(&mut self, key: &[u8], positions: &[usize; D]) -> (usize, bool) {
-        // Pass 1: look for existing non-expired key
+        // Pass 1: existing non-expired key
         for &pos in positions {
             if self.slot_is_empty(pos) || self.slot_is_expired(pos) {
                 continue;
             }
-            if self.slot_raw_item(pos).key() == key {
+            if self.slot_item(pos).key() == key {
                 return (pos, true);
             }
         }
 
-        // Pass 2: use an empty slot
+        // Pass 2: empty slot
         for &pos in positions {
             if self.slot_is_empty(pos) {
                 return (pos, false);
             }
         }
 
-        // Pass 3: use an expired slot
+        // Pass 3: expired slot
         for &pos in positions {
             if self.slot_is_expired(pos) {
                 self.handle_expired(pos);
@@ -380,12 +343,12 @@ impl CuckooCache {
             }
         }
 
-        // Pass 4: try displacement
+        // Pass 4: displacement
         if let Some(freed_idx) = self.try_displace(positions) {
             return (positions[freed_idx], false);
         }
 
-        // Pass 5: evict according to policy
+        // Pass 5: evict
         let victim_idx = self.select_victim(positions);
         let pos = positions[victim_idx];
         self.evict_at(pos);
@@ -396,8 +359,7 @@ impl CuckooCache {
     // Public API
     // -----------------------------------------------------------------------
 
-    /// Look up an item by key. Returns `None` if the item is not found or has
-    /// expired. Expired items are lazily cleared on access.
+    /// Look up an item by key.
     ///
     /// ```
     /// use cuckoo_cache::CuckooCache;
@@ -406,7 +368,7 @@ impl CuckooCache {
     /// let mut cache = CuckooCache::builder().build();
     /// assert!(cache.get(b"coffee").is_none());
     ///
-    /// cache.insert(b"coffee", b"strong", None, Duration::ZERO).unwrap();
+    /// cache.insert(b"coffee", b"strong", Duration::ZERO).unwrap();
     /// let item = cache.get(b"coffee").unwrap();
     /// assert_eq!(item.value(), b"strong");
     /// ```
@@ -421,7 +383,7 @@ impl CuckooCache {
                 continue;
             }
 
-            if self.slot_raw_item(pos).key() == key {
+            if self.slot_item(pos).key() == key {
                 if self.slot_is_expired(pos) {
                     self.handle_expired(pos);
                     #[cfg(feature = "metrics")]
@@ -432,8 +394,7 @@ impl CuckooCache {
                 #[cfg(feature = "metrics")]
                 metrics::CUCKOO_GET_KEY_HIT.increment();
 
-                let expire = self.slot_expire(pos);
-                return Some(Item::new(self.slot_raw_item(pos), expire));
+                return Some(Item::new(self.slot_item(pos)));
             }
         }
 
@@ -443,22 +404,19 @@ impl CuckooCache {
         None
     }
 
-    /// Insert an item into the cache. If the key already exists, its value and
-    /// TTL are updated. When all candidate positions are occupied, items may be
-    /// displaced or evicted according to the configured policy.
+    /// Insert an item into the cache.
     ///
     /// ```
     /// use cuckoo_cache::CuckooCache;
     /// use std::time::Duration;
     ///
     /// let mut cache = CuckooCache::builder().build();
-    /// cache.insert(b"drink", b"coffee", None, Duration::ZERO).unwrap();
+    /// cache.insert(b"drink", b"coffee", Duration::ZERO).unwrap();
     ///
     /// let item = cache.get(b"drink").unwrap();
     /// assert_eq!(item.value(), b"coffee");
     ///
-    /// // Overwrite with a new value
-    /// cache.insert(b"drink", b"whisky", None, Duration::ZERO).unwrap();
+    /// cache.insert(b"drink", b"whisky", Duration::ZERO).unwrap();
     /// let item = cache.get(b"drink").unwrap();
     /// assert_eq!(item.value(), b"whisky");
     /// ```
@@ -466,14 +424,11 @@ impl CuckooCache {
         &mut self,
         key: &[u8],
         value: T,
-        optional: Option<&[u8]>,
         ttl: std::time::Duration,
     ) -> Result<(), CuckooCacheError> {
         let value: Value = value.into();
-        let optional = optional.unwrap_or(&[]);
 
-        let required =
-            EXPIRE_SIZE + ITEM_HDR_SIZE + optional.len() + key.len() + keyvalue::size_of(&value);
+        let required = TINY_ITEM_HDR_SIZE + key.len() + keyvalue::size_of(&value);
         if required > self.item_size {
             #[cfg(feature = "metrics")]
             metrics::CUCKOO_INSERT_EX.increment();
@@ -504,7 +459,7 @@ impl CuckooCache {
             }
         }
 
-        self.write_slot(pos, key, value, optional, expire);
+        self.write_slot(pos, key, value, expire);
 
         #[cfg(feature = "metrics")]
         self.increment_item_metrics(pos);
@@ -512,8 +467,7 @@ impl CuckooCache {
         Ok(())
     }
 
-    /// Remove the item with the given key. Returns `true` if the item was
-    /// found and removed, `false` if not found (or expired).
+    /// Remove the item with the given key.
     ///
     /// ```
     /// use cuckoo_cache::CuckooCache;
@@ -522,7 +476,7 @@ impl CuckooCache {
     /// let mut cache = CuckooCache::builder().build();
     /// assert!(!cache.delete(b"coffee"));
     ///
-    /// cache.insert(b"coffee", b"strong", None, Duration::ZERO).unwrap();
+    /// cache.insert(b"coffee", b"strong", Duration::ZERO).unwrap();
     /// assert!(cache.delete(b"coffee"));
     /// assert!(cache.get(b"coffee").is_none());
     /// ```
@@ -536,7 +490,7 @@ impl CuckooCache {
             if self.slot_is_empty(pos) {
                 continue;
             }
-            if self.slot_raw_item(pos).key() == key {
+            if self.slot_item(pos).key() == key {
                 if self.slot_is_expired(pos) {
                     self.handle_expired(pos);
                     return false;
@@ -556,9 +510,7 @@ impl CuckooCache {
         self.data.fill(0);
     }
 
-    /// Perform a wrapping addition on the numeric value stored at the given
-    /// key. Returns the updated item, or an error if the key is not found or
-    /// the value is not numeric.
+    /// Perform a wrapping addition on a numeric value.
     pub fn wrapping_add(&mut self, key: &[u8], rhs: u64) -> Result<Item, CuckooCacheError> {
         let positions = self.positions(key);
 
@@ -566,23 +518,20 @@ impl CuckooCache {
             if self.slot_is_empty(pos) || self.slot_is_expired(pos) {
                 continue;
             }
-            if self.slot_raw_item(pos).key() == key {
-                let off = self.slot_offset(pos) + EXPIRE_SIZE;
-                // SAFETY: we have &mut self and the offset is within bounds.
+            if self.slot_item(pos).key() == key {
+                let off = self.slot_offset(pos);
                 let ptr = unsafe { self.data.as_mut_ptr().add(off) };
-                let mut raw = RawItem::from_ptr(ptr);
-                raw.wrapping_add(rhs)
+                let mut item = TinyItem::from_ptr(ptr);
+                item.wrapping_add(rhs)
                     .map_err(|_| CuckooCacheError::NotNumeric)?;
-                return Ok(Item::new(raw, self.slot_expire(pos)));
+                return Ok(Item::new(item));
             }
         }
 
         Err(CuckooCacheError::NotFound)
     }
 
-    /// Perform a saturating subtraction on the numeric value stored at the
-    /// given key. Returns the updated item, or an error if the key is not
-    /// found or the value is not numeric.
+    /// Perform a saturating subtraction on a numeric value.
     pub fn saturating_sub(&mut self, key: &[u8], rhs: u64) -> Result<Item, CuckooCacheError> {
         let positions = self.positions(key);
 
@@ -590,22 +539,20 @@ impl CuckooCache {
             if self.slot_is_empty(pos) || self.slot_is_expired(pos) {
                 continue;
             }
-            if self.slot_raw_item(pos).key() == key {
-                let off = self.slot_offset(pos) + EXPIRE_SIZE;
-                // SAFETY: we have &mut self and the offset is within bounds.
+            if self.slot_item(pos).key() == key {
+                let off = self.slot_offset(pos);
                 let ptr = unsafe { self.data.as_mut_ptr().add(off) };
-                let mut raw = RawItem::from_ptr(ptr);
-                raw.saturating_sub(rhs)
+                let mut item = TinyItem::from_ptr(ptr);
+                item.saturating_sub(rhs)
                     .map_err(|_| CuckooCacheError::NotNumeric)?;
-                return Ok(Item::new(raw, self.slot_expire(pos)));
+                return Ok(Item::new(item));
             }
         }
 
         Err(CuckooCacheError::NotFound)
     }
 
-    /// Get a count of live (non-expired) items. This is an expensive operation
-    /// and is only enabled for tests and builds with the `debug` feature.
+    /// Get a count of live (non-expired) items.
     ///
     /// ```
     /// use cuckoo_cache::CuckooCache;
