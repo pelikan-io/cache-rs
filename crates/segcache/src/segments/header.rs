@@ -71,7 +71,7 @@ pub struct SegmentHeader {
 #[repr(u8)]
 pub(crate) enum SegmentPool {
     Main = 0,
-    Small = 1,
+    Admission = 1,
 }
 
 impl SegmentHeader {

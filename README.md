@@ -59,7 +59,7 @@ All policies operate at segment granularity. When memory runs out, the policy se
 | `Cte` | Segment closest to expiration | All items dropped |
 | `Util` | Segment with fewest live bytes | All items dropped |
 | `Merge` | Sequential segments in a TTL chain | High-frequency items copied to target, low-frequency dropped |
-| `S3Fifo` | Oldest small-pool or main-pool segment | [Frequency-based promotion/eviction](docs/s3fifo.md) — **S3-Segcache** |
+| `S3Fifo` | Oldest admission-pool or main-pool segment | [Frequency-based promotion/eviction](docs/s3fifo.md) — **S3-Segcache** |
 
 `Merge` and `S3Fifo` are the sophisticated policies — they scan items within the evicted segment and selectively retain valuable ones by copying them elsewhere. The simpler policies discard everything in the segment.
 
@@ -76,7 +76,7 @@ let mut cache = Segcache::builder()
     .heap_size(64 * MB)
     .segment_size(1 * MB as i32)
     .hash_power(16)
-    .eviction(Policy::S3Fifo { small_ratio: 0.10 })
+    .eviction(Policy::S3Fifo { admission_ratio: 0.10 })
     .build()
     .expect("failed to create cache");
 

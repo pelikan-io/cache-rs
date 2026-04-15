@@ -42,8 +42,8 @@ impl Eviction {
         ranked_segs.resize_with(nseg, || None);
         let ranked_segs = ranked_segs.into_boxed_slice();
 
-        // For S3-FIFO, size the ghost queue to ~10% of segment count
-        // (approximating the number of items in the small pool)
+        // For S3-FIFO, size the ghost queue proportionally
+        // (approximating the number of items in the admission pool)
         let ghost_capacity = if matches!(policy, Policy::S3Fifo { .. }) {
             std::cmp::max(1024, nseg * 64)
         } else {

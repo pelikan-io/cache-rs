@@ -133,7 +133,7 @@ impl Segcache {
                 self.segments.ghost_remove(hash);
                 SegmentPool::Main
             } else {
-                SegmentPool::Small
+                SegmentPool::Admission
             }
         } else {
             SegmentPool::Main
@@ -162,12 +162,14 @@ impl Segcache {
                 Ok(mut reserved_item) => {
                     reserved_item.define(key, value, optional);
                     // Set the segment pool for S3-FIFO (only transitions
-                    // Main→Small need a counter update; fresh segments
+                    // Main→Admission need a counter update; fresh segments
                     // default to Main)
                     if let Ok(mut seg) = self.segments.get_mut(reserved_item.seg()) {
-                        if target_pool == SegmentPool::Small && seg.pool() != SegmentPool::Small {
+                        if target_pool == SegmentPool::Admission
+                            && seg.pool() != SegmentPool::Admission
+                        {
                             seg.set_pool(target_pool);
-                            self.segments.incr_pool(SegmentPool::Small);
+                            self.segments.incr_pool(SegmentPool::Admission);
                         }
                     }
                     reserved = reserved_item;

@@ -28,10 +28,10 @@ pub(crate) struct Segments {
     flush_at: Instant,
     /// Eviction configuration and state
     evict: Box<Eviction>,
-    /// Max segments in the small pool (S3-FIFO only, 0 for other policies)
-    small_cap: u32,
-    /// Current number of segments in the small pool
-    small_count: u32,
+    /// Max segments in the admission pool (S3-FIFO only, 0 for other policies)
+    admission_cap: u32,
+    /// Current number of segments in the admission pool
+    admission_count: u32,
 }
 
 impl Segments {
@@ -97,8 +97,8 @@ impl Segments {
             SEGMENT_FREE.set(segments as _);
         }
 
-        let small_cap = if let Policy::S3Fifo { small_ratio } = evict_policy {
-            (segments as f64 * small_ratio).round() as u32
+        let admission_cap = if let Policy::S3Fifo { admission_ratio } = evict_policy {
+            (segments as f64 * admission_ratio).round() as u32
         } else {
             0
         };
@@ -112,23 +112,23 @@ impl Segments {
             data,
             flush_at: Instant::now(),
             evict: Box::new(Eviction::new(segments, evict_policy)),
-            small_cap,
-            small_count: 0,
+            admission_cap,
+            admission_count: 0,
         })
     }
 
     /// Check if the given pool has room for another segment.
     pub(crate) fn pool_has_room(&self, pool: SegmentPool) -> bool {
         match pool {
-            SegmentPool::Small => self.small_count < self.small_cap,
+            SegmentPool::Admission => self.admission_count < self.admission_cap,
             SegmentPool::Main => true,
         }
     }
 
     /// Track a segment transitioning to the given pool.
     pub(crate) fn incr_pool(&mut self, pool: SegmentPool) {
-        if pool == SegmentPool::Small {
-            self.small_count += 1;
+        if pool == SegmentPool::Admission {
+            self.admission_count += 1;
         }
     }
 
@@ -455,8 +455,8 @@ impl Segments {
         self.headers[id_idx].set_accessible(false);
 
         // Decrement pool counter before resetting to default
-        if self.headers[id_idx].pool() == SegmentPool::Small {
-            self.small_count = self.small_count.saturating_sub(1);
+        if self.headers[id_idx].pool() == SegmentPool::Admission {
+            self.admission_count = self.admission_count.saturating_sub(1);
         }
         self.headers[id_idx].set_pool(SegmentPool::Main);
 
@@ -1015,19 +1015,19 @@ impl Segments {
         best.map(|(id, _)| id)
     }
 
-    /// S3-FIFO eviction entry point. Tries small-pool first (the filtering
-    /// step), then main-pool (CLOCK second-chance).
+    /// S3-FIFO eviction entry point. Tries admission pool first (the
+    /// filtering step), then main pool (CLOCK second-chance).
     fn s3fifo_evict(
         &mut self,
         ttl_buckets: &mut TtlBuckets,
         hashtable: &mut HashTable,
     ) -> Result<(), SegmentsError> {
-        // Try evicting a small-pool segment first (with promotion of freq > 0)
-        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, SegmentPool::Small) {
-            return self.s3fifo_evict_small(seg_id, ttl_buckets, hashtable);
+        // Try evicting an admission-pool segment first (promoting freq > 0)
+        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, SegmentPool::Admission) {
+            return self.s3fifo_evict_admission(seg_id, ttl_buckets, hashtable);
         }
 
-        // No small-pool segments evictable; try main-pool
+        // No admission-pool segments evictable; try main pool
         if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, SegmentPool::Main) {
             return self.s3fifo_evict_main(seg_id, ttl_buckets, hashtable);
         }
@@ -1038,10 +1038,10 @@ impl Segments {
         Err(SegmentsError::NoEvictableSegments)
     }
 
-    /// Evict a small-pool segment. Items with freq > 0 are promoted (copied
-    /// to a main-pool segment). Items with freq == 0 are dropped and their
-    /// key hashes are added to the ghost queue.
-    fn s3fifo_evict_small(
+    /// Evict an admission-pool segment. Items with freq > 0 are promoted
+    /// (copied to a main-pool segment). Items with freq == 0 are dropped
+    /// and their key hashes are added to the ghost queue.
+    fn s3fifo_evict_admission(
         &mut self,
         seg_id: NonZeroU32,
         ttl_buckets: &mut TtlBuckets,

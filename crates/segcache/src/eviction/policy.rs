@@ -59,20 +59,20 @@ pub enum Policy {
         /// Note: Compaction will be disabled by setting this parameter to zero.
         compact: usize,
     },
-    /// S3-FIFO eviction (S3-Segcache) uses two pools of segments — small and
-    /// main — plus a ghost queue of recently evicted key fingerprints.
-    /// New items are written to small-pool segments. When a small-pool
+    /// S3-FIFO eviction (S3-Segcache) uses two pools of segments — admission
+    /// and main — plus a ghost queue of recently evicted key fingerprints.
+    /// New items are written to admission-pool segments. When an admission
     /// segment is evicted, items with frequency > 0 are promoted (copied
     /// into a main-pool segment); items with frequency == 0 are dropped and
     /// their hashes added to the ghost queue. Main-pool segments use
     /// CLOCK-style second-chance eviction.
     ///
     /// If a newly inserted key's hash is found in the ghost queue, the item
-    /// is written directly to a main-pool segment instead of small.
+    /// is written directly to a main-pool segment, bypassing admission.
     S3Fifo {
-        /// Ratio of total segments allocated to the small (probation)
-        /// pool, between 0.0 and 1.0. The remaining segments form the
-        /// main pool. Typical values are 0.05–0.20. Default: 0.10.
-        small_ratio: f64,
+        /// Ratio of total segments allocated to the admission pool,
+        /// between 0.0 and 1.0. The remaining segments form the main
+        /// pool. Typical values are 0.05–0.20. Default: 0.10.
+        admission_ratio: f64,
     },
 }
