@@ -2,7 +2,7 @@
 // Copyright 2023 Pelikan Cache contributors
 // Licensed under the MIT and Apache-2.0 licenses
 
-use super::{SegmentHeader, SegmentsError};
+use super::{SegmentHeader, SegmentPool, SegmentsError};
 use crate::*;
 use core::num::NonZeroU32;
 
@@ -17,6 +17,16 @@ pub struct Segment<'a> {
 }
 
 impl<'a> Segment<'a> {
+    /// Returns a raw pointer to the segment's data buffer.
+    pub fn data_ptr(&self) -> *mut u8 {
+        self.data.as_ptr() as *mut u8
+    }
+
+    /// Set the segment pool (used by S3-FIFO).
+    pub fn set_pool(&mut self, pool: SegmentPool) {
+        self.header.set_pool(pool);
+    }
+
     /// Construct a `Segment` from its raw parts
     pub fn from_raw_parts(
         header: &'a mut segments::header::SegmentHeader,
@@ -67,7 +77,7 @@ impl<'a> Segment<'a> {
 
     /// Convenience function which is used as a stop point for scanning through
     /// the segment. All valid items would exist below this value
-    fn max_item_offset(&self) -> usize {
+    pub(crate) fn max_item_offset(&self) -> usize {
         if self.write_offset() >= ITEM_HDR_SIZE as i32 {
             std::cmp::min(self.write_offset() as usize, self.data.len()) - ITEM_HDR_SIZE
         } else if cfg!(feature = "magic") {
@@ -156,6 +166,18 @@ impl<'a> Segment<'a> {
     #[inline]
     pub fn live_items(&self) -> i32 {
         self.header.live_items()
+    }
+
+    /// Increment live items count.
+    #[inline]
+    pub fn incr_live_items(&mut self) {
+        self.header.incr_live_items();
+    }
+
+    /// Increment live bytes count.
+    #[inline]
+    pub fn incr_live_bytes(&mut self, bytes: i32) {
+        self.header.incr_live_bytes(bytes);
     }
 
     /// Returns whether the segment is currently accessible from the hashtable.

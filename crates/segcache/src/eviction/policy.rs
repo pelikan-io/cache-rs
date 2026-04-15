@@ -59,4 +59,15 @@ pub enum Policy {
         /// Note: Compaction will be disabled by setting this parameter to zero.
         compact: usize,
     },
+    /// S3-FIFO eviction uses two pools of segments — small (~10%) and main
+    /// (~90%) — plus a ghost queue of recently evicted key fingerprints.
+    /// New items are written to small-pool segments. When a small-pool
+    /// segment is evicted, items with frequency > 0 are promoted (copied
+    /// into a main-pool segment); items with frequency == 0 are dropped and
+    /// their hashes added to the ghost queue. Main-pool segments use
+    /// CLOCK-style second-chance eviction.
+    ///
+    /// If a newly inserted key's hash is found in the ghost queue, the item
+    /// is written directly to a main-pool segment instead of small.
+    S3Fifo,
 }

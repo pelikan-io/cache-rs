@@ -6,6 +6,7 @@
 
 use crate::Value;
 use crate::*;
+use core::hash::{BuildHasher, Hasher};
 use std::cmp::min;
 
 const RESERVE_RETRIES: usize = 3;
@@ -121,6 +122,23 @@ impl Segcache {
 
         let ttl = Duration::from_secs(min(u32::MAX as u64, ttl.as_secs()) as u32);
 
+        // For S3-FIFO: determine target pool based on ghost queue
+        let target_pool = if self.segments.evict_policy() == Policy::S3Fifo {
+            let hash = {
+                let mut hasher = self.hashtable.hash_builder().build_hasher();
+                hasher.write(key);
+                hasher.finish()
+            };
+            if self.segments.ghost_contains(hash) {
+                self.segments.ghost_remove(hash);
+                SegmentPool::Main
+            } else {
+                SegmentPool::Small
+            }
+        } else {
+            SegmentPool::Main
+        };
+
         // try to get a `ReservedItem`
         let mut retries = RESERVE_RETRIES;
         let reserved;
@@ -132,6 +150,10 @@ impl Segcache {
             {
                 Ok(mut reserved_item) => {
                     reserved_item.define(key, value, optional);
+                    // Set the segment pool for S3-FIFO
+                    if let Ok(mut seg) = self.segments.get_mut(reserved_item.seg()) {
+                        seg.set_pool(target_pool);
+                    }
                     reserved = reserved_item;
                     break;
                 }

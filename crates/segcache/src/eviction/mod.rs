@@ -15,8 +15,10 @@ use crate::segments::*;
 use crate::Random;
 use crate::*;
 
+mod ghost;
 mod policy;
 
+pub(crate) use ghost::GhostQueue;
 pub use policy::Policy;
 
 /// The `Eviction` struct is used to rank and return segments for eviction. It
@@ -27,6 +29,8 @@ pub struct Eviction {
     ranked_segs: Box<[Option<NonZeroU32>]>,
     index: usize,
     rng: Box<Random>,
+    /// Ghost queue for S3-FIFO (empty for other policies)
+    pub(crate) ghost: GhostQueue,
 }
 
 impl Eviction {
@@ -38,12 +42,21 @@ impl Eviction {
         ranked_segs.resize_with(nseg, || None);
         let ranked_segs = ranked_segs.into_boxed_slice();
 
+        // For S3-FIFO, size the ghost queue to ~10% of segment count
+        // (approximating the number of items in the small pool)
+        let ghost_capacity = if policy == Policy::S3Fifo {
+            std::cmp::max(1024, nseg * 64)
+        } else {
+            0
+        };
+
         Self {
             policy,
             last_update_time: Instant::now(),
             ranked_segs,
             index: 0,
             rng: Box::new(rng()),
+            ghost: GhostQueue::new(ghost_capacity),
         }
     }
 
@@ -72,7 +85,11 @@ impl Eviction {
     pub fn should_rerank(&mut self) -> bool {
         let now = Instant::now();
         match self.policy {
-            Policy::None | Policy::Random | Policy::RandomFifo | Policy::Merge { .. } => false,
+            Policy::None
+            | Policy::Random
+            | Policy::RandomFifo
+            | Policy::Merge { .. }
+            | Policy::S3Fifo => false,
             Policy::Fifo | Policy::Cte | Policy::Util => {
                 if self.ranked_segs[0].is_none()
                     || (now - self.last_update_time).as_secs() > 1
@@ -90,7 +107,11 @@ impl Eviction {
     pub fn rerank(&mut self, headers: &[SegmentHeader]) {
         let mut ids: Vec<NonZeroU32> = headers.iter().map(|h| h.id()).collect();
         match self.policy {
-            Policy::None | Policy::Random | Policy::RandomFifo | Policy::Merge { .. } => {
+            Policy::None
+            | Policy::Random
+            | Policy::RandomFifo
+            | Policy::Merge { .. }
+            | Policy::S3Fifo => {
                 return;
             }
             Policy::Fifo => {
