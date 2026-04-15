@@ -859,6 +859,7 @@ dependencies = [
  "ahash",
  "clocksource",
  "criterion",
+ "datatier",
  "keyvalue",
  "log",
  "metriken",

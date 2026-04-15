@@ -107,10 +107,8 @@ impl HashTable {
                 }
                 if get_tag(item_info) == tag {
                     let index = get_index(item_info);
-                    if let Some(entry) = slab.get(index) {
-                        if !entry.deleted && entry.key_eq(key) {
-                            return Some(index);
-                        }
+                    if slab.is_match(index, key) {
+                        return Some(index);
                     }
                     #[cfg(feature = "metrics")]
                     HASH_TAG_COLLISION.increment();
@@ -162,18 +160,16 @@ impl HashTable {
                 }
                 if get_tag(item_info) == tag {
                     let existing_index = get_index(item_info);
-                    if let Some(entry) = slab.get(existing_index) {
-                        if !entry.deleted && entry.key_eq(key) {
-                            // Replace existing entry
-                            self.data[bucket_id].data[slot] = new_item_info;
-                            let primary = (hash & self.mask) as usize;
-                            self.data[primary].data[0] += 1 << CAS_BIT_SHIFT;
+                    if slab.is_match(existing_index, key) {
+                        // Replace existing entry
+                        self.data[bucket_id].data[slot] = new_item_info;
+                        let primary = (hash & self.mask) as usize;
+                        self.data[primary].data[0] += 1 << CAS_BIT_SHIFT;
 
-                            #[cfg(feature = "metrics")]
-                            crate::ITEM_REPLACE.increment();
+                        #[cfg(feature = "metrics")]
+                        crate::ITEM_REPLACE.increment();
 
-                            return Ok(Some(existing_index));
-                        }
+                        return Ok(Some(existing_index));
                     }
                     #[cfg(feature = "metrics")]
                     HASH_TAG_COLLISION.increment();
@@ -278,15 +274,13 @@ impl HashTable {
                 }
                 if get_tag(item_info) == tag {
                     let index = get_index(item_info);
-                    if let Some(entry) = slab.get(index) {
-                        if !entry.deleted && entry.key_eq(key) {
-                            self.data[bucket_id].data[slot] = 0;
+                    if slab.is_match(index, key) {
+                        self.data[bucket_id].data[slot] = 0;
 
-                            #[cfg(feature = "metrics")]
-                            HASH_REMOVE.increment();
+                        #[cfg(feature = "metrics")]
+                        HASH_REMOVE.increment();
 
-                            return Some(index);
-                        }
+                        return Some(index);
                     }
                     #[cfg(feature = "metrics")]
                     HASH_TAG_COLLISION.increment();

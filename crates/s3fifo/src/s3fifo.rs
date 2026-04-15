@@ -75,8 +75,8 @@ impl S3Fifo {
         let index = self.hashtable.get(key, hash, &self.slab)?;
 
         let (expire_at, deleted) = {
-            let entry = self.slab.get(index)?;
-            (entry.expire_at, entry.deleted)
+            let meta = self.slab.get(index)?;
+            (meta.expire_at, meta.deleted)
         };
 
         if deleted {
@@ -94,12 +94,12 @@ impl S3Fifo {
         }
 
         // Increment frequency (cap at 3)
-        let entry = self.slab.get_mut(index).unwrap();
-        if entry.freq < 3 {
-            entry.freq += 1;
+        let meta = self.slab.get_mut(index).unwrap();
+        if meta.freq < 3 {
+            meta.freq += 1;
         }
 
-        let raw = RawItem::from_ptr(entry.data.as_mut_ptr());
+        let raw = RawItem::from_ptr(self.slab.data_ptr(index).unwrap());
         let cas = self.hashtable.get_cas(hash);
 
         let item = Item::new(raw, cas);
@@ -122,8 +122,8 @@ impl S3Fifo {
         let index = self.hashtable.get(key, hash, &self.slab)?;
 
         let (expire_at, deleted) = {
-            let entry = self.slab.get(index)?;
-            (entry.expire_at, entry.deleted)
+            let meta = self.slab.get(index)?;
+            (meta.expire_at, meta.deleted)
         };
 
         if deleted {
@@ -136,8 +136,7 @@ impl S3Fifo {
             return None;
         }
 
-        let entry = self.slab.get_mut(index).unwrap();
-        let raw = RawItem::from_ptr(entry.data.as_mut_ptr());
+        let raw = RawItem::from_ptr(self.slab.data_ptr(index).unwrap());
         let cas = self.hashtable.get_cas(hash);
 
         let item = Item::new(raw, cas);
@@ -219,22 +218,26 @@ impl S3Fifo {
         };
 
         let queue = if use_main { Queue::Main } else { Queue::Small };
-        let index = self.slab.allocate(size, hash, expire_at, queue);
+        let index = self
+            .slab
+            .allocate(size, hash, expire_at, queue)
+            .ok_or(S3FifoError::NoFreeSpace)?;
 
-        // Write item data into the slab buffer
+        // Write item data into the arena buffer
         {
-            let entry = self.slab.get_mut(index).unwrap();
-            let mut raw = RawItem::from_ptr(entry.data.as_mut_ptr());
+            let ptr = self.slab.data_ptr(index).unwrap();
+            let mut raw = RawItem::from_ptr(ptr);
             raw.define(key, value, optional);
         }
+
+        // The actual allocated size (may be larger due to size-class rounding)
+        let alloc_size = self.slab.item_size(index).unwrap();
 
         // Insert into hashtable
         match self.hashtable.insert(hash, index, key, &self.slab) {
             Ok(old) => {
                 if let Some(old_index) = old {
-                    // Replaced an existing entry (shouldn't normally happen
-                    // since we deleted above, but handle gracefully)
-                    let old_size = self.slab.get(old_index).map(|e| e.data.len()).unwrap_or(0);
+                    let old_size = self.slab.item_size(old_index).unwrap_or(0);
                     self.slab.free(old_index);
                     self.current_bytes -= old_size;
                     self.live_items -= 1;
@@ -251,9 +254,9 @@ impl S3Fifo {
             self.main.push_back(index);
         } else {
             self.small.push_back(index);
-            self.small_bytes += size;
+            self.small_bytes += alloc_size;
         }
-        self.current_bytes += size;
+        self.current_bytes += alloc_size;
         self.live_items += 1;
 
         #[cfg(feature = "metrics")]
@@ -301,13 +304,11 @@ impl S3Fifo {
     ) -> Result<(), S3FifoError> {
         let hash = self.hashtable.hash(key);
 
-        // Check that the item exists
         let _index = self
             .hashtable
             .get(key, hash, &self.slab)
             .ok_or(S3FifoError::NotFound)?;
 
-        // Check CAS value
         let bucket_cas = self.hashtable.get_cas(hash);
         if cas != bucket_cas {
             return Err(S3FifoError::Exists);
@@ -336,11 +337,10 @@ impl S3Fifo {
 
         if let Some(index) = self.hashtable.delete(key, hash, &self.slab) {
             let (size, queue) = match self.slab.get(index) {
-                Some(e) => (e.data.len(), e.queue),
+                Some(meta) => (meta.alloc_size as usize, meta.queue),
                 None => return false,
             };
 
-            // Mark as deleted (tombstone) for lazy cleanup from queues
             self.slab.get_mut(index).unwrap().deleted = true;
 
             self.current_bytes -= size;
@@ -415,8 +415,8 @@ impl S3Fifo {
             .get(key, hash, &self.slab)
             .ok_or(S3FifoError::NotFound)?;
 
-        let entry = self.slab.get_mut(index).ok_or(S3FifoError::NotFound)?;
-        let mut raw = RawItem::from_ptr(entry.data.as_mut_ptr());
+        let ptr = self.slab.data_ptr(index).ok_or(S3FifoError::NotFound)?;
+        let mut raw = RawItem::from_ptr(ptr);
         raw.wrapping_add(rhs).map_err(|_| S3FifoError::NotNumeric)?;
 
         let cas = self.hashtable.get_cas(hash);
@@ -432,8 +432,8 @@ impl S3Fifo {
             .get(key, hash, &self.slab)
             .ok_or(S3FifoError::NotFound)?;
 
-        let entry = self.slab.get_mut(index).ok_or(S3FifoError::NotFound)?;
-        let mut raw = RawItem::from_ptr(entry.data.as_mut_ptr());
+        let ptr = self.slab.data_ptr(index).ok_or(S3FifoError::NotFound)?;
+        let mut raw = RawItem::from_ptr(ptr);
         raw.saturating_sub(rhs)
             .map_err(|_| S3FifoError::NotNumeric)?;
 
@@ -450,7 +450,7 @@ impl S3Fifo {
     /// Remove an item from the hashtable and mark it deleted in the slab.
     fn remove_item_internal(&mut self, index: u32, hash: u64) {
         let (size, queue) = match self.slab.get(index) {
-            Some(e) if !e.deleted => (e.data.len(), e.queue),
+            Some(meta) if !meta.deleted => (meta.alloc_size as usize, meta.queue),
             _ => return,
         };
 
@@ -490,11 +490,7 @@ impl S3Fifo {
         }
     }
 
-    /// Try to evict one item from the cache, freeing bytes. Tries small
-    /// first (evicting items with freq == 0, promoting those with freq > 0),
-    /// then main.
     fn evict_one(&mut self) -> bool {
-        // Try small: scan until we find an item with freq == 0 to evict
         let small_len = self.small.len();
         for _ in 0..small_len {
             match self.process_small_head() {
@@ -504,7 +500,6 @@ impl S3Fifo {
             }
         }
 
-        // Small exhausted or all promoted; try main
         let main_len = self.main.len();
         for _ in 0..main_len {
             match self.process_main_head() {
@@ -517,8 +512,6 @@ impl S3Fifo {
         false
     }
 
-    /// Drain one non-tombstone item from the small queue. Returns true if an
-    /// item was processed (promoted or evicted).
     fn drain_small_one(&mut self) -> bool {
         matches!(
             self.process_small_head(),
@@ -526,10 +519,6 @@ impl S3Fifo {
         )
     }
 
-    /// Pop the head of the small queue and process it according to S3-FIFO:
-    /// - tombstone/expired → free and report Freed
-    /// - freq > 0 → promote to main, report Moved
-    /// - freq == 0 → evict, add to ghost, report Freed
     fn process_small_head(&mut self) -> ProcessResult {
         let index = match self.small.pop_front() {
             Some(idx) => idx,
@@ -537,19 +526,18 @@ impl S3Fifo {
         };
 
         let (deleted, freq, hash, size, expire_at) = match self.slab.get(index) {
-            Some(entry) => (
-                entry.deleted,
-                entry.freq,
-                entry.hash,
-                entry.data.len(),
-                entry.expire_at,
+            Some(meta) => (
+                meta.deleted,
+                meta.freq,
+                meta.hash,
+                meta.alloc_size as usize,
+                meta.expire_at,
             ),
-            None => return ProcessResult::Freed, // shouldn't happen
+            None => return ProcessResult::Freed,
         };
 
         if deleted {
             self.slab.free(index);
-            // Recurse to get the next real item
             return self.process_small_head();
         }
 
@@ -568,10 +556,9 @@ impl S3Fifo {
         }
 
         if freq > 0 {
-            // Promote to main, reset frequency
-            let entry = self.slab.get_mut(index).unwrap();
-            entry.freq = 0;
-            entry.queue = Queue::Main;
+            let meta = self.slab.get_mut(index).unwrap();
+            meta.freq = 0;
+            meta.queue = Queue::Main;
 
             self.small_bytes -= size;
             self.main.push_back(index);
@@ -581,7 +568,6 @@ impl S3Fifo {
 
             ProcessResult::Moved
         } else {
-            // Evict: add fingerprint to ghost, remove from cache
             self.ghost.insert(hash);
             self.hashtable.remove_by_index(hash, index);
             self.slab.free(index);
@@ -596,10 +582,6 @@ impl S3Fifo {
         }
     }
 
-    /// Pop the head of the main queue and process it:
-    /// - tombstone/expired → free and report Freed
-    /// - freq > 0 → reinsert at tail, report Moved
-    /// - freq == 0 → evict, report Freed
     fn process_main_head(&mut self) -> ProcessResult {
         let index = match self.main.pop_front() {
             Some(idx) => idx,
@@ -607,12 +589,12 @@ impl S3Fifo {
         };
 
         let (deleted, freq, hash, size, expire_at) = match self.slab.get(index) {
-            Some(entry) => (
-                entry.deleted,
-                entry.freq,
-                entry.hash,
-                entry.data.len(),
-                entry.expire_at,
+            Some(meta) => (
+                meta.deleted,
+                meta.freq,
+                meta.hash,
+                meta.alloc_size as usize,
+                meta.expire_at,
             ),
             None => return ProcessResult::Freed,
         };
@@ -636,9 +618,8 @@ impl S3Fifo {
         }
 
         if freq > 0 {
-            // Reinsert at tail of main, reset frequency
-            let entry = self.slab.get_mut(index).unwrap();
-            entry.freq = 0;
+            let meta = self.slab.get_mut(index).unwrap();
+            meta.freq = 0;
 
             self.main.push_back(index);
 
@@ -647,7 +628,6 @@ impl S3Fifo {
 
             ProcessResult::Moved
         } else {
-            // Evict
             self.hashtable.remove_by_index(hash, index);
             self.slab.free(index);
             self.current_bytes -= size;
@@ -660,8 +640,6 @@ impl S3Fifo {
         }
     }
 
-    /// Expire items in the small queue. We rotate through the queue, removing
-    /// expired and tombstoned items, and putting live items back.
     fn expire_queue_small(&mut self, now: u32) -> usize {
         let mut queue = std::mem::take(&mut self.small);
         let mut count = 0;
@@ -669,27 +647,30 @@ impl S3Fifo {
 
         for _ in 0..len {
             let index = queue.pop_front().unwrap();
-            match self.slab.get(index) {
-                Some(entry) if !entry.deleted => {
-                    if entry.expire_at > 0 && now >= entry.expire_at {
-                        let hash = entry.hash;
-                        let size = entry.data.len();
-                        self.hashtable.remove_by_index(hash, index);
-                        self.slab.free(index);
-                        self.small_bytes -= size;
-                        self.current_bytes -= size;
-                        self.live_items -= 1;
-                        count += 1;
+            let (expired, hash, size, deleted) = match self.slab.get(index) {
+                Some(meta) if !meta.deleted => (
+                    meta.expire_at > 0 && now >= meta.expire_at,
+                    meta.hash,
+                    meta.alloc_size as usize,
+                    false,
+                ),
+                _ => (false, 0, 0, true),
+            };
 
-                        #[cfg(feature = "metrics")]
-                        ITEM_EXPIRE.increment();
-                    } else {
-                        queue.push_back(index);
-                    }
-                }
-                _ => {
-                    self.slab.free(index);
-                }
+            if deleted {
+                self.slab.free(index);
+            } else if expired {
+                self.hashtable.remove_by_index(hash, index);
+                self.slab.free(index);
+                self.small_bytes -= size;
+                self.current_bytes -= size;
+                self.live_items -= 1;
+                count += 1;
+
+                #[cfg(feature = "metrics")]
+                ITEM_EXPIRE.increment();
+            } else {
+                queue.push_back(index);
             }
         }
 
@@ -697,7 +678,6 @@ impl S3Fifo {
         count
     }
 
-    /// Expire items in the main queue.
     fn expire_queue_main(&mut self, now: u32) -> usize {
         let mut queue = std::mem::take(&mut self.main);
         let mut count = 0;
@@ -705,26 +685,29 @@ impl S3Fifo {
 
         for _ in 0..len {
             let index = queue.pop_front().unwrap();
-            match self.slab.get(index) {
-                Some(entry) if !entry.deleted => {
-                    if entry.expire_at > 0 && now >= entry.expire_at {
-                        let hash = entry.hash;
-                        let size = entry.data.len();
-                        self.hashtable.remove_by_index(hash, index);
-                        self.slab.free(index);
-                        self.current_bytes -= size;
-                        self.live_items -= 1;
-                        count += 1;
+            let (expired, hash, size, deleted) = match self.slab.get(index) {
+                Some(meta) if !meta.deleted => (
+                    meta.expire_at > 0 && now >= meta.expire_at,
+                    meta.hash,
+                    meta.alloc_size as usize,
+                    false,
+                ),
+                _ => (false, 0, 0, true),
+            };
 
-                        #[cfg(feature = "metrics")]
-                        ITEM_EXPIRE.increment();
-                    } else {
-                        queue.push_back(index);
-                    }
-                }
-                _ => {
-                    self.slab.free(index);
-                }
+            if deleted {
+                self.slab.free(index);
+            } else if expired {
+                self.hashtable.remove_by_index(hash, index);
+                self.slab.free(index);
+                self.current_bytes -= size;
+                self.live_items -= 1;
+                count += 1;
+
+                #[cfg(feature = "metrics")]
+                ITEM_EXPIRE.increment();
+            } else {
+                queue.push_back(index);
             }
         }
 
@@ -734,10 +717,7 @@ impl S3Fifo {
 }
 
 enum ProcessResult {
-    /// Item was evicted or expired, freeing total bytes
     Freed,
-    /// Item was promoted or reinserted (no total bytes freed)
     Moved,
-    /// Queue is empty
     Empty,
 }

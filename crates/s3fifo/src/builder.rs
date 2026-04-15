@@ -128,7 +128,7 @@ impl Builder {
 
         Ok(S3Fifo {
             hashtable,
-            slab: Slab::new(),
+            slab: Slab::new(self.heap_size)?,
             small: VecDeque::new(),
             main: VecDeque::new(),
             ghost: GhostQueue::new(ghost_capacity),
