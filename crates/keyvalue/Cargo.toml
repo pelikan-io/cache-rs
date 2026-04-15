@@ -1,0 +1,12 @@
+[package]
+name = "keyvalue"
+version = "0.1.0"
+description = "Shared key-value item types for cache storage engines"
+
+edition = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+
+[features]
+magic = []
+debug = ["magic"]

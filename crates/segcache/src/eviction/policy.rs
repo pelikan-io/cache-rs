@@ -4,7 +4,7 @@
 
 /// Policies define the eviction strategy to be used. All eviction strategies
 /// exclude segments which are currently accepting new items.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug)]
 pub enum Policy {
     /// No eviction. When all the segments are full, inserts will fail until
     /// segments are freed by TTL expiration.
@@ -58,5 +58,21 @@ pub enum Policy {
         ///
         /// Note: Compaction will be disabled by setting this parameter to zero.
         compact: usize,
+    },
+    /// S3-FIFO eviction (S3-Segcache) uses two pools of segments — admission
+    /// and main — plus a ghost queue of recently evicted key fingerprints.
+    /// New items are written to admission-pool segments. When an admission
+    /// segment is evicted, items with frequency > 0 are promoted (copied
+    /// into a main-pool segment); items with frequency == 0 are dropped and
+    /// their hashes added to the ghost queue. Main-pool segments use
+    /// CLOCK-style second-chance eviction.
+    ///
+    /// If a newly inserted key's hash is found in the ghost queue, the item
+    /// is written directly to a main-pool segment, bypassing admission.
+    S3Fifo {
+        /// Ratio of total segments allocated to the admission pool,
+        /// between 0.0 and 1.0. The remaining segments form the main
+        /// pool. Typical values are 0.05–0.20. Default: 0.10.
+        admission_ratio: f64,
     },
 }

@@ -640,6 +640,11 @@ impl HashTable {
         false
     }
 
+    /// Returns a reference to the hash builder (used by S3-FIFO ghost queue).
+    pub fn hash_builder(&self) -> &RandomState {
+        &self.hash_builder
+    }
+
     /// Internal function used to calculate a hash value for a key
     fn hash(&self, key: &[u8]) -> u64 {
         #[cfg(feature = "metrics")]

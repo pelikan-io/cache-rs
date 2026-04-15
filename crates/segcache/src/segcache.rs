@@ -6,6 +6,7 @@
 
 use crate::Value;
 use crate::*;
+use core::hash::{BuildHasher, Hasher};
 use std::cmp::min;
 
 const RESERVE_RETRIES: usize = 3;
@@ -121,6 +122,34 @@ impl Segcache {
 
         let ttl = Duration::from_secs(min(u32::MAX as u64, ttl.as_secs()) as u32);
 
+        // For S3-FIFO: determine target pool based on ghost queue
+        let target_pool = if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. }) {
+            let hash = {
+                let mut hasher = self.hashtable.hash_builder().build_hasher();
+                hasher.write(key);
+                hasher.finish()
+            };
+            if self.segments.ghost_contains(hash) {
+                self.segments.ghost_remove(hash);
+                SegmentPool::Main
+            } else {
+                SegmentPool::Admission
+            }
+        } else {
+            SegmentPool::Main
+        };
+
+        // For S3-FIFO: ensure the target pool has room by evicting from it
+        // if it's at capacity. This enforces the small/main ratio computed
+        // at construction time.
+        if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. })
+            && !self.segments.pool_has_room(target_pool)
+        {
+            let _ = self
+                .segments
+                .evict(&mut self.ttl_buckets, &mut self.hashtable);
+        }
+
         // try to get a `ReservedItem`
         let mut retries = RESERVE_RETRIES;
         let reserved;
@@ -132,6 +161,17 @@ impl Segcache {
             {
                 Ok(mut reserved_item) => {
                     reserved_item.define(key, value, optional);
+                    // Set the segment pool for S3-FIFO (only transitions
+                    // Main→Admission need a counter update; fresh segments
+                    // default to Main)
+                    if let Ok(mut seg) = self.segments.get_mut(reserved_item.seg()) {
+                        if target_pool == SegmentPool::Admission
+                            && seg.pool() != SegmentPool::Admission
+                        {
+                            seg.set_pool(target_pool);
+                            self.segments.incr_pool(SegmentPool::Admission);
+                        }
+                    }
                     reserved = reserved_item;
                     break;
                 }

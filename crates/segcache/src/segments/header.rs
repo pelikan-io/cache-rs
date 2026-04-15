@@ -60,7 +60,18 @@ pub struct SegmentHeader {
     accessible: bool,
     /// Is the segment evictable?
     evictable: bool,
-    _pad: [u8; 25],
+    /// Which pool the segment belongs to (used by S3-FIFO policy)
+    pool: SegmentPool,
+    _pad: [u8; 24],
+}
+
+/// Which pool a segment belongs to. Only meaningful under `Policy::S3Fifo`;
+/// other policies leave all segments as `Main`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum SegmentPool {
+    Main = 0,
+    Admission = 1,
 }
 
 impl SegmentHeader {
@@ -78,7 +89,8 @@ impl SegmentHeader {
             merge_at: now,
             accessible: false,
             evictable: false,
-            _pad: [0; 25],
+            pool: SegmentPool::Main,
+            _pad: [0; 24],
         }
     }
 
@@ -265,6 +277,18 @@ impl SegmentHeader {
     /// Update the created time
     pub fn mark_merged(&mut self) {
         self.merge_at = Instant::now();
+    }
+
+    #[inline]
+    /// Returns the segment pool.
+    pub fn pool(&self) -> SegmentPool {
+        self.pool
+    }
+
+    #[inline]
+    /// Set the segment pool.
+    pub fn set_pool(&mut self, pool: SegmentPool) {
+        self.pool = pool;
     }
 
     #[inline]

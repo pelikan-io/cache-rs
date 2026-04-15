@@ -17,7 +17,7 @@ mod segments;
 
 pub(crate) use builder::SegmentsBuilder;
 pub(crate) use error::SegmentsError;
-pub(crate) use header::SegmentHeader;
+pub(crate) use header::{SegmentHeader, SegmentPool};
 pub(crate) use segment::Segment;
 pub(crate) use segments::Segments;
 

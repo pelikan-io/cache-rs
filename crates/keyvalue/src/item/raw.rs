@@ -1,32 +1,28 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 //! A raw byte-level representation of an item.
 //!
-//! Unlike an [`Item`], the [`RawItem`] does not contain any fields which are
-//! shared within a hash bucket such as the CAS value.
+//! The [`RawItem`] provides direct byte-level access to item data stored as
+//! a packed buffer of `[ItemHeader][optional][key][value]`.
 
 use super::header::ValueType;
 use crate::item::*;
-use crate::SegcacheError;
+use crate::NotNumericError;
 use crate::Value;
 
 /// The raw byte-level representation of an item
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub(crate) struct RawItem {
+pub struct RawItem {
     data: *mut u8,
 }
 
 impl RawItem {
     /// Get an immutable borrow of the item's header
-    pub(crate) fn header(&self) -> &ItemHeader {
+    pub fn header(&self) -> &ItemHeader {
         unsafe { &*(self.data as *const ItemHeader) }
     }
 
     /// Get a mutable borrow of the item's header
-    pub(crate) fn header_mut(&mut self) -> *mut ItemHeader {
+    pub fn header_mut(&mut self) -> *mut ItemHeader {
         self.data as *mut ItemHeader
     }
 
@@ -38,18 +34,18 @@ impl RawItem {
     /// item or a pointer which is not 64bit aligned will result in undefined
     /// behavior. It is up to the caller to ensure that the item is constructed
     /// from a properly aligned pointer to valid data.
-    pub(crate) fn from_ptr(ptr: *mut u8) -> RawItem {
+    pub fn from_ptr(ptr: *mut u8) -> RawItem {
         Self { data: ptr }
     }
 
     /// Returns the key length
     #[inline]
-    pub(crate) fn klen(&self) -> u8 {
+    pub fn klen(&self) -> u8 {
         self.header().klen()
     }
 
     /// Borrow the key
-    pub(crate) fn key(&self) -> &[u8] {
+    pub fn key(&self) -> &[u8] {
         unsafe {
             let ptr = self.data.add(self.key_offset());
             let len = self.klen() as usize;
@@ -64,16 +60,13 @@ impl RawItem {
     }
 
     /// Borrow the value
-    // TODO(bmartin): should probably change this to be Option<>
-    pub(crate) fn value(&self) -> Value<'_> {
+    pub fn value(&self) -> Value<'_> {
         let bytes = unsafe {
             let ptr = self.data.add(self.value_offset());
             let len = self.vlen() as usize;
             std::slice::from_raw_parts(ptr, len)
         };
 
-        // TODO(bmartin): consider allowing other return types here by encoding
-        // the type in the vlen portion of the header
         match self.header().value_type() {
             Some(ValueType::U64) => Value::U64(u64::from_be_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -84,12 +77,12 @@ impl RawItem {
 
     /// Returns the optional data length
     #[inline]
-    pub(crate) fn olen(&self) -> u8 {
+    pub fn olen(&self) -> u8 {
         self.header().olen()
     }
 
     /// Borrow the optional data
-    pub(crate) fn optional(&self) -> Option<&[u8]> {
+    pub fn optional(&self) -> Option<&[u8]> {
         if self.olen() > 0 {
             unsafe {
                 let ptr = self.data.add(self.optional_offset());
@@ -103,12 +96,12 @@ impl RawItem {
 
     /// Check the header magic bytes
     #[inline]
-    pub(crate) fn check_magic(&self) {
+    pub fn check_magic(&self) {
         self.header().check_magic()
     }
 
     /// Copy data into the item
-    pub(crate) fn define(&mut self, key: &[u8], value: Value, optional: &[u8]) {
+    pub fn define(&mut self, key: &[u8], value: Value, optional: &[u8]) {
         unsafe {
             (*self.header_mut()).init();
         }
@@ -177,14 +170,14 @@ impl RawItem {
     }
 
     /// Returns item size, rounded up for alignment
-    pub(crate) fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         (((ITEM_HDR_SIZE + self.olen() as usize + self.klen() as usize + self.vlen() as usize)
             >> 3)
             + 1)
             << 3
     }
 
-    pub(crate) fn wrapping_add(&mut self, rhs: u64) -> Result<(), SegcacheError> {
+    pub fn wrapping_add(&mut self, rhs: u64) -> Result<(), NotNumericError> {
         match self.value() {
             Value::U64(v) => unsafe {
                 let new = v.wrapping_add(rhs);
@@ -195,11 +188,11 @@ impl RawItem {
                 );
                 Ok(())
             },
-            _ => Err(SegcacheError::NotNumeric),
+            _ => Err(NotNumericError),
         }
     }
 
-    pub(crate) fn saturating_sub(&mut self, rhs: u64) -> Result<(), SegcacheError> {
+    pub fn saturating_sub(&mut self, rhs: u64) -> Result<(), NotNumericError> {
         match self.value() {
             Value::U64(v) => unsafe {
                 let new = v.saturating_sub(rhs);
@@ -210,7 +203,7 @@ impl RawItem {
                 );
                 Ok(())
             },
-            _ => Err(SegcacheError::NotNumeric),
+            _ => Err(NotNumericError),
         }
     }
 }

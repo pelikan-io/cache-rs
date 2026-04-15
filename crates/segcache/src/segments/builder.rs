@@ -5,7 +5,6 @@
 //! A builder struct for initializing segment storage.
 
 use crate::eviction::*;
-use crate::item::*;
 use crate::segments::*;
 
 use std::path::{Path, PathBuf};

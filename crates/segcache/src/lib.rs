@@ -47,7 +47,6 @@ mod rand;
 mod segcache;
 mod segments;
 mod ttl_buckets;
-mod value;
 
 #[cfg(feature = "metrics")]
 mod metrics;
@@ -62,12 +61,13 @@ pub use builder::Builder;
 pub use error::SegcacheError;
 pub use eviction::Policy;
 pub use item::Item;
-pub use value::Value;
+pub use keyvalue::Value;
 
 // items from submodules which are imported for convenience to the crate level
 pub(crate) use crate::rand::*;
 pub(crate) use hashtable::*;
 pub(crate) use item::*;
+pub(crate) use keyvalue::{size_of, RawItem, ITEM_HDR_SIZE};
 pub(crate) use segments::*;
 pub(crate) use ttl_buckets::*;
 

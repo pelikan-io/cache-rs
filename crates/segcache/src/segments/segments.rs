@@ -3,8 +3,8 @@
 // Licensed under the MIT and Apache-2.0 licenses
 
 use crate::eviction::*;
-use crate::item::*;
 use crate::segments::*;
+use core::hash::{BuildHasher, Hasher};
 use core::num::NonZeroU32;
 use datatier::*;
 
@@ -28,6 +28,10 @@ pub(crate) struct Segments {
     flush_at: Instant,
     /// Eviction configuration and state
     evict: Box<Eviction>,
+    /// Max segments in the admission pool (S3-FIFO only, 0 for other policies)
+    admission_cap: u32,
+    /// Current number of segments in the admission pool
+    admission_count: u32,
 }
 
 impl Segments {
@@ -93,6 +97,12 @@ impl Segments {
             SEGMENT_FREE.set(segments as _);
         }
 
+        let admission_cap = if let Policy::S3Fifo { admission_ratio } = evict_policy {
+            (segments as f64 * admission_ratio).round() as u32
+        } else {
+            0
+        };
+
         Ok(Self {
             headers,
             segment_size,
@@ -102,7 +112,30 @@ impl Segments {
             data,
             flush_at: Instant::now(),
             evict: Box::new(Eviction::new(segments, evict_policy)),
+            admission_cap,
+            admission_count: 0,
         })
+    }
+
+    /// Check if the given pool has room for another segment.
+    pub(crate) fn pool_has_room(&self, pool: SegmentPool) -> bool {
+        match pool {
+            SegmentPool::Admission => self.admission_count < self.admission_cap,
+            SegmentPool::Main => true,
+        }
+    }
+
+    /// Track a segment transitioning to the given pool.
+    pub(crate) fn incr_pool(&mut self, pool: SegmentPool) {
+        if pool == SegmentPool::Admission {
+            self.admission_count += 1;
+        }
+    }
+
+    /// Return the configured eviction policy.
+    #[inline]
+    pub fn evict_policy(&self) -> Policy {
+        self.evict.policy()
     }
 
     /// Return the size of each segment in bytes
@@ -235,6 +268,17 @@ impl Segments {
                 }
 
                 Err(SegmentsError::NoEvictableSegments)
+            }
+            Policy::S3Fifo { .. } => {
+                #[cfg(feature = "metrics")]
+                SEGMENT_EVICT.increment();
+
+                let result = self.s3fifo_evict(ttl_buckets, hashtable);
+
+                #[cfg(feature = "metrics")]
+                EVICT_TIME.add(now.elapsed().as_nanos() as _);
+
+                result
             }
             Policy::None => {
                 #[cfg(feature = "metrics")]
@@ -398,6 +442,8 @@ impl Segments {
             SEGMENT_FREE.increment();
         }
 
+        let id_idx = id.get() as usize - 1;
+
         // unlinks the next segment
         self.unlink(id);
 
@@ -405,9 +451,14 @@ impl Segments {
         self.push_front(id, self.free_q);
         self.free_q = Some(id);
 
-        let id_idx = id.get() as usize - 1;
         assert!(!self.headers[id_idx].evictable());
         self.headers[id_idx].set_accessible(false);
+
+        // Decrement pool counter before resetting to default
+        if self.headers[id_idx].pool() == SegmentPool::Admission {
+            self.admission_count = self.admission_count.saturating_sub(1);
+        }
+        self.headers[id_idx].set_pool(SegmentPool::Main);
 
         self.headers[id_idx].reset();
 
@@ -934,5 +985,276 @@ impl Segments {
         }
 
         Ok(next_id)
+    }
+
+    // ── S3-FIFO eviction ─────────────────────────────────────────────
+
+    /// Find the oldest evictable segment in the given pool across all TTL
+    /// buckets.
+    fn find_oldest_seg_in_pool(
+        &self,
+        ttl_buckets: &TtlBuckets,
+        pool: SegmentPool,
+    ) -> Option<NonZeroU32> {
+        let mut best: Option<(NonZeroU32, Instant)> = None;
+
+        for bucket in &ttl_buckets.buckets {
+            let mut id_opt = bucket.head();
+            while let Some(id) = id_opt {
+                let hdr = &self.headers[id.get() as usize - 1];
+                if hdr.pool() == pool && hdr.can_evict() {
+                    let age = std::cmp::max(hdr.create_at(), hdr.merge_at());
+                    if best.is_none() || age < best.unwrap().1 {
+                        best = Some((id, age));
+                    }
+                }
+                id_opt = hdr.next_seg();
+            }
+        }
+
+        best.map(|(id, _)| id)
+    }
+
+    /// S3-FIFO eviction entry point. Tries admission pool first (the
+    /// filtering step), then main pool (CLOCK second-chance).
+    fn s3fifo_evict(
+        &mut self,
+        ttl_buckets: &mut TtlBuckets,
+        hashtable: &mut HashTable,
+    ) -> Result<(), SegmentsError> {
+        // Try evicting an admission-pool segment first (promoting freq > 0)
+        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, SegmentPool::Admission) {
+            return self.s3fifo_evict_admission(seg_id, ttl_buckets, hashtable);
+        }
+
+        // No admission-pool segments evictable; try main pool
+        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, SegmentPool::Main) {
+            return self.s3fifo_evict_main(seg_id, ttl_buckets, hashtable);
+        }
+
+        #[cfg(feature = "metrics")]
+        SEGMENT_EVICT_EX.increment();
+
+        Err(SegmentsError::NoEvictableSegments)
+    }
+
+    /// Evict an admission-pool segment. Items with freq > 0 are promoted
+    /// (copied to a main-pool segment). Items with freq == 0 are dropped
+    /// and their key hashes are added to the ghost queue.
+    fn s3fifo_evict_admission(
+        &mut self,
+        seg_id: NonZeroU32,
+        ttl_buckets: &mut TtlBuckets,
+        hashtable: &mut HashTable,
+    ) -> Result<(), SegmentsError> {
+        // First pass: copy items with freq > 0 into a main-pool segment.
+        // We try to acquire a free segment for the promoted items.
+        let target_id = self.pop_free();
+
+        if let Some(tid) = target_id {
+            // Mark the target as a main-pool segment
+            self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
+
+            let src_ttl = self.headers[seg_id.get() as usize - 1].ttl();
+            self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
+            self.headers[tid.get() as usize - 1].set_accessible(true);
+            self.headers[tid.get() as usize - 1].set_evictable(true);
+
+            // Link target into the TTL bucket
+            let ttl_bucket = ttl_buckets.get_mut_bucket(src_ttl);
+            let old_head = ttl_bucket.head();
+            ttl_bucket.set_head(Some(tid));
+            self.push_front(tid, old_head);
+
+            self.s3fifo_promote_from(seg_id, tid, hashtable);
+        }
+        // If no free segment, we just drop everything (all items evicted)
+
+        // Add hashes of remaining (freq == 0) items to ghost queue
+        self.s3fifo_ghost_remaining(seg_id, hashtable);
+
+        // Clear and free the source segment
+        self.clear_segment(seg_id, hashtable, false)
+            .map_err(|_| SegmentsError::EvictFailure)?;
+
+        let id_idx = seg_id.get() as usize - 1;
+        if self.headers[id_idx].prev_seg().is_none() {
+            let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
+            ttl_bucket.set_head(self.headers[id_idx].next_seg());
+        }
+        self.push_free(seg_id);
+
+        Ok(())
+    }
+
+    /// Copy items with freq > 0 from src to dst (promotion).
+    fn s3fifo_promote_from(
+        &mut self,
+        src_id: NonZeroU32,
+        dst_id: NonZeroU32,
+        hashtable: &mut HashTable,
+    ) {
+        let seg_size = self.segment_size() as usize;
+        let (mut src, mut dst) = match self.get_mut_pair(src_id, dst_id) {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+
+        let max_offset = src.max_item_offset();
+        let mut offset = if cfg!(feature = "magic") {
+            std::mem::size_of_val(&SEG_MAGIC)
+        } else {
+            0
+        };
+
+        while offset <= max_offset {
+            let item = match src.get_item_at(offset) {
+                Some(i) => i,
+                None => break,
+            };
+            if item.klen() == 0 && src.live_items() == 0 {
+                break;
+            }
+            item.check_magic();
+
+            let item_size = item.size();
+            let deleted = !hashtable.is_item_at(item.key(), src.id(), offset as u64);
+            if deleted {
+                offset += item_size;
+                continue;
+            }
+
+            let freq = hashtable
+                .get_freq(item.key(), &mut src, offset as u64)
+                .unwrap_or(0)
+                & 0x7F;
+
+            if freq > 0 {
+                let write_offset = dst.write_offset() as usize;
+                if write_offset + item_size < seg_size
+                    && hashtable
+                        .relink_item(
+                            item.key(),
+                            src.id(),
+                            dst.id(),
+                            offset as u64,
+                            write_offset as u64,
+                        )
+                        .is_ok()
+                {
+                    unsafe {
+                        let s = src.data_ptr().add(offset);
+                        let d = dst.data_ptr().add(write_offset);
+                        std::ptr::copy_nonoverlapping(s, d, item_size);
+                    }
+                    src.remove_item_at(offset);
+                    dst.incr_live_items();
+                    dst.incr_live_bytes(item_size as i32);
+                    dst.set_write_offset(write_offset as i32 + item_size as i32);
+
+                    #[cfg(feature = "metrics")]
+                    ITEM_COMPACTED.increment();
+                }
+                // If no room in target, item stays in source and will be evicted
+            }
+
+            offset += item_size;
+        }
+    }
+
+    /// Add hashes of remaining live items in a segment to the ghost queue.
+    fn s3fifo_ghost_remaining(&mut self, seg_id: NonZeroU32, hashtable: &mut HashTable) {
+        // Collect hashes first to avoid borrow conflict with self.evict.ghost
+        let mut hashes = Vec::new();
+        {
+            let mut segment = match self.get_mut(seg_id) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+
+            let max_offset = segment.max_item_offset();
+            let mut offset = if cfg!(feature = "magic") {
+                std::mem::size_of_val(&SEG_MAGIC)
+            } else {
+                0
+            };
+
+            while offset <= max_offset {
+                let item = match segment.get_item_at(offset) {
+                    Some(i) => i,
+                    None => break,
+                };
+                if item.klen() == 0 {
+                    break;
+                }
+
+                let item_size = item.size();
+                let deleted = !hashtable.is_item_at(item.key(), segment.id(), offset as u64);
+                if !deleted {
+                    let mut hasher = hashtable.hash_builder().build_hasher();
+                    hasher.write(item.key());
+                    hashes.push(hasher.finish());
+                }
+
+                offset += item_size;
+            }
+        }
+
+        for hash in hashes {
+            self.evict.ghost.insert(hash);
+        }
+    }
+
+    /// Evict a main-pool segment using CLOCK-style second chance.
+    /// Items with freq > 0 are copied to a fresh main segment (second
+    /// chance). Items with freq == 0 are dropped.
+    fn s3fifo_evict_main(
+        &mut self,
+        seg_id: NonZeroU32,
+        ttl_buckets: &mut TtlBuckets,
+        hashtable: &mut HashTable,
+    ) -> Result<(), SegmentsError> {
+        // Try to get a target segment for second-chance items
+        let target_id = self.pop_free();
+
+        if let Some(tid) = target_id {
+            self.headers[tid.get() as usize - 1].set_pool(SegmentPool::Main);
+
+            let src_ttl = self.headers[seg_id.get() as usize - 1].ttl();
+            self.headers[tid.get() as usize - 1].set_ttl(src_ttl);
+            self.headers[tid.get() as usize - 1].set_accessible(true);
+            self.headers[tid.get() as usize - 1].set_evictable(true);
+
+            let ttl_bucket = ttl_buckets.get_mut_bucket(src_ttl);
+            let old_head = ttl_bucket.head();
+            ttl_bucket.set_head(Some(tid));
+            self.push_front(tid, old_head);
+
+            // Copy freq > 0 items (same promote logic, but no ghost)
+            self.s3fifo_promote_from(seg_id, tid, hashtable);
+        }
+
+        // Clear and free the source
+        self.clear_segment(seg_id, hashtable, false)
+            .map_err(|_| SegmentsError::EvictFailure)?;
+
+        let id_idx = seg_id.get() as usize - 1;
+        if self.headers[id_idx].prev_seg().is_none() {
+            let ttl_bucket = ttl_buckets.get_mut_bucket(self.headers[id_idx].ttl());
+            ttl_bucket.set_head(self.headers[id_idx].next_seg());
+        }
+        self.push_free(seg_id);
+
+        Ok(())
+    }
+
+    /// Check if a key hash is in the ghost queue (S3-FIFO).
+    pub(crate) fn ghost_contains(&self, hash: u64) -> bool {
+        self.evict.ghost.contains(hash)
+    }
+
+    /// Remove a hash from the ghost queue (on ghost hit).
+    pub(crate) fn ghost_remove(&mut self, hash: u64) {
+        self.evict.ghost.remove(hash);
     }
 }

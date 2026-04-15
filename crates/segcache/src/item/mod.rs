@@ -4,18 +4,14 @@
 
 //! Items are the base unit of data stored within the cache.
 
-mod header;
-mod raw;
 mod reserved;
 
 #[cfg(any(feature = "magic", feature = "debug"))]
-pub(crate) use header::ITEM_MAGIC_SIZE;
+pub(crate) use keyvalue::ITEM_MAGIC_SIZE;
 
 use crate::SegcacheError;
-use crate::Value;
+use keyvalue::{RawItem, Value};
 
-pub(crate) use header::{ItemHeader, ITEM_HDR_SIZE};
-pub(crate) use raw::RawItem;
 pub(crate) use reserved::ReservedItem;
 
 /// Items are the base unit of data stored within the cache.
@@ -64,13 +60,17 @@ impl Item {
     /// Perform a wrapping addition on the value. Returns an error if the item
     /// is not a numeric type.
     pub fn wrapping_add(&mut self, rhs: u64) -> Result<(), SegcacheError> {
-        self.raw.wrapping_add(rhs)
+        self.raw
+            .wrapping_add(rhs)
+            .map_err(|_| SegcacheError::NotNumeric)
     }
 
     /// Perform a saturating subtraction on the value. Returns an error if the
     /// item is not a numeric type.
     pub fn saturating_sub(&mut self, rhs: u64) -> Result<(), SegcacheError> {
-        self.raw.saturating_sub(rhs)
+        self.raw
+            .saturating_sub(rhs)
+            .map_err(|_| SegcacheError::NotNumeric)
     }
 }
 
@@ -80,12 +80,5 @@ impl std::fmt::Debug for Item {
             .field("cas", &self.cas())
             .field("raw", &self.raw)
             .finish()
-    }
-}
-
-pub fn size_of(value: &Value) -> usize {
-    match value {
-        Value::Bytes(v) => v.len(),
-        Value::U64(_) => core::mem::size_of::<u64>(),
     }
 }
