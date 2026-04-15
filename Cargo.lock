@@ -274,7 +274,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "datatier"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "clocksource",
@@ -869,7 +869,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "segcache"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "clocksource",
