@@ -117,7 +117,7 @@ Eight policies, set at construction time. The storage layer is identical for all
 | `Cte` | Segment closest to expiration | No |
 | `Util` | Segment with fewest live bytes | No |
 | `Merge` | Sequential segments in a TTL chain | Yes — frequency-based pruning |
-| `S3Fifo` | Oldest small-pool or main-pool segment | Yes — frequency-based promotion |
+| `S3Fifo` | Oldest small-pool or main-pool segment | Yes — frequency-based promotion ([S3-Segcache](s3fifo.md)) |
 
 The first six policies evict the entire selected segment — all items are dropped. `Merge` and `S3Fifo` are more sophisticated: they scan items within the segment and selectively copy high-value items to a fresh segment before freeing the source.
 
@@ -132,9 +132,9 @@ The `Merge` policy is segcache's original innovation. Instead of discarding an e
 
 Parameters: `max` (max segments per pass), `merge` (target merge count), `compact` (compaction threshold — segments below 1/N occupancy trigger compaction).
 
-### S3-FIFO Eviction
+### S3-Segcache Eviction
 
-The `S3Fifo` policy ([detailed description](s3fifo.md)) introduces a two-pool architecture within the same segment infrastructure:
+The `S3Fifo` policy ([detailed description](s3fifo.md)) — referred to as **S3-Segcache** when describing the full configuration — introduces a two-pool architecture within the same segment infrastructure:
 
 - **Small pool** (~10% of segments): Probationary. New items land here. When a small segment is evicted, items with `freq > 0` are promoted (copied to a main segment), items with `freq == 0` are dropped and their key hashes added to a ghost queue.
 - **Main pool** (~90% of segments): Proven items. Eviction uses CLOCK-style second chance — items with `freq > 0` are copied to a fresh main segment, items with `freq == 0` are dropped.

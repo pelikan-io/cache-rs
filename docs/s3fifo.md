@@ -1,8 +1,8 @@
-# S3-FIFO: Scan-Resistant Eviction Policy
+# S3-Segcache: Scan-Resistant Segment-Structured Cache
 
 ## Overview
 
-S3-FIFO is available as `Policy::S3Fifo` within segcache. It uses two pools of segments — small and main — plus a ghost queue of recently evicted key fingerprints to achieve scan-resistant caching with near-optimal hit ratios. Published at [SOSP'23](https://dl.acm.org/doi/10.1145/3600006.3613147) and described at [s3fifo.com](https://s3fifo.com/).
+S3-Segcache is segcache configured with `Policy::S3Fifo` — the S3-FIFO eviction algorithm operating on segcache's segment-structured storage engine. It uses two pools of segments — small and main — plus a ghost queue of recently evicted key fingerprints to achieve scan-resistant caching with near-optimal hit ratios. Published at [SOSP'23](https://dl.acm.org/doi/10.1145/3600006.3613147) and described at [s3fifo.com](https://s3fifo.com/).
 
 ## The Algorithm
 
@@ -69,7 +69,7 @@ When no small-pool segments are available for eviction (all have been drained or
 
 S3-FIFO uses the same frequency counters already stored in segcache's hash table slots (8-bit approximate counters with probabilistic increment). No additional per-item metadata is needed. During eviction, `hashtable.get_freq(key, segment, offset)` reads the counter without touching item data.
 
-## What S3-FIFO Inherits from Segcache
+## What S3-Segcache Inherits from Segcache
 
 By implementing S3-FIFO as a policy within segcache rather than a standalone cache, it automatically gets:
 
@@ -101,7 +101,7 @@ let mut cache = Segcache::builder()
 
 The API is identical to any other eviction policy. Only the builder's `.eviction()` call differs.
 
-## When to Use S3-FIFO
+## When to Use S3-Segcache
 
 **Best for:**
 - Skewed popularity distributions (Zipf-like) — a small set of hot keys, a long tail of cold keys
@@ -113,7 +113,7 @@ The API is identical to any other eviction policy. Only the builder's `.eviction
 - Very short TTLs dominate — TTL expiration handles most reclamation regardless of policy
 - Write-heavy with frequent overwrites — `Merge` with compaction may reclaim dead bytes more efficiently
 
-## Tradeoffs vs Other Policies
+## Tradeoffs vs Other Segcache Policies
 
 | Aspect | S3Fifo | Merge | Fifo |
 |--------|--------|-------|------|
