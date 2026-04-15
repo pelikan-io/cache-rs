@@ -3,26 +3,26 @@
 The central idea is **separation of storage from eviction**. The storage layer — segment allocation, TTL-based expiration, hash table lookup, item packing — is shared infrastructure. Eviction policies are pluggable strategies that decide *which* segment to reclaim when memory pressure occurs, without reimplementing any storage machinery.
 
 ```
-                  ┌─────────────────────────────────────┐
-                  │             segcache                 │
-                  │                                     │
-  eviction        │  ┌─────┬──────┬─────┬─────┬──────┐ │
-  policy          │  │None │Random│Fifo │Merge│S3Fifo│ │
-  (pluggable)     │  └──┬──┴──┬───┴──┬──┴──┬──┴──┬───┘ │
-                  │     └─────┴──────┴─────┴─────┘     │
-                  │               ▼                     │
-  storage         │  ┌───────────────────────────────┐  │
-  layer           │  │ segments · TTL buckets · hash │  │
-  (shared)        │  │ table · item packing · CAS    │  │
-                  │  └─────────────┬─────────────────┘  │
-                  └────────────────┼────────────────────┘
+                ┌──────────────────────────────────────┐
+                │            segcache                  │
+                │                                      │
+  eviction      │  ┌──────┬──────┬─────┬─────┬──────┐  │
+  policy        │  │ None │Random│Fifo │Merge│S3Fifo│  │
+  (pluggable)   │  └──┬───┴──┬───┴──┬──┴──┬──┴──┬───┘  │
+                │     └──────┴──────┴─────┴─────┘      │
+                │               ▼                      │
+  storage       │  ┌────────────────────────────────┐  │
+  layer         │  │ segments · TTL buckets · hash  │  │
+  (shared)      │  │ table · item packing · CAS     │  │
+                │  └───────────────┬────────────────┘  │
+                └──────────────────┼───────────────────┘
                                    │
               ┌────────────────────┼────────────────┐
               ▼                    ▼                ▼
-      ┌───────────┐         ┌───────────┐      ┌───────────┐
-      │ keyvalue  │         │ datatier  │      │ metriken  │
-      │ (items)   │         │ (mmap)    │      │ (metrics) │
-      └───────────┘         └───────────┘      └───────────┘
+        ┌───────────┐       ┌───────────┐    ┌───────────┐
+        │ keyvalue  │       │ datatier  │    │ metriken  │
+        │ (items)   │       │ (mmap)    │    │ (metrics) │
+        └───────────┘       └───────────┘    └───────────┘
 ```
 
 This means adding a new eviction algorithm — like S3-FIFO — requires only the decision logic (~250 lines), not a new storage engine. The new policy automatically inherits:
