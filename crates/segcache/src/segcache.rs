@@ -161,9 +161,14 @@ impl Segcache {
             {
                 Ok(mut reserved_item) => {
                     reserved_item.define(key, value, optional);
-                    // Set the segment pool for S3-FIFO
+                    // Set the segment pool for S3-FIFO (only transitions
+                    // Main→Small need a counter update; fresh segments
+                    // default to Main)
                     if let Ok(mut seg) = self.segments.get_mut(reserved_item.seg()) {
-                        seg.set_pool(target_pool);
+                        if target_pool == SegmentPool::Small && seg.pool() != SegmentPool::Small {
+                            seg.set_pool(target_pool);
+                            self.segments.incr_pool(SegmentPool::Small);
+                        }
                     }
                     reserved = reserved_item;
                     break;

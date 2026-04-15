@@ -22,6 +22,11 @@ impl<'a> Segment<'a> {
         self.data.as_ptr() as *mut u8
     }
 
+    /// Returns the segment pool.
+    pub fn pool(&self) -> SegmentPool {
+        self.header.pool()
+    }
+
     /// Set the segment pool (used by S3-FIFO).
     pub fn set_pool(&mut self, pool: SegmentPool) {
         self.header.set_pool(pool);

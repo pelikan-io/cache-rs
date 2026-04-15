@@ -30,6 +30,8 @@ pub(crate) struct Segments {
     evict: Box<Eviction>,
     /// Max segments in the small pool (S3-FIFO only, 0 for other policies)
     small_cap: u32,
+    /// Current number of segments in the small pool
+    small_count: u32,
 }
 
 impl Segments {
@@ -111,15 +113,22 @@ impl Segments {
             flush_at: Instant::now(),
             evict: Box::new(Eviction::new(segments, evict_policy)),
             small_cap,
+            small_count: 0,
         })
     }
 
     /// Check if the given pool has room for another segment.
     pub(crate) fn pool_has_room(&self, pool: SegmentPool) -> bool {
-        let (small_count, _) = self.pool_counts();
         match pool {
-            SegmentPool::Small => small_count < self.small_cap,
-            SegmentPool::Main => true, // main absorbs everything else
+            SegmentPool::Small => self.small_count < self.small_cap,
+            SegmentPool::Main => true,
+        }
+    }
+
+    /// Track a segment transitioning to the given pool.
+    pub(crate) fn incr_pool(&mut self, pool: SegmentPool) {
+        if pool == SegmentPool::Small {
+            self.small_count += 1;
         }
     }
 
@@ -444,7 +453,12 @@ impl Segments {
 
         assert!(!self.headers[id_idx].evictable());
         self.headers[id_idx].set_accessible(false);
-        self.headers[id_idx].set_pool(SegmentPool::Main); // reset to default
+
+        // Decrement pool counter before resetting to default
+        if self.headers[id_idx].pool() == SegmentPool::Small {
+            self.small_count = self.small_count.saturating_sub(1);
+        }
+        self.headers[id_idx].set_pool(SegmentPool::Main);
 
         self.headers[id_idx].reset();
 
@@ -974,21 +988,6 @@ impl Segments {
     }
 
     // ── S3-FIFO eviction ─────────────────────────────────────────────
-
-    /// Count the number of segments in each pool (excluding free segments).
-    fn pool_counts(&self) -> (u32, u32) {
-        let mut small = 0u32;
-        let mut total = 0u32;
-        for hdr in self.headers.iter() {
-            if hdr.accessible() || hdr.evictable() {
-                total += 1;
-                if hdr.pool() == SegmentPool::Small {
-                    small += 1;
-                }
-            }
-        }
-        (small, total)
-    }
 
     /// Find the oldest evictable segment in the given pool across all TTL
     /// buckets.
