@@ -63,10 +63,7 @@ pub static ITEM_EXPIRE: Counter = Counter::new();
 #[metric(name = "item_current", description = "current number of live items")]
 pub static ITEM_CURRENT: Gauge = Gauge::new();
 
-#[metric(
-    name = "item_key_byte",
-    description = "current total key bytes stored"
-)]
+#[metric(name = "item_key_byte", description = "current total key bytes stored")]
 pub static ITEM_KEY_BYTE: Gauge = Gauge::new();
 
 #[metric(

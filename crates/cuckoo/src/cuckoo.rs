@@ -169,14 +169,7 @@ impl CuckooCache {
     }
 
     /// Write an item into a slot.
-    fn write_slot(
-        &mut self,
-        index: usize,
-        key: &[u8],
-        value: Value,
-        optional: &[u8],
-        expire: u32,
-    ) {
+    fn write_slot(&mut self, index: usize, key: &[u8], value: Value, optional: &[u8], expire: u32) {
         self.clear_slot(index);
         self.set_slot_expire(index, expire);
 

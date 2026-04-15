@@ -7,10 +7,7 @@ use std::time::Duration;
 
 #[test]
 fn init() {
-    let cache = CuckooCache::builder()
-        .nitem(1024)
-        .item_size(64)
-        .build();
+    let cache = CuckooCache::builder().nitem(1024).item_size(64).build();
     assert_eq!(cache.items(), 0);
 }
 
@@ -150,7 +147,9 @@ fn displacement() {
 #[test]
 fn numeric_value() {
     let mut cache = CuckooCache::builder().build();
-    cache.insert(b"counter", 0u64, None, Duration::ZERO).unwrap();
+    cache
+        .insert(b"counter", 0u64, None, Duration::ZERO)
+        .unwrap();
 
     let item = cache.get(b"counter").unwrap();
     assert_eq!(item.value(), 0u64);
@@ -219,10 +218,7 @@ fn wrapping_add_not_found() {
 
 #[test]
 fn many_items() {
-    let mut cache = CuckooCache::builder()
-        .nitem(4096)
-        .item_size(64)
-        .build();
+    let mut cache = CuckooCache::builder().nitem(4096).item_size(64).build();
 
     for i in 0..2048u32 {
         let key = format!("key{i:06}");
@@ -295,9 +291,7 @@ fn optional_data() {
 fn no_optional_data() {
     let mut cache = CuckooCache::builder().build();
 
-    cache
-        .insert(b"key", b"val", None, Duration::ZERO)
-        .unwrap();
+    cache.insert(b"key", b"val", None, Duration::ZERO).unwrap();
     let item = cache.get(b"key").unwrap();
     assert_eq!(item.optional(), None);
 }
@@ -306,12 +300,8 @@ fn no_optional_data() {
 fn multiple_distinct_keys() {
     let mut cache = CuckooCache::builder().build();
 
-    cache
-        .insert(b"a", b"alpha", None, Duration::ZERO)
-        .unwrap();
-    cache
-        .insert(b"b", b"bravo", None, Duration::ZERO)
-        .unwrap();
+    cache.insert(b"a", b"alpha", None, Duration::ZERO).unwrap();
+    cache.insert(b"b", b"bravo", None, Duration::ZERO).unwrap();
     cache
         .insert(b"c", b"charlie", None, Duration::ZERO)
         .unwrap();
