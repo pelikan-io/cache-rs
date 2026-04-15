@@ -2,7 +2,7 @@
 
 ## Purpose
 
-keyvalue provides the common key-value item representation shared by cache engines in this workspace. It contains the packed item header, raw byte-level item access, and value types. Extracting these into a shared crate eliminates ~660 lines of duplication between segcache and s3fifo with zero runtime cost.
+keyvalue provides the common key-value item representation shared across the workspace. It contains the packed item header, raw byte-level item access, and value types. Segcache uses these types for items packed within segments; any future cache engine in the workspace can reuse the same item format without duplication.
 
 ## What's Inside
 
@@ -41,11 +41,11 @@ A thin wrapper around a `*mut u8` pointing to a buffer laid out as `[ItemHeader]
 - `size() -> usize` — aligned item size
 - `check_magic()` — validates corruption-detection magic bytes
 
-Each cache crate wraps `RawItem` in its own `Item` struct that adds cache-specific fields (e.g., CAS values) and maps `NotNumericError` to the crate's error type.
+Segcache wraps `RawItem` in its own `Item` struct that adds CAS values and maps `NotNumericError` to `SegcacheError`.
 
 ### NotNumericError
 
-A simple unit error returned by `wrapping_add` / `saturating_sub` when the value isn't `U64`. Each cache crate converts this to its own error variant via `map_err`.
+A simple unit error returned by `wrapping_add` / `saturating_sub` when the value isn't `U64`. The cache crate converts this to its own error variant via `map_err`.
 
 ## Feature Flags
 
@@ -54,8 +54,8 @@ A simple unit error returned by `wrapping_add` / `saturating_sub` when the value
 | `magic` | Adds a 4-byte magic field (0xDECAFBAD) to `ItemHeader` |
 | `debug` | Enables `magic` |
 
-Cache crates forward their `magic` feature to keyvalue (e.g., `magic = ["keyvalue/magic"]`).
+Segcache forwards its `magic` feature to keyvalue (`magic = ["keyvalue/magic"]`).
 
 ## Zero-Cost Sharing
 
-All types are concrete structs with `#[inline]` accessors. No traits, no generics, no dynamic dispatch. The compiler monomorphizes everything identically to having the code duplicated in each crate.
+All types are concrete structs with `#[inline]` accessors. No traits, no generics, no dynamic dispatch. The compiler monomorphizes everything identically to having the code inlined in the consumer crate.
