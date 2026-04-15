@@ -28,6 +28,8 @@ pub(crate) struct Segments {
     flush_at: Instant,
     /// Eviction configuration and state
     evict: Box<Eviction>,
+    /// Max segments in the small pool (S3-FIFO only, 0 for other policies)
+    small_cap: u32,
 }
 
 impl Segments {
@@ -93,6 +95,12 @@ impl Segments {
             SEGMENT_FREE.set(segments as _);
         }
 
+        let small_cap = if let Policy::S3Fifo { small_ratio } = evict_policy {
+            (segments as f64 * small_ratio).round() as u32
+        } else {
+            0
+        };
+
         Ok(Self {
             headers,
             segment_size,
@@ -102,7 +110,17 @@ impl Segments {
             data,
             flush_at: Instant::now(),
             evict: Box::new(Eviction::new(segments, evict_policy)),
+            small_cap,
         })
+    }
+
+    /// Check if the given pool has room for another segment.
+    pub(crate) fn pool_has_room(&self, pool: SegmentPool) -> bool {
+        let (small_count, _) = self.pool_counts();
+        match pool {
+            SegmentPool::Small => small_count < self.small_cap,
+            SegmentPool::Main => true, // main absorbs everything else
+        }
     }
 
     /// Return the configured eviction policy.
@@ -415,6 +433,8 @@ impl Segments {
             SEGMENT_FREE.increment();
         }
 
+        let id_idx = id.get() as usize - 1;
+
         // unlinks the next segment
         self.unlink(id);
 
@@ -422,9 +442,9 @@ impl Segments {
         self.push_front(id, self.free_q);
         self.free_q = Some(id);
 
-        let id_idx = id.get() as usize - 1;
         assert!(!self.headers[id_idx].evictable());
         self.headers[id_idx].set_accessible(false);
+        self.headers[id_idx].set_pool(SegmentPool::Main); // reset to default
 
         self.headers[id_idx].reset();
 
@@ -996,40 +1016,21 @@ impl Segments {
         best.map(|(id, _)| id)
     }
 
-    /// S3-FIFO eviction entry point. Evicts from whichever pool is over its
-    /// quota, falling back to the other pool if the preferred one has no
-    /// evictable segments.
+    /// S3-FIFO eviction entry point. Tries small-pool first (the filtering
+    /// step), then main-pool (CLOCK second-chance).
     fn s3fifo_evict(
         &mut self,
         ttl_buckets: &mut TtlBuckets,
         hashtable: &mut HashTable,
     ) -> Result<(), SegmentsError> {
-        // Count segments in each pool to decide which to drain
-        let (small_count, total_count) = self.pool_counts();
-        let small_ratio = self.evict.small_ratio();
-
-        // Prefer evicting from small if it exceeds its quota, otherwise main
-        let small_over_quota =
-            total_count > 0 && (small_count as f64 / total_count as f64) >= small_ratio;
-
-        let (first_pool, second_pool) = if small_over_quota {
-            (SegmentPool::Small, SegmentPool::Main)
-        } else {
-            (SegmentPool::Main, SegmentPool::Small)
-        };
-
-        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, first_pool) {
-            return match first_pool {
-                SegmentPool::Small => self.s3fifo_evict_small(seg_id, ttl_buckets, hashtable),
-                SegmentPool::Main => self.s3fifo_evict_main(seg_id, ttl_buckets, hashtable),
-            };
+        // Try evicting a small-pool segment first (with promotion of freq > 0)
+        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, SegmentPool::Small) {
+            return self.s3fifo_evict_small(seg_id, ttl_buckets, hashtable);
         }
 
-        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, second_pool) {
-            return match second_pool {
-                SegmentPool::Small => self.s3fifo_evict_small(seg_id, ttl_buckets, hashtable),
-                SegmentPool::Main => self.s3fifo_evict_main(seg_id, ttl_buckets, hashtable),
-            };
+        // No small-pool segments evictable; try main-pool
+        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, SegmentPool::Main) {
+            return self.s3fifo_evict_main(seg_id, ttl_buckets, hashtable);
         }
 
         #[cfg(feature = "metrics")]

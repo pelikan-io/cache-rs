@@ -241,14 +241,4 @@ impl Eviction {
         self.target_ratio() * (self.n_merge() - 1) as f64 + 0.05
     }
 
-    #[inline]
-    /// Returns the small-pool ratio for S3-FIFO (0.0–1.0). Returns 0.0 for
-    /// non-S3Fifo policies.
-    pub fn small_ratio(&self) -> f64 {
-        if let Policy::S3Fifo { small_ratio } = self.policy {
-            small_ratio
-        } else {
-            0.0
-        }
-    }
 }

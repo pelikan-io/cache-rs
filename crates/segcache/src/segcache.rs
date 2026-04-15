@@ -139,6 +139,17 @@ impl Segcache {
             SegmentPool::Main
         };
 
+        // For S3-FIFO: ensure the target pool has room by evicting from it
+        // if it's at capacity. This enforces the small/main ratio computed
+        // at construction time.
+        if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. })
+            && !self.segments.pool_has_room(target_pool)
+        {
+            let _ = self
+                .segments
+                .evict(&mut self.ttl_buckets, &mut self.hashtable);
+        }
+
         // try to get a `ReservedItem`
         let mut retries = RESERVE_RETRIES;
         let reserved;
