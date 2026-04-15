@@ -136,9 +136,11 @@ Parameters: `max` (max segments per pass), `merge` (target merge count), `compac
 
 The `S3Fifo` policy ([detailed description](s3fifo.md)) — referred to as **S3-Segcache** when describing the full configuration — introduces a two-pool architecture within the same segment infrastructure:
 
-- **Small pool** (~10% of segments): Probationary. New items land here. When a small segment is evicted, items with `freq > 0` are promoted (copied to a main segment), items with `freq == 0` are dropped and their key hashes added to a ghost queue.
-- **Main pool** (~90% of segments): Proven items. Eviction uses CLOCK-style second chance — items with `freq > 0` are copied to a fresh main segment, items with `freq == 0` are dropped.
+- **Small pool**: Probationary. New items land here. When a small segment is evicted, items with `freq > 0` are promoted (copied to a main segment), items with `freq == 0` are dropped and their key hashes added to a ghost queue.
+- **Main pool**: Proven items. Eviction uses CLOCK-style second chance — items with `freq > 0` are copied to a fresh main segment, items with `freq == 0` are dropped.
 - **Ghost queue**: A fixed-size set of key hashes. When a newly inserted key matches a ghost entry, it bypasses small and goes directly to main.
+
+The pool split is configured via `small_ratio` (0.0–1.0, default 0.10). The exact number of small-pool segments is computed at construction time (`round(total_segments * small_ratio)`) and enforced as a hard cap on every insert via an O(1) counter check.
 
 The pool distinction is a single byte in the segment header (using existing padding). The promotion/retention copying reuses the same `relink_item` + `copy_nonoverlapping` machinery that `Merge` uses for segment merging.
 
@@ -172,7 +174,7 @@ let mut cache = Segcache::builder()
     .heap_size(64 * MB)
     .segment_size(1 * MB as i32)
     .hash_power(16)
-    .eviction(Policy::S3Fifo)
+    .eviction(Policy::S3Fifo { small_ratio: 0.10 })
     .build()?;
 
 // Operations (identical regardless of policy)

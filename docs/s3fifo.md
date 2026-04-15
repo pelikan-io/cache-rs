@@ -34,12 +34,26 @@ Insert ──┐
 
 **Ghost queue**: A fixed-capacity set of 64-bit key hashes stored as a `VecDeque` (FIFO eviction) paired with an `AHashSet` (O(1) lookup). Capacity is auto-sized to `max(1024, num_segments * 64)`.
 
+### Pool Sizing
+
+The split between small and main is configured via `small_ratio` (0.0–1.0) and enforced as a hard cap computed at construction time:
+
+```
+small_cap = round(total_segments * small_ratio)
+```
+
+For a 64 MB heap with 1 MB segments (64 segments) and `small_ratio: 0.10`:
+- Small pool: 6 segments (6 MB)
+- Main pool: 58 segments (58 MB)
+
+The cap is enforced at insert time: before reserving space, if the target pool is at capacity, eviction is triggered. A `small_count` counter (incremented on Main→Small transitions, decremented when a Small segment returns to the free queue) makes the capacity check O(1).
+
 ### Admission: Ghost-Guided Routing
 
 On every `insert()`, segcache hashes the key and checks the ghost queue:
 
 - **Ghost hit**: Item is written to a main-pool segment. The ghost entry is removed. This key was recently evicted from small with `freq == 0` but has reappeared — it deserves a second chance in main.
-- **Ghost miss**: Item is written to a small-pool segment. It must prove itself by being accessed before its segment is evicted.
+- **Ghost miss**: Item is written to a small-pool segment (if the small pool has room). It must prove itself by being accessed before its segment is evicted.
 
 The pool label is set on the segment header. Segments within the same TTL bucket may have different pool labels — the pool is per-segment, not per-bucket.
 
@@ -51,7 +65,7 @@ When memory pressure triggers eviction and a small-pool segment is selected (old
 2. Every item in the small segment is scanned:
    - **`freq > 0`**: Item is copied to the fresh main segment via `relink_item` + `copy_nonoverlapping` (same machinery as `Merge` eviction). The hash table entry is updated to point to the new location.
    - **`freq == 0`**: Item is dropped. Its key hash is added to the ghost queue.
-3. The small segment is cleared and returned to the free queue
+3. The small segment is cleared and returned to the free queue (`small_count` decremented)
 
 This is the key filtering step. Items that were never accessed during their time in the small pool are discarded cheaply. Items that proved popular are promoted to main where they get a longer lifetime.
 
@@ -67,7 +81,7 @@ When no small-pool segments are available for eviction (all have been drained or
 
 ### Frequency Counters
 
-S3-FIFO uses the same frequency counters already stored in segcache's hash table slots (8-bit approximate counters with probabilistic increment). No additional per-item metadata is needed. During eviction, `hashtable.get_freq(key, segment, offset)` reads the counter without touching item data.
+S3-Segcache uses the same frequency counters already stored in segcache's hash table slots (8-bit approximate counters with probabilistic increment). No additional per-item metadata is needed. During eviction, `hashtable.get_freq(key, segment, offset)` reads the counter without touching item data.
 
 ## What S3-Segcache Inherits from Segcache
 
@@ -94,12 +108,20 @@ let mut cache = Segcache::builder()
     .heap_size(64 * MB)
     .segment_size(1 * MB as i32)
     .hash_power(16)
-    .eviction(Policy::S3Fifo)
+    .eviction(Policy::S3Fifo { small_ratio: 0.10 })
     .build()
     .expect("failed to create cache");
 ```
 
 The API is identical to any other eviction policy. Only the builder's `.eviction()` call differs.
+
+## Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `small_ratio` | 0.10 | Fraction of segments for the small pool (0.0–1.0). Lower values filter more aggressively but give items less time to prove themselves. Higher values provide more probation capacity for bursty workloads. |
+
+The pool sizes are fixed at construction. At runtime, the `small_count` counter enforces the cap in O(1) per insert — no scanning.
 
 ## When to Use S3-Segcache
 
@@ -119,7 +141,8 @@ The API is identical to any other eviction policy. Only the builder's `.eviction
 |--------|--------|-------|------|
 | Scan resistance | Strong (quick demotion via small pool) | Moderate (frequency-based pruning) | None |
 | Eviction cost | One segment scan + selective copy | Multi-segment merge + prune + compact | Immediate (drop entire segment) |
-| Extra state | Ghost queue (~16 bytes per entry) | None | None |
+| Extra state | Ghost queue (~16 bytes/entry) + pool counter | None | None |
 | Segment overhead | 1 byte per header (pool field) | None | None |
+| Pool enforcement | O(1) counter check at insert | N/A | N/A |
 | Hit ratio (skewed) | Near-optimal | Good | Fair |
 | Hit ratio (uniform) | Good | Good | Good |

@@ -76,7 +76,7 @@ let mut cache = Segcache::builder()
     .heap_size(64 * MB)
     .segment_size(1 * MB as i32)
     .hash_power(16)
-    .eviction(Policy::S3Fifo)
+    .eviction(Policy::S3Fifo { small_ratio: 0.10 })
     .build()
     .expect("failed to create cache");
 
