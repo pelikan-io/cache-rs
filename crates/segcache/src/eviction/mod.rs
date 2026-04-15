@@ -240,5 +240,4 @@ impl Eviction {
     pub fn stop_ratio(&self) -> f64 {
         self.target_ratio() * (self.n_merge() - 1) as f64 + 0.05
     }
-
 }
