@@ -4,9 +4,9 @@
 
 use super::*;
 use crate::hashtable::HashBucket;
-use keyvalue::ITEM_HDR_SIZE;
 use ::rand::Rng;
 use core::num::NonZeroU32;
+use keyvalue::ITEM_HDR_SIZE;
 
 use std::time::Duration;
 
