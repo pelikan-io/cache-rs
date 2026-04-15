@@ -80,7 +80,7 @@ Expiration is **eager**: `expire()` walks each TTL bucket and checks if the head
 
 ## Eviction Policies
 
-Seven policies, set at construction time:
+Eight policies, set at construction time:
 
 | Policy | Strategy |
 |--------|----------|
@@ -91,6 +91,7 @@ Seven policies, set at construction time:
 | `Cte` | Evict the segment closest to expiration |
 | `Util` | Evict the segment with the fewest live bytes |
 | `Merge` | Merge multiple segments, keeping high-frequency items (see below) |
+| `S3Fifo` | Two-pool scan-resistant eviction with ghost queue ([details](s3fifo.md)) |
 
 ### Merge-Based Eviction
 
