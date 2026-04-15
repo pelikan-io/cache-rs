@@ -6,16 +6,14 @@ use crate::eviction::*;
 use crate::segments::*;
 use core::hash::{BuildHasher, Hasher};
 use core::num::NonZeroU32;
-use datatier::*;
-
 /// `Segments` contain all items within the cache. This struct is a collection
 /// of individual `Segment`s which are represented by a `SegmentHeader` and a
 /// subslice of bytes from a contiguous heap allocation.
 pub(crate) struct Segments {
     /// Pointer to slice of headers
     headers: Box<[SegmentHeader]>,
-    /// Pointer to raw data
-    data: Box<dyn Datapool>,
+    /// Heap-allocated segment data
+    data: Box<[u8]>,
     /// Segment size in bytes
     segment_size: i32,
     /// Number of free segments
@@ -24,8 +22,6 @@ pub(crate) struct Segments {
     cap: u32,
     /// Head of the free segment queue
     free_q: Option<NonZeroU32>,
-    /// Time last flushed
-    flush_at: Instant,
     /// Eviction configuration and state
     evict: Box<Eviction>,
     /// Max segments in the admission pool (S3-FIFO only, 0 for other policies)
@@ -66,22 +62,13 @@ impl Segments {
 
         let heap_size = segments * segment_size as usize;
 
-        // TODO(bmartin): we will need to make additional changes before we
-        // allow restoring state from an existing datapool file, for now this
-        // retains the previous behavior and always creates a new file to mmap
-        // if a datapool path is provided.
-        let mut data: Box<dyn Datapool> = if let Some(file) = builder.datapool_path {
-            Box::new(MmapFile::create(file, heap_size, crate::VERSION)?)
-        } else {
-            Box::new(Memory::create(heap_size)?)
-        };
+        let mut data = vec![0u8; heap_size].into_boxed_slice();
 
         for idx in 0..segments {
             let begin = segment_size as usize * idx;
             let end = begin + segment_size as usize;
 
-            let mut segment =
-                Segment::from_raw_parts(&mut headers[idx], &mut data.as_mut_slice()[begin..end]);
+            let mut segment = Segment::from_raw_parts(&mut headers[idx], &mut data[begin..end]);
             segment.init();
 
             let id = idx as u32 + 1; // we index segments from 1
@@ -110,7 +97,6 @@ impl Segments {
             free: segments as u32,
             free_q: NonZeroU32::new(1),
             data,
-            flush_at: Instant::now(),
             evict: Box::new(Eviction::new(segments, evict_policy)),
             admission_cap,
             admission_count: 0,
@@ -150,16 +136,6 @@ impl Segments {
         self.free as usize
     }
 
-    /// Returns the time the segments were last flushed
-    pub fn flush_at(&self) -> Instant {
-        self.flush_at
-    }
-
-    /// Mark the segments as flushed at a given instant
-    pub fn set_flush_at(&mut self, instant: Instant) {
-        self.flush_at = instant;
-    }
-
     /// Retrieve a `RawItem` from the segment id and offset encoded in the
     /// item info.
     pub(crate) fn get_item(&mut self, item_info: u64) -> Option<RawItem> {
@@ -183,7 +159,7 @@ impl Segments {
         let seg_end = seg_begin + self.segment_size() as usize;
         let mut segment = Segment::from_raw_parts(
             &mut self.headers[seg_id as usize - 1],
-            &mut self.data.as_mut_slice()[seg_begin..seg_end],
+            &mut self.data[seg_begin..seg_end],
         );
 
         segment.get_item_at(offset)
@@ -335,7 +311,7 @@ impl Segments {
             let seg_start = self.segment_size as usize * id;
             let seg_end = self.segment_size as usize * (id + 1);
 
-            let seg_data = &mut self.data.as_mut_slice()[seg_start..seg_end];
+            let seg_data = &mut self.data[seg_start..seg_end];
 
             let segment = Segment::from_raw_parts(header, seg_data);
             segment.check_magic();
@@ -369,7 +345,7 @@ impl Segments {
                 let header_a = &mut self.headers[a] as *mut _;
                 let header_b = &mut self.headers[b] as *mut _;
 
-                let data = self.data.as_mut_slice();
+                let data = &mut *self.data;
 
                 // split the borrowed data
                 let split = (std::cmp::min(a, b) + 1) * seg_size;

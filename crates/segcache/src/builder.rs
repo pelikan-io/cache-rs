@@ -5,7 +5,6 @@
 //! A builder for configuring a new [`Segcache`] instance.
 
 use crate::*;
-use std::path::Path;
 
 /// A builder that is used to construct a new [`Segcache`] instance.
 pub struct Builder {
@@ -137,16 +136,6 @@ impl Builder {
     /// ```
     pub fn eviction(mut self, policy: Policy) -> Self {
         self.segments_builder = self.segments_builder.eviction_policy(policy);
-        self
-    }
-
-    /// Specify a backing file to be used for segment storage.
-    ///
-    /// # Panics
-    ///
-    /// This will panic if the file already exists
-    pub fn datapool_path<T: AsRef<Path>>(mut self, path: Option<T>) -> Self {
-        self.segments_builder = self.segments_builder.datapool_path(path);
         self
     }
 

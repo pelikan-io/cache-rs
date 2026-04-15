@@ -89,9 +89,8 @@ impl TtlBucket {
         loop {
             let seg_id = self.head;
             if let Some(seg_id) = seg_id {
-                let flush_at = segments.flush_at();
                 let mut segment = segments.get_mut(seg_id).unwrap();
-                if segment.create_at() + segment.ttl() <= ts || segment.create_at() < flush_at {
+                if segment.create_at() + segment.ttl() <= ts {
                     if let Some(next) = segment.next_seg() {
                         self.head = Some(next);
                     } else {

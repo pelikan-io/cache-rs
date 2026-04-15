@@ -30,7 +30,6 @@ default = ["metrics"]
 [dependencies]
 ahash = { workspace = true }
 clocksource = { workspace = true }
-datatier = { workspace = true }
 keyvalue = { workspace = true, features = [] }
 log = { workspace = true }
 metriken = { workspace = true, optional = true }

@@ -33,10 +33,6 @@ use clocksource::coarse::{Duration, Instant};
 use core::hash::{BuildHasher, Hasher};
 use std::convert::TryInto;
 
-// NOTE: this represents the versioning of the internal data layout and must be
-// incremented when breaking changes are made to the datastructures
-const VERSION: u64 = 0;
-
 // submodules
 mod builder;
 mod error;
