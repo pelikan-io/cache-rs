@@ -138,7 +138,6 @@ impl TtlBuckets {
         for bucket in self.buckets.iter_mut() {
             cleared += bucket.clear(hashtable, segments);
         }
-        segments.set_flush_at(Instant::now());
         let duration = start.elapsed();
         debug!("expired: {cleared} segments in {duration:?}");
 

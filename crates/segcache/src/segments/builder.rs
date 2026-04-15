@@ -7,14 +7,11 @@
 use crate::eviction::*;
 use crate::segments::*;
 
-use std::path::{Path, PathBuf};
-
 /// The `SegmentsBuilder` allows for the configuration of the segment storage.
 pub(crate) struct SegmentsBuilder {
     pub(super) heap_size: usize,
     pub(super) segment_size: i32,
     pub(super) evict_policy: Policy,
-    pub(super) datapool_path: Option<PathBuf>,
 }
 
 impl Default for SegmentsBuilder {
@@ -23,7 +20,6 @@ impl Default for SegmentsBuilder {
             segment_size: 1024 * 1024,
             heap_size: 64 * 1024 * 1024,
             evict_policy: Policy::Random,
-            datapool_path: None,
         }
     }
 }
@@ -58,14 +54,6 @@ impl SegmentsBuilder {
     /// fails due to memory pressure.
     pub fn eviction_policy(mut self, policy: Policy) -> Self {
         self.evict_policy = policy;
-        self
-    }
-
-    /// Specify a backing file to be used for the segment storage. If provided,
-    /// a file will be created at the corresponding path and used for segment
-    /// storage.
-    pub fn datapool_path<T: AsRef<Path>>(mut self, path: Option<T>) -> Self {
-        self.datapool_path = path.map(|p| p.as_ref().to_owned());
         self
     }
 
