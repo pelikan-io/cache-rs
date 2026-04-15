@@ -242,7 +242,7 @@ impl Segments {
 
                 Err(SegmentsError::NoEvictableSegments)
             }
-            Policy::S3Fifo => {
+            Policy::S3Fifo { .. } => {
                 #[cfg(feature = "metrics")]
                 SEGMENT_EVICT.increment();
 
@@ -955,6 +955,21 @@ impl Segments {
 
     // ── S3-FIFO eviction ─────────────────────────────────────────────
 
+    /// Count the number of segments in each pool (excluding free segments).
+    fn pool_counts(&self) -> (u32, u32) {
+        let mut small = 0u32;
+        let mut total = 0u32;
+        for hdr in self.headers.iter() {
+            if hdr.accessible() || hdr.evictable() {
+                total += 1;
+                if hdr.pool() == SegmentPool::Small {
+                    small += 1;
+                }
+            }
+        }
+        (small, total)
+    }
+
     /// Find the oldest evictable segment in the given pool across all TTL
     /// buckets.
     fn find_oldest_seg_in_pool(
@@ -981,20 +996,39 @@ impl Segments {
         best.map(|(id, _)| id)
     }
 
-    /// S3-FIFO eviction entry point. Tries small-pool first, then main-pool.
+    /// S3-FIFO eviction entry point. Evicts from whichever pool is over its
+    /// quota, falling back to the other pool if the preferred one has no
+    /// evictable segments.
     fn s3fifo_evict(
         &mut self,
         ttl_buckets: &mut TtlBuckets,
         hashtable: &mut HashTable,
     ) -> Result<(), SegmentsError> {
-        // Try evicting a small-pool segment (with promotion of freq > 0 items)
-        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, SegmentPool::Small) {
-            return self.s3fifo_evict_small(seg_id, ttl_buckets, hashtable);
+        // Count segments in each pool to decide which to drain
+        let (small_count, total_count) = self.pool_counts();
+        let small_ratio = self.evict.small_ratio() as u32;
+
+        // Prefer evicting from small if it exceeds its quota, otherwise main
+        let small_over_quota = total_count > 0 && small_count * 100 >= small_ratio * total_count;
+
+        let (first_pool, second_pool) = if small_over_quota {
+            (SegmentPool::Small, SegmentPool::Main)
+        } else {
+            (SegmentPool::Main, SegmentPool::Small)
+        };
+
+        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, first_pool) {
+            return match first_pool {
+                SegmentPool::Small => self.s3fifo_evict_small(seg_id, ttl_buckets, hashtable),
+                SegmentPool::Main => self.s3fifo_evict_main(seg_id, ttl_buckets, hashtable),
+            };
         }
 
-        // No small-pool segments evictable; try main-pool (CLOCK second-chance)
-        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, SegmentPool::Main) {
-            return self.s3fifo_evict_main(seg_id, ttl_buckets, hashtable);
+        if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, second_pool) {
+            return match second_pool {
+                SegmentPool::Small => self.s3fifo_evict_small(seg_id, ttl_buckets, hashtable),
+                SegmentPool::Main => self.s3fifo_evict_main(seg_id, ttl_buckets, hashtable),
+            };
         }
 
         #[cfg(feature = "metrics")]

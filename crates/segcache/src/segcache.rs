@@ -123,7 +123,7 @@ impl Segcache {
         let ttl = Duration::from_secs(min(u32::MAX as u64, ttl.as_secs()) as u32);
 
         // For S3-FIFO: determine target pool based on ghost queue
-        let target_pool = if self.segments.evict_policy() == Policy::S3Fifo {
+        let target_pool = if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. }) {
             let hash = {
                 let mut hasher = self.hashtable.hash_builder().build_hasher();
                 hasher.write(key);

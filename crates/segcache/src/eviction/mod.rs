@@ -44,7 +44,7 @@ impl Eviction {
 
         // For S3-FIFO, size the ghost queue to ~10% of segment count
         // (approximating the number of items in the small pool)
-        let ghost_capacity = if policy == Policy::S3Fifo {
+        let ghost_capacity = if matches!(policy, Policy::S3Fifo { .. }) {
             std::cmp::max(1024, nseg * 64)
         } else {
             0
@@ -89,7 +89,7 @@ impl Eviction {
             | Policy::Random
             | Policy::RandomFifo
             | Policy::Merge { .. }
-            | Policy::S3Fifo => false,
+            | Policy::S3Fifo { .. } => false,
             Policy::Fifo | Policy::Cte | Policy::Util => {
                 if self.ranked_segs[0].is_none()
                     || (now - self.last_update_time).as_secs() > 1
@@ -111,7 +111,7 @@ impl Eviction {
             | Policy::Random
             | Policy::RandomFifo
             | Policy::Merge { .. }
-            | Policy::S3Fifo => {
+            | Policy::S3Fifo { .. } => {
                 return;
             }
             Policy::Fifo => {
@@ -239,5 +239,16 @@ impl Eviction {
     /// the merge pass to stop when the target segment has a higher occupancy
     pub fn stop_ratio(&self) -> f64 {
         self.target_ratio() * (self.n_merge() - 1) as f64 + 0.05
+    }
+
+    #[inline]
+    /// Returns the small-pool ratio for S3-FIFO (0–100). Returns 0 for
+    /// non-S3Fifo policies.
+    pub fn small_ratio(&self) -> u8 {
+        if let Policy::S3Fifo { small_ratio } = self.policy {
+            small_ratio
+        } else {
+            0
+        }
     }
 }

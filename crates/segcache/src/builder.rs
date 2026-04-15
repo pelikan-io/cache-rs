@@ -129,6 +129,11 @@ impl Builder {
     /// // create a cache using a merge based eviction policy
     /// let policy = Policy::Merge { max: 8, merge: 4, compact: 2};
     /// let cache = Segcache::builder().eviction(policy).build();
+    ///
+    /// // create an S3-Segcache with 10% small pool
+    /// let cache = Segcache::builder()
+    ///     .eviction(Policy::S3Fifo { small_ratio: 10 })
+    ///     .build();
     /// ```
     pub fn eviction(mut self, policy: Policy) -> Self {
         self.segments_builder = self.segments_builder.eviction_policy(policy);
