@@ -1,6 +1,3 @@
-// Copyright 2025 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 //! Core cuckoo cache implementation.
 //!
 //! Each item slot has the following layout:

@@ -7,6 +7,7 @@ A collection of Rust implementations of state-of-the-art cache algorithms, built
 | Crate | Description |
 |-------|-------------|
 | [**segcache**](docs/segcache.md) | Segment-structured cache engine with pluggable eviction policies |
+| [**cuckoo-cache**](docs/cuckoo.md) | Array-based cuckoo hash cache with fixed-size item slots |
 | [**keyvalue**](docs/keyvalue.md) | Shared packed item types (`Value`, `ItemHeader`, `RawItem`) |
 | [**datatier**](docs/datatier.md) | Byte storage pool abstraction (anonymous mmap, file-backed mmap, hybrid) |
 

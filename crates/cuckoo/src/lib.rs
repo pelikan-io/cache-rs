@@ -1,6 +1,3 @@
-// Copyright 2025 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 //! Cuckoo hash based cache storage engine with fixed-size item slots.
 //!
 //! This crate implements an array-based cache that uses cuckoo hashing to map

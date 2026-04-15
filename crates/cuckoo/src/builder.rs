@@ -1,6 +1,3 @@
-// Copyright 2025 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 //! Builder for configuring a [`CuckooCache`] instance.
 
 use crate::{CuckooCache, Policy};
