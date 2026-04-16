@@ -40,7 +40,7 @@ impl MultiChoiceHashtable {
     /// Create a new hashtable with two-choice hashing (default).
     ///
     /// # Parameters
-    /// - `power`: Number of buckets = 2^power (minimum 4)
+    /// - `power`: Total item capacity is 2^power (8 slots per bucket, minimum power 7)
     pub fn new(power: u8) -> Self {
         Self::with_choices(power, 2)
     }
@@ -48,10 +48,10 @@ impl MultiChoiceHashtable {
     /// Create a new hashtable with configurable N-choice hashing.
     ///
     /// # Parameters
-    /// - `power`: Number of buckets = 2^power (minimum 4)
+    /// - `power`: Total item capacity is 2^power (8 slots per bucket, minimum power 7)
     /// - `num_choices`: Number of bucket choices (1-8)
     pub fn with_choices(power: u8, num_choices: u8) -> Self {
-        assert!(power >= 4, "power must be at least 4");
+        assert!(power >= 7, "power must be at least 7 (128 slots)");
         assert!(
             (1..=MAX_CHOICES).contains(&num_choices),
             "num_choices must be 1-{}",
@@ -66,7 +66,9 @@ impl MultiChoiceHashtable {
             0x4feb29c1fbbd59d0,
         );
 
-        let num_buckets = 1_usize << power;
+        // 8 slots per bucket, so bucket count = 2^(power-3)
+        let bucket_power = power - 3;
+        let num_buckets = 1_usize << bucket_power;
         let mask = (num_buckets as u64) - 1;
 
         let buckets = (0..num_buckets)
@@ -1035,8 +1037,9 @@ mod tests {
 
     #[test]
     fn test_hashtable_creation() {
+        // power=10 → 2^10 = 1024 slots → 128 buckets (8 slots each)
         let ht = MultiChoiceHashtable::new(10);
-        assert_eq!(ht.num_buckets, 1024);
+        assert_eq!(ht.num_buckets, 128);
         assert_eq!(ht.num_choices, 2);
     }
 
@@ -1167,7 +1170,7 @@ mod loom_tests {
     #[test]
     fn test_concurrent_insert_different_keys() {
         loom::model(|| {
-            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
             let verifier = Arc::new(AlwaysVerifier);
 
             let ht1 = ht.clone();
@@ -1199,7 +1202,7 @@ mod loom_tests {
     #[test]
     fn test_concurrent_insert_same_key() {
         loom::model(|| {
-            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
             let verifier = Arc::new(AlwaysVerifier);
 
             let ht1 = ht.clone();
@@ -1234,7 +1237,7 @@ mod loom_tests {
     #[test]
     fn test_concurrent_lookup_frequency_update() {
         loom::model(|| {
-            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
             let verifier = Arc::new(AlwaysVerifier);
 
             // Insert a key first
@@ -1265,7 +1268,7 @@ mod loom_tests {
     #[test]
     fn test_concurrent_insert_and_remove() {
         loom::model(|| {
-            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
             let verifier = Arc::new(AlwaysVerifier);
 
             // Insert a key first
@@ -1297,7 +1300,7 @@ mod loom_tests {
     #[test]
     fn test_concurrent_cas_operations() {
         loom::model(|| {
-            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
             let verifier = Arc::new(AlwaysVerifier);
 
             // Insert a key first
@@ -1366,7 +1369,7 @@ mod loom_tests {
         let mut builder = loom::model::Builder::new();
         builder.preemption_bound = Some(2);
         builder.check(|| {
-            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
             let verifier = Arc::new(AlwaysVerifier);
 
             let loc_initial = Location::new(1);
@@ -1417,7 +1420,7 @@ mod loom_tests {
         let mut builder = loom::model::Builder::new();
         builder.preemption_bound = Some(2);
         builder.check(|| {
-            let ht = Arc::new(MultiChoiceHashtable::new(8));
+            let ht = Arc::new(MultiChoiceHashtable::new(10));
             let verifier = Arc::new(AlwaysVerifier);
 
             let ht1 = ht.clone();

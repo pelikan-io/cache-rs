@@ -194,15 +194,15 @@ fn collisions_2() {
     let mut cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
-        .hash_power(3)
+        .hash_power(7)
         .build()
         .expect("failed to create cache");
     assert_eq!(cache.items(), 0);
     assert_eq!(cache.segments.free(), 2);
 
-    // note: we can only fit 7 because the first bucket in the chain only
-    // has 7 slots. since we don't support chaining, we must have a
-    // collision on the 8th insert.
+    // With very small segments (64 bytes) and only 2 segments, we can
+    // only hold a few items. Repeatedly overwrite 3 keys to exercise
+    // the insert-replace path.
     for i in 0..1000 {
         let i = i % 3;
         let v = format!("{i:02}");
@@ -219,13 +219,13 @@ fn collisions() {
     let segments = 64;
     let heap_size = segments * segment_size as usize;
 
-    // With the N-choice hashtable (min power=4 → 16 buckets × 8 slots = 128
-    // capacity), we need many more items to exhaust it. Use a small hash
-    // power and insert until we fill the hashtable.
+    // With the N-choice hashtable, hash_power(7) gives 2^7 = 128 slots
+    // across 16 buckets with 2-choice hashing. Insert items until the
+    // hashtable is full.
     let mut cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
-        .hash_power(7) // 2^(7-3) = 16 buckets, 128 slots with 2-choice
+        .hash_power(7)
         .build()
         .expect("failed to create cache");
     assert_eq!(cache.items(), 0);
@@ -500,7 +500,7 @@ fn fuzz_1() {
     let mut cache = Segcache::builder()
         .segment_size(1024)
         .heap_size(8 * 1024)
-        .hash_power(3)
+        .hash_power(7)
         .overflow_factor(0.0)
         .build()
         .expect("failed to create cache");
@@ -544,7 +544,7 @@ fn fuzz_2() {
     let mut cache = Segcache::builder()
         .segment_size(1024)
         .heap_size(8 * 1024)
-        .hash_power(5)
+        .hash_power(7)
         .overflow_factor(1.0)
         .build()
         .expect("failed to create cache");
