@@ -2,9 +2,11 @@
 
 use crate::eviction::*;
 use crate::segments::*;
-use crate::*;
 
 /// Configuration builder for [`Segments`].
+///
+/// Validation is deferred to [`build()`](SegmentsBuilder::build) so that
+/// setters never panic.
 pub(crate) struct SegmentsBuilder {
     pub(super) heap_size: usize,
     pub(super) segment_size: i32,
@@ -23,17 +25,7 @@ impl Default for SegmentsBuilder {
 
 impl SegmentsBuilder {
     /// Set the segment size in bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the size is not greater than the per-item overhead.
     pub fn segment_size(mut self, bytes: i32) -> Self {
-        #[cfg(not(feature = "magic"))]
-        assert!(bytes > ITEM_HDR_SIZE as i32);
-
-        #[cfg(feature = "magic")]
-        assert!(bytes > ITEM_HDR_SIZE as i32 + ITEM_MAGIC_SIZE as i32);
-
         self.segment_size = bytes;
         self
     }
@@ -51,8 +43,35 @@ impl SegmentsBuilder {
         self
     }
 
-    /// Build the [`Segments`] from this configuration.
-    pub fn build(self) -> Result<Segments, std::io::Error> {
+    /// Validate configuration and build the [`Segments`].
+    ///
+    /// Returns an error if:
+    /// - `segment_size` is not larger than the per-item header overhead
+    /// - `heap_size` is zero or not a multiple of `segment_size`
+    pub fn build(self) -> Result<Segments, SegmentsError> {
+        let min_size = {
+            #[cfg(not(feature = "magic"))]
+            {
+                crate::ITEM_HDR_SIZE as i32 + 1
+            }
+            #[cfg(feature = "magic")]
+            {
+                crate::ITEM_HDR_SIZE as i32 + crate::item::ITEM_MAGIC_SIZE as i32 + 1
+            }
+        };
+
+        if self.segment_size < min_size {
+            return Err(SegmentsError::SegmentTooSmall);
+        }
+
+        let seg_size = self.segment_size as usize;
+        if self.heap_size == 0 || !self.heap_size.is_multiple_of(seg_size) {
+            return Err(SegmentsError::InvalidHeapSize {
+                heap_size: self.heap_size,
+                segment_size: seg_size,
+            });
+        }
+
         Segments::from_builder(self)
     }
 }

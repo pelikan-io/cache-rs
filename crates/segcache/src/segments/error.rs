@@ -12,4 +12,15 @@ pub enum SegmentsError {
     NoEvictableSegments,
     #[error("eviction failed")]
     EvictFailure,
+    #[error("segment size must be greater than item header overhead")]
+    SegmentTooSmall,
+    #[error(
+        "heap size ({heap_size}) must be a non-zero multiple of segment size ({segment_size})"
+    )]
+    InvalidHeapSize {
+        heap_size: usize,
+        segment_size: usize,
+    },
+    #[error("mmap allocation failed")]
+    Mmap(#[from] std::io::Error),
 }

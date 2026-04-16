@@ -38,7 +38,7 @@ impl Segments {
     /// Allocate and initialize segments by consuming the builder. The backing
     /// heap is an anonymous mmap region instead of a boxed slice so that large
     /// caches do not fragment the process heap.
-    pub(super) fn from_builder(builder: SegmentsBuilder) -> Result<Self, std::io::Error> {
+    pub(super) fn from_builder(builder: SegmentsBuilder) -> Result<Self, SegmentsError> {
         let segment_size = builder.segment_size;
         let segments = builder.heap_size / (segment_size as usize);
 
