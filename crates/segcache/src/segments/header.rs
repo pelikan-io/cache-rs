@@ -2,6 +2,26 @@
 //!
 //! Each header is exactly 64 bytes (one cache line) and uses atomic types
 //! for all mutable fields, preparing for concurrent access.
+//!
+//! ```text
+//! ┌──────────────┬──────────────┬──────────────┬──────────────┐
+//! │      ID      │ WRITE OFFSET │  LIVE BYTES  │  LIVE ITEMS  │
+//! │    u32       │  AtomicI32   │  AtomicI32   │  AtomicI32   │
+//! │    32 bit    │    32 bit    │    32 bit    │    32 bit    │
+//! ├──────────────┼──────────────┼──────────────┼──────────────┤
+//! │   PREV SEG   │   NEXT SEG   │  CREATE AT   │   MERGE AT   │
+//! │  AtomicU32   │  AtomicU32   │AtomicInstant │AtomicInstant │
+//! │    32 bit    │    32 bit    │    32 bit    │    32 bit    │
+//! ├──────────────┼──┬──┬────────┴──────────────┴──────────────┤
+//! │     TTL      │ST│PL│              PADDING                 │
+//! │  AtomicU32   │  │  │                                      │
+//! │    32 bit    │8b│8b│             208 bit                  │
+//! ├──────────────┴──┴──┴──────────────────────────────────────┤
+//! │                         PADDING                           │
+//! │                         128 bit                           │
+//! └──────────────────────────────────────────────────────────┘
+//! ST = SegmentState (AtomicU8)    PL = SegmentPool (AtomicU8)
+//! ```
 
 use crate::sync::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 use clocksource::coarse::{AtomicInstant, Duration, Instant};
