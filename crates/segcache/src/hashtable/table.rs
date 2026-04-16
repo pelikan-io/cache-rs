@@ -1184,8 +1184,8 @@ mod loom_tests {
                 ht2.insert(b"key2", loc, &*v2)
             });
 
-            t1.join().unwrap();
-            t2.join().unwrap();
+            let _ = t1.join().unwrap();
+            let _ = t2.join().unwrap();
 
             // Both keys should be present (or one may fail due to full bucket)
             let found1 = ht.lookup(b"key1", &*verifier).is_some();
