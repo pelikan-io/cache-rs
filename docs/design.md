@@ -30,7 +30,7 @@ This means adding a new eviction algorithm — like S3-FIFO — requires only th
 - **Pre-allocated mmap'd heap** — zero per-item malloc
 - **Eager TTL expiration** — O(1) per segment, no timers
 - **Compact item headers** — 5–6 bytes per item (88% less than Memcached)
-- **Cacheline-aligned hash table** — bulk chaining with 12-bit tags
+- **Lock-free hash table** — N-choice hashing with SIMD tag scanning
 - **CAS support, numeric operations, optional metadata**
 - **Corruption detection** (magic feature), **metrics** (metriken)
 

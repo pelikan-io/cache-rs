@@ -92,7 +92,7 @@ By implementing S3-FIFO as a policy within segcache rather than a standalone cac
 | **Pre-allocated mmap'd heap** | All segments live in a contiguous mmap region allocated at startup. Zero per-item malloc. |
 | **Eager TTL expiration** | TTL buckets expire entire segments in O(1). Works identically for both admission and main segments. |
 | **Compact item headers** | 5 bytes per item via the shared `keyvalue` crate. |
-| **Bulk-chaining hash table** | Cacheline-aligned buckets with 12-bit tags. Frequency counters embedded in hash slots. |
+| **Lock-free hash table** | N-choice hashing with SIMD tag scanning. Frequency counters embedded in hash slots. |
 | **CAS, numeric ops, optional data** | Full API surface — `cas()`, `wrapping_add()`, `saturating_sub()`, optional metadata. |
 | **Corruption detection** | Magic bytes in items and segments (`magic` feature). |
 | **Metrics** | All existing counters/gauges via `metriken`. |
