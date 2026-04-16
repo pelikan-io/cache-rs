@@ -1,13 +1,10 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-//! A builder struct for initializing segment storage.
+//! Builder for configuring segment storage.
 
 use crate::eviction::*;
 use crate::segments::*;
+use crate::*;
 
-/// The `SegmentsBuilder` allows for the configuration of the segment storage.
+/// Configuration builder for [`Segments`].
 pub(crate) struct SegmentsBuilder {
     pub(super) heap_size: usize,
     pub(super) segment_size: i32,
@@ -29,9 +26,7 @@ impl SegmentsBuilder {
     ///
     /// # Panics
     ///
-    /// This function will panic if the size is not greater than the per-item
-    /// overhead. Currently this means that the minimum size is 6 bytes when
-    /// built without magic/debug, or 10 bytes when built with magic/debug.
+    /// Panics if the size is not greater than the per-item overhead.
     pub fn segment_size(mut self, bytes: i32) -> Self {
         #[cfg(not(feature = "magic"))]
         assert!(bytes > ITEM_HDR_SIZE as i32);
@@ -43,21 +38,20 @@ impl SegmentsBuilder {
         self
     }
 
-    /// Specify the total heap size in bytes. The heap size will be divided by
-    /// the segment size to determine the number of segments to allocate.
+    /// Set the total heap size in bytes. The number of segments is
+    /// `heap_size / segment_size`.
     pub fn heap_size(mut self, bytes: usize) -> Self {
         self.heap_size = bytes;
         self
     }
 
-    /// Specify the eviction [`Policy`] which will be used when item allocation
-    /// fails due to memory pressure.
+    /// Set the eviction [`Policy`].
     pub fn eviction_policy(mut self, policy: Policy) -> Self {
         self.evict_policy = policy;
         self
     }
 
-    /// Construct the [`Segments`] from the builder
+    /// Build the [`Segments`] from this configuration.
     pub fn build(self) -> Result<Segments, std::io::Error> {
         Segments::from_builder(self)
     }

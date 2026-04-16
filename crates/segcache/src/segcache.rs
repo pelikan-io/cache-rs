@@ -183,7 +183,7 @@ impl Segcache {
                     // Set the segment pool for S3-FIFO (only transitions
                     // Main→Admission need a counter update; fresh segments
                     // default to Main)
-                    if let Ok(mut seg) = self.segments.get_mut(reserved_item.seg()) {
+                    if let Ok(seg) = self.segments.get_mut(reserved_item.seg()) {
                         if target_pool == SegmentPool::Admission
                             && seg.pool() != SegmentPool::Admission
                         {

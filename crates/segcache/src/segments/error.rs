@@ -1,19 +1,15 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-//! Possible errors returned by segment operations.
+//! Error types for segment operations.
 
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum SegmentsError {
-    #[error("bad segment id")]
+    #[error("invalid segment id")]
     BadSegmentId,
-    #[error("item relink failure")]
+    #[error("item relink failure during compaction")]
     RelinkFailure,
-    #[error("no evictable segments")]
+    #[error("no segments available for eviction")]
     NoEvictableSegments,
-    #[error("evict failure")]
+    #[error("eviction failed")]
     EvictFailure,
 }

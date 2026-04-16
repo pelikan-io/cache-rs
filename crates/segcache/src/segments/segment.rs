@@ -1,6 +1,7 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
+//! Segment view combining a header and data slice.
+//!
+//! A `Segment` provides operations on a single segment's data, delegating
+//! metadata access to the atomic fields in [`SegmentHeader`].
 
 use super::{SegmentHeader, SegmentPool, SegmentsError};
 use crate::*;
@@ -8,40 +9,26 @@ use core::num::NonZeroU32;
 
 pub const SEG_MAGIC: u64 = 0xBADC0FFEEBADCAFE;
 
-/// A `Segment` is a contiguous allocation of bytes and an associated header
-/// which contains metadata. This structure allows us to operate on mutable
-/// borrows of the header and data sections to perform basic operations.
+/// A view of a single segment, combining a shared header reference with
+/// a mutable data slice. The header is accessed via shared reference
+/// since all its fields are atomic.
 pub struct Segment<'a> {
-    header: &'a mut SegmentHeader,
+    header: &'a SegmentHeader,
     data: &'a mut [u8],
 }
 
 impl<'a> Segment<'a> {
+    /// Construct a `Segment` from its raw parts.
+    pub fn from_raw_parts(header: &'a SegmentHeader, data: &'a mut [u8]) -> Self {
+        Segment { header, data }
+    }
+
     /// Returns a raw pointer to the segment's data buffer.
     pub fn data_ptr(&self) -> *mut u8 {
         self.data.as_ptr() as *mut u8
     }
 
-    /// Returns the segment pool.
-    pub fn pool(&self) -> SegmentPool {
-        self.header.pool()
-    }
-
-    /// Set the segment pool (used by S3-FIFO).
-    pub fn set_pool(&mut self, pool: SegmentPool) {
-        self.header.set_pool(pool);
-    }
-
-    /// Construct a `Segment` from its raw parts
-    pub fn from_raw_parts(
-        header: &'a mut segments::header::SegmentHeader,
-        data: &'a mut [u8],
-    ) -> Self {
-        Segment { header, data }
-    }
-
-    /// Initialize the segment. Sets the magic bytes in the data segment (if the
-    /// feature is enabled) and initializes the header fields.
+    /// Initialize the segment. Sets magic bytes (if enabled) and resets header.
     pub fn init(&mut self) {
         if cfg!(feature = "magic") {
             for (i, byte) in SEG_MAGIC.to_be_bytes().iter().enumerate() {
@@ -53,7 +40,6 @@ impl<'a> Segment<'a> {
 
     #[cfg(feature = "magic")]
     #[inline]
-    /// Reads the magic bytes from the start of the segment data section.
     pub fn magic(&self) -> u64 {
         u64::from_be_bytes([
             self.data[0],
@@ -68,20 +54,12 @@ impl<'a> Segment<'a> {
     }
 
     #[inline]
-    /// Checks that the magic bytes match the expected value
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if the magic bytes do not match the expected
-    /// value. This would indicate data corruption or that the segment was
-    /// constructed from invalid data.
     pub fn check_magic(&self) {
         #[cfg(feature = "magic")]
         assert_eq!(self.magic(), SEG_MAGIC)
     }
 
-    /// Convenience function which is used as a stop point for scanning through
-    /// the segment. All valid items would exist below this value
+    /// Maximum valid item start offset within the data slice.
     pub(crate) fn max_item_offset(&self) -> usize {
         if self.write_offset() >= ITEM_HDR_SIZE as i32 {
             std::cmp::min(self.write_offset() as usize, self.data.len()) - ITEM_HDR_SIZE
@@ -92,20 +70,11 @@ impl<'a> Segment<'a> {
         }
     }
 
-    /// Check the segment integrity. This is an expensive operation. Will return
-    /// a bool with a true result indicating that the segment integrity check
-    /// has passed. A false result indicates that there is data corruption.
-    ///
-    /// # Panics
-    ///
-    /// This function may panic if the segment is corrupted or has been
-    /// constructed from invalid bytes.
     #[cfg(feature = "debug")]
-    pub(crate) fn check_integrity(&mut self, hashtable: &MultiChoiceHashtable) -> bool {
+    pub(crate) fn check_integrity(&self, hashtable: &MultiChoiceHashtable) -> bool {
         self.check_magic();
 
         let mut integrity = true;
-
         let max_offset = self.max_item_offset();
         let mut offset = if cfg!(feature = "magic") {
             std::mem::size_of_val(&SEG_MAGIC)
@@ -116,7 +85,7 @@ impl<'a> Segment<'a> {
         let mut count = 0;
 
         while offset < max_offset {
-            let item = RawItem::from_ptr(unsafe { self.data.as_mut_ptr().add(offset) });
+            let item = RawItem::from_ptr((self.data.as_ptr() as *mut u8).wrapping_add(offset));
             if item.klen() == 0 {
                 break;
             }
@@ -142,215 +111,171 @@ impl<'a> Segment<'a> {
         integrity
     }
 
-    /// Return the segment's id
+    // -- Header delegation (all via shared reference) --
+
     #[inline]
     pub fn id(&self) -> NonZeroU32 {
         self.header.id()
     }
 
-    /// Return the current write offset of the segment. This index is the start
-    /// of the next write.
     #[inline]
     pub fn write_offset(&self) -> i32 {
         self.header.write_offset()
     }
 
-    /// Set the write offset to a specific value
     #[inline]
-    pub fn set_write_offset(&mut self, bytes: i32) {
-        self.header.set_write_offset(bytes)
+    pub fn set_write_offset(&self, bytes: i32) {
+        self.header.set_write_offset(bytes);
     }
 
-    /// Return the number of live (active) bytes in the segment. This may be
-    /// lower than the write offset due to items being removed/replaced
     #[inline]
     pub fn live_bytes(&self) -> i32 {
         self.header.live_bytes()
     }
 
-    /// Return the number of live items in the segment.
     #[inline]
     pub fn live_items(&self) -> i32 {
         self.header.live_items()
     }
 
-    /// Increment live items count.
     #[inline]
-    pub fn incr_live_items(&mut self) {
+    pub fn incr_live_items(&self) {
         self.header.incr_live_items();
     }
 
-    /// Increment live bytes count.
     #[inline]
-    pub fn incr_live_bytes(&mut self, bytes: i32) {
+    pub fn incr_live_bytes(&self, bytes: i32) {
         self.header.incr_live_bytes(bytes);
     }
 
-    /// Returns whether the segment is currently accessible from the hashtable.
     #[inline]
     pub fn accessible(&self) -> bool {
         self.header.accessible()
     }
 
-    /// Mark whether or not the segment is accessible from the hashtable.
     #[inline]
-    pub fn set_accessible(&mut self, accessible: bool) {
-        self.header.set_accessible(accessible)
+    pub fn set_accessible(&self, accessible: bool) {
+        self.header.set_accessible(accessible);
     }
 
-    /// Indicate if the segment might be evictable, prefer to use `can_evict()`
-    /// to check.
     #[inline]
     pub fn evictable(&self) -> bool {
         self.header.evictable()
     }
 
-    /// Set if the segment could be considered evictable.
     #[inline]
-    pub fn set_evictable(&mut self, evictable: bool) {
-        self.header.set_evictable(evictable)
+    pub fn set_evictable(&self, evictable: bool) {
+        self.header.set_evictable(evictable);
     }
 
-    /// Performs some checks to determine if the segment can actually be evicted
     #[inline]
     pub fn can_evict(&self) -> bool {
         self.header.can_evict()
     }
 
-    /// Return the segment's TTL
     #[inline]
     pub fn ttl(&self) -> Duration {
         self.header.ttl()
     }
 
-    /// Set the segment's TTL, used when linking it into a TtlBucket
     #[inline]
-    pub fn set_ttl(&mut self, ttl: Duration) {
-        self.header.set_ttl(ttl)
+    pub fn set_ttl(&self, ttl: Duration) {
+        self.header.set_ttl(ttl);
     }
 
-    /// Returns the time the segment was last initialized
     #[inline]
     pub fn create_at(&self) -> Instant {
         self.header.create_at()
     }
 
-    /// Mark that the segment has been merged
     #[inline]
-    pub fn mark_merged(&mut self) {
-        self.header.mark_merged()
+    pub fn mark_merged(&self) {
+        self.header.mark_merged();
     }
 
-    /// Return the previous segment's id. This will be a segment before it in a
-    /// TtlBucket or on the free queue. A `None` indicates that this segment is
-    /// the head of a bucket or the free queue.
-    #[allow(dead_code)]
     #[inline]
     pub fn prev_seg(&self) -> Option<NonZeroU32> {
         self.header.prev_seg()
     }
 
-    /// Set the previous segment id to this value. Negative values will mean
-    /// that there is no previous segment, meaning this segment is the head of
-    /// a bucket or the free queue
     #[inline]
-    pub fn set_prev_seg(&mut self, id: Option<NonZeroU32>) {
-        self.header.set_prev_seg(id)
+    pub fn set_prev_seg(&self, id: Option<NonZeroU32>) {
+        self.header.set_prev_seg(id);
     }
 
-    /// Return the next segment's id. This will be a segment following it in a
-    /// TtlBucket or on the free queue. A `None` indicates that this segment is
-    /// the tail of a bucket or the free queue.
     #[inline]
     pub fn next_seg(&self) -> Option<NonZeroU32> {
         self.header.next_seg()
     }
 
-    /// Set the next segment id to this value. Negative values will mean that
-    /// there is no previous segment, meaning this segment is the head of a
-    /// bucket or the free queue
     #[inline]
-    pub fn set_next_seg(&mut self, id: Option<NonZeroU32>) {
-        self.header.set_next_seg(id)
+    pub fn set_next_seg(&self, id: Option<NonZeroU32>) {
+        self.header.set_next_seg(id);
     }
 
-    /// Decrement the live bytes by `bytes` and the live items by `1`. This
-    /// would be used to update the header after an item has been removed or
-    /// replaced.
     #[inline]
-    pub fn decr_item(&mut self, bytes: i32) {
-        self.header.decr_live_bytes(bytes);
-        self.header.decr_live_items();
+    pub fn pool(&self) -> SegmentPool {
+        self.header.pool()
     }
 
-    /// Internal function which increments the live bytes by `bytes` and the
-    /// live items by `1`. Used when an item has been allocated
     #[inline]
-    fn incr_item(&mut self, bytes: i32) {
-        let _ = self.header.incr_write_offset(bytes);
-        self.header.incr_live_bytes(bytes);
+    pub fn set_pool(&self, pool: SegmentPool) {
+        self.header.set_pool(pool);
+    }
+
+    // -- Item operations --
+
+    /// Allocate space for an item, returning a `RawItem` pointing to the
+    /// allocated region. Updates write offset, live items, and live bytes.
+    pub(crate) fn alloc_item(&self, size: i32) -> RawItem {
+        let offset = self.header.fetch_add_write_offset(size);
+
         self.header.incr_live_items();
-    }
-
-    /// Allocate a new `RawItem` with the given size
-    ///
-    /// # Safety
-    ///
-    /// This function *does not* check that there is enough free space in the
-    /// segment. It is up to the caller to ensure that the resulting item fits
-    /// in the segment. Data corruption or segfault is likely to occur if this
-    /// is not checked.
-    // TODO(bmartin): See about returning a Result here instead and avoiding the
-    // potential safety issue.
-    pub(crate) fn alloc_item(&mut self, size: i32) -> RawItem {
-        let offset = self.write_offset() as usize;
-        self.incr_item(size);
+        self.header.incr_live_bytes(size);
 
         #[cfg(feature = "metrics")]
         {
-            ITEM_ALLOCATE.increment();
             ITEM_CURRENT.increment();
             ITEM_CURRENT_BYTES.add(size as _);
+            ITEM_ALLOCATE.increment();
         }
 
-        let ptr = unsafe { self.data.as_mut_ptr().add(offset) };
+        let ptr = (self.data.as_ptr() as *mut u8).wrapping_add(offset as usize);
         RawItem::from_ptr(ptr)
     }
 
-    /// Remove an item based on its offset into the segment
-    pub(crate) fn remove_item_at(&mut self, offset: usize) {
+    /// Remove an item at the given offset, decrementing live counters.
+    pub(crate) fn remove_item_at(&self, offset: usize) {
         let item = self.get_item_at(offset).unwrap();
-
-        let item_size = item.size() as i64;
+        let item_size = item.size() as i32;
 
         #[cfg(feature = "metrics")]
         {
             ITEM_CURRENT.decrement();
-            ITEM_CURRENT_BYTES.sub(item_size);
+            ITEM_CURRENT_BYTES.sub(item_size as _);
             ITEM_DEAD.increment();
-            ITEM_DEAD_BYTES.add(item_size);
+            ITEM_DEAD_BYTES.add(item_size as _);
         }
 
         self.check_magic();
-        self.decr_item(item_size as i32);
+        self.header.decr_item(item_size);
         assert!(self.live_bytes() >= 0);
         assert!(self.live_items() >= 0);
 
         self.check_magic();
     }
 
-    /// Returns the item at the given offset
-    // TODO(bmartin): consider changing the return type here and removing asserts?
+    /// Get a `RawItem` at the given offset within the segment data.
     #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn get_item_at(&mut self, offset: usize) -> Option<RawItem> {
+    pub(crate) fn get_item_at(&self, offset: usize) -> Option<RawItem> {
         assert!(offset <= self.max_item_offset());
-        Some(RawItem::from_ptr(unsafe {
-            self.data.as_mut_ptr().add(offset)
-        }))
+        Some(RawItem::from_ptr(
+            (self.data.as_ptr() as *mut u8).wrapping_add(offset),
+        ))
     }
 
-    /// This is used as part of segment merging, it moves all occupied space to
-    /// the beginning of the segment, leaving the end of the segment free
+    /// Compact the segment in-place, removing dead items and relinking
+    /// live items in the hashtable.
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn compact(
         &mut self,
@@ -377,10 +302,8 @@ impl<'a> Segment<'a> {
             }
 
             item.check_magic();
-
             let item_size = item.size();
 
-            // don't copy deleted items
             let old_loc = pack_location(self.id(), read_offset as u64);
             let deleted = hashtable.get_item_frequency(item.key(), old_loc).is_none();
             if deleted {
@@ -391,26 +314,20 @@ impl<'a> Segment<'a> {
                     ITEM_COMPACTED.increment();
                 }
 
-                // move read offset forward, leave write offset trailing
                 read_offset += item_size;
-
                 continue;
             }
 
-            // only copy if the offsets are different
             if read_offset != write_offset {
                 let src = unsafe { self.data.as_ptr().add(read_offset) };
                 let dst = unsafe { self.data.as_mut_ptr().add(write_offset) };
 
                 let new_loc = pack_location(self.id(), write_offset as u64);
                 if hashtable.cas_location(item.key(), old_loc, new_loc, true) {
-                    // note that we use a copy that can handle overlap
                     unsafe {
                         std::ptr::copy(src, dst, item_size);
                     }
                 } else {
-                    // this shouldn't happen, but if relink does fail we can
-                    // only move forward or return an error
                     read_offset += item_size;
                     write_offset = read_offset;
                     continue;
@@ -419,30 +336,20 @@ impl<'a> Segment<'a> {
 
             read_offset += item_size;
             write_offset += item_size;
-            continue;
         }
 
         #[cfg(feature = "metrics")]
         {
-            // We have removed dead items, so we must subtract the pruned items
-            // from the dead item stats.
             ITEM_DEAD.sub(items_pruned as _);
             ITEM_DEAD_BYTES.sub(bytes_pruned as _);
         }
 
-        // updates the write offset to the new position
         self.set_write_offset(write_offset as i32);
-
         Ok(())
     }
 
-    /// This is used to copy data from this segment into the target segment and
-    /// relink the items in the hashtable
-    ///
-    /// # NOTE
-    ///
-    /// Any items that don't fit in the target will be left in this segment it
-    /// is left to the caller to decide how to handle this
+    /// Copy live items from this segment into the target segment,
+    /// relinking them in the hashtable.
     pub(crate) fn copy_into(
         &mut self,
         target: &mut Segment,
@@ -467,12 +374,9 @@ impl<'a> Segment<'a> {
             }
 
             item.check_magic();
-
             let item_size = item.size();
-
             let write_offset = target.write_offset() as usize;
 
-            // skip deleted items and ones that won't fit in the target segment
             let old_loc = pack_location(self.id(), read_offset as u64);
             let deleted = hashtable.get_item_frequency(item.key(), old_loc).is_none();
             if deleted || write_offset + item_size >= target.data.len() {
@@ -485,8 +389,6 @@ impl<'a> Segment<'a> {
 
             let new_loc = pack_location(target.id(), write_offset as u64);
             if hashtable.cas_location(item.key(), old_loc, new_loc, true) {
-                // since we're working with two different segments, we can use
-                // nonoverlapping copy
                 unsafe {
                     std::ptr::copy_nonoverlapping(src, dst, item_size);
                 }
@@ -501,8 +403,6 @@ impl<'a> Segment<'a> {
                     bytes_copied += item_size;
                 }
             } else {
-                // TODO(bmartin): figure out if this could happen and make the
-                // relink function infallible if it can't happen
                 return Err(SegmentsError::RelinkFailure);
             }
 
@@ -511,9 +411,6 @@ impl<'a> Segment<'a> {
 
         #[cfg(feature = "metrics")]
         {
-            // We need to increment the current bytes, because removing items from
-            // this segment decrements these as it marks the item as removed. This
-            // should result in these stats remaining unchanged by this function.
             ITEM_CURRENT.add(items_copied);
             ITEM_CURRENT_BYTES.add(bytes_copied as _);
         }
@@ -521,9 +418,8 @@ impl<'a> Segment<'a> {
         Ok(())
     }
 
-    /// This is used as part of segment merging, it removes items from the
-    /// segment based on a cutoff frequency and target ratio. Since the cutoff
-    /// frequency is adjusted, it is returned as the result.
+    /// Prune low-frequency items from the segment based on a cutoff.
+    /// Returns the adjusted cutoff frequency.
     pub(crate) fn prune(
         &mut self,
         hashtable: &MultiChoiceHashtable,
@@ -556,7 +452,6 @@ impl<'a> Segment<'a> {
             }
 
             item.check_magic();
-
             let item_size = item.size();
 
             let loc = pack_location(self.id(), offset as u64);
@@ -570,8 +465,6 @@ impl<'a> Segment<'a> {
 
             if n_scanned >= (n_th_update * update_interval) {
                 n_th_update += 1;
-                // magical formula for adjusting cutoff based on retention,
-                // scan progress, and target ratio
                 let t = ((n_retained as f64) / (n_scanned as f64) - target_ratio) / target_ratio;
                 if !(-0.5..=0.5).contains(&t) {
                     cutoff *= 1.0 + t;
@@ -615,9 +508,7 @@ impl<'a> Segment<'a> {
         cutoff
     }
 
-    /// Remove all items from the segment, unlinking them from the hashtable.
-    /// If expire is true, this is treated as an expiration option. Otherwise it
-    /// is treated as an eviction.
+    /// Clear all items from the segment, unlinking them from the hashtable.
     pub(crate) fn clear(&mut self, hashtable: &MultiChoiceHashtable, expire: bool) {
         self.set_accessible(false);
         self.set_evictable(false);
@@ -629,12 +520,6 @@ impl<'a> Segment<'a> {
             0
         };
 
-        // track all items and bytes that are cleared
-        #[cfg(feature = "metrics")]
-        let mut items = 0;
-        #[cfg(feature = "metrics")]
-        let mut bytes = 0;
-
         while offset <= max_offset {
             let item = self.get_item_at(offset).unwrap();
             if item.klen() == 0 && self.live_items() == 0 {
@@ -644,12 +529,6 @@ impl<'a> Segment<'a> {
             item.check_magic();
 
             debug_assert!(item.klen() > 0, "invalid klen: ({})", item.klen());
-
-            #[cfg(feature = "metrics")]
-            {
-                items += 1;
-                bytes += item.size();
-            }
 
             let loc = pack_location(self.id(), offset as u64);
             let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
@@ -666,9 +545,6 @@ impl<'a> Segment<'a> {
                         ITEM_EVICT.increment();
                     }
                 } else {
-                    // this *shouldn't* happen, but to keep header integrity, we
-                    // warn and remove the item even if it wasn't in the
-                    // hashtable
                     warn!("unlinked item was present in segment");
                     self.remove_item_at(offset);
                 }
@@ -685,17 +561,6 @@ impl<'a> Segment<'a> {
                 self.live_bytes()
             );
             offset += item.size();
-        }
-
-        #[cfg(feature = "metrics")]
-        {
-            // At the end of the clear phase above, we have only dead items that we
-            // are clearing from the segment. The functions that removed the live
-            // items from the hashtable have decremented the live items, and
-            // incremented the dead items. So we subtract all items that were in
-            // this segment from the dead item stats.
-            ITEM_DEAD.sub(items as _);
-            ITEM_DEAD_BYTES.sub(bytes as _);
         }
 
         // skips over seg_wait_refcount and evict retry, because no threading
@@ -723,7 +588,7 @@ impl<'a> Segment<'a> {
 }
 
 #[cfg(feature = "magic")]
-impl<'a> std::fmt::Debug for Segment<'a> {
+impl std::fmt::Debug for Segment<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.debug_struct("Segment")
             .field("header", &self.header)
