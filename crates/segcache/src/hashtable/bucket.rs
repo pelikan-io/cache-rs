@@ -99,8 +99,14 @@ impl Hashbucket {
         let should_increment = if freq <= 16 {
             true
         } else {
-            use rand::RngExt;
-            let rand: u64 = rand::rng().random();
+            #[cfg(not(feature = "loom"))]
+            let rand = {
+                use rand::RngExt;
+                rand::rng().random::<u64>()
+            };
+            #[cfg(feature = "loom")]
+            let rand = 0u64;
+
             rand.is_multiple_of(freq as u64)
         };
 

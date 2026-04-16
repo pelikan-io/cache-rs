@@ -170,7 +170,7 @@ impl MultiChoiceHashtable {
     // =========================================================================
 
     /// Find slots with matching tags using SIMD (AVX2).
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(feature = "loom")))]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         use std::arch::x86_64::*;
@@ -216,7 +216,7 @@ impl MultiChoiceHashtable {
     }
 
     /// Find slots with matching tags using NEON (ARM64).
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "loom")))]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         use std::arch::aarch64::*;
@@ -312,10 +312,13 @@ impl MultiChoiceHashtable {
     }
 
     /// Scalar fallback for finding tag matches.
-    #[cfg(not(any(
-        all(target_arch = "x86_64", target_feature = "avx2"),
-        target_arch = "aarch64"
-    )))]
+    #[cfg(any(
+        feature = "loom",
+        not(any(
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            target_arch = "aarch64"
+        ))
+    ))]
     #[inline]
     fn find_tag_matches_simd(bucket: &Hashbucket, tag_shifted: u64) -> u8 {
         const TAG_MASK: u64 = 0xFFF0_0000_0000_0000;
@@ -1002,7 +1005,7 @@ impl Hashtable for MultiChoiceHashtable {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
 
@@ -1141,5 +1144,325 @@ mod tests {
         let result = ht.insert(b"test", loc2, &verifier);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(loc1));
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use crate::hashtable::traits::Hashtable;
+    use crate::sync::AtomicU64;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// Simple verifier that always returns true for testing hashtable mechanics.
+    struct AlwaysVerifier;
+
+    impl KeyVerifier for AlwaysVerifier {
+        fn verify(&self, _key: &[u8], _location: Location, _allow_deleted: bool) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_concurrent_insert_different_keys() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            let ht1 = ht.clone();
+            let v1 = verifier.clone();
+            let t1 = thread::spawn(move || {
+                let loc = Location::new(1);
+                ht1.insert(b"key1", loc, &*v1)
+            });
+
+            let ht2 = ht.clone();
+            let v2 = verifier.clone();
+            let t2 = thread::spawn(move || {
+                let loc = Location::new(2);
+                ht2.insert(b"key2", loc, &*v2)
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // Both keys should be present (or one may fail due to full bucket)
+            let found1 = ht.lookup(b"key1", &*verifier).is_some();
+            let found2 = ht.lookup(b"key2", &*verifier).is_some();
+
+            // At least one should succeed
+            assert!(found1 || found2);
+        });
+    }
+
+    #[test]
+    fn test_concurrent_insert_same_key() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            let ht1 = ht.clone();
+            let v1 = verifier.clone();
+            let t1 = thread::spawn(move || {
+                let loc = Location::new(1);
+                ht1.insert(b"key", loc, &*v1)
+            });
+
+            let ht2 = ht.clone();
+            let v2 = verifier.clone();
+            let t2 = thread::spawn(move || {
+                let loc = Location::new(2);
+                ht2.insert(b"key", loc, &*v2)
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Both should succeed (insert does upsert, not add-only)
+            assert!(r1.is_ok());
+            assert!(r2.is_ok());
+
+            // Key should be present with one of the locations
+            let lookup = ht.lookup(b"key", &*verifier);
+            assert!(lookup.is_some());
+            let final_loc = lookup.unwrap().0;
+            assert!(final_loc == Location::new(1) || final_loc == Location::new(2));
+        });
+    }
+
+    #[test]
+    fn test_concurrent_lookup_frequency_update() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            // Insert a key first
+            let loc = Location::new(42);
+            ht.insert(b"key", loc, &*verifier).unwrap();
+
+            let ht1 = ht.clone();
+            let v1 = verifier.clone();
+            let t1 = thread::spawn(move || ht1.lookup(b"key", &*v1));
+
+            let ht2 = ht.clone();
+            let v2 = verifier.clone();
+            let t2 = thread::spawn(move || ht2.lookup(b"key", &*v2));
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Both lookups should find the key
+            assert!(r1.is_some());
+            assert!(r2.is_some());
+
+            // Both should return the same location
+            assert_eq!(r1.unwrap().0, loc);
+            assert_eq!(r2.unwrap().0, loc);
+        });
+    }
+
+    #[test]
+    fn test_concurrent_insert_and_remove() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            // Insert a key first
+            let loc = Location::new(42);
+            ht.insert(b"key", loc, &*verifier).unwrap();
+
+            let ht1 = ht.clone();
+            let t1 = thread::spawn(move || ht1.remove(b"key", loc));
+
+            let ht2 = ht.clone();
+            let v2 = verifier.clone();
+            let t2 = thread::spawn(move || {
+                let new_loc = Location::new(99);
+                ht2.insert(b"key2", new_loc, &*v2)
+            });
+
+            let removed = t1.join().unwrap();
+            let _ = t2.join().unwrap();
+
+            // Remove should have succeeded
+            assert!(removed);
+
+            // Original key should be gone
+            let lookup = ht.lookup(b"key", &*verifier);
+            assert!(lookup.is_none());
+        });
+    }
+
+    #[test]
+    fn test_concurrent_cas_operations() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            // Insert a key first
+            let loc1 = Location::new(1);
+            ht.insert(b"key", loc1, &*verifier).unwrap();
+
+            let ht1 = ht.clone();
+            let t1 = thread::spawn(move || {
+                let loc2 = Location::new(2);
+                ht1.cas_location(b"key", loc1, loc2, true)
+            });
+
+            let ht2 = ht.clone();
+            let t2 = thread::spawn(move || {
+                let loc3 = Location::new(3);
+                ht2.cas_location(b"key", loc1, loc3, true)
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Exactly one CAS should succeed
+            let successes = [r1, r2].iter().filter(|&&x| x).count();
+            assert_eq!(successes, 1, "Exactly one CAS should succeed");
+
+            // The key should now point to either loc2 or loc3
+            let lookup = ht.lookup(b"key", &*verifier);
+            assert!(lookup.is_some());
+            let final_loc = lookup.unwrap().0;
+            assert!(final_loc == Location::new(2) || final_loc == Location::new(3));
+        });
+    }
+
+    #[test]
+    fn test_bucket_slot_cas_contention() {
+        loom::model(|| {
+            let bucket = Hashbucket::new();
+            let slot = &bucket.items[0];
+
+            let slot_ptr = slot as *const AtomicU64 as usize;
+
+            let t1 = thread::spawn(move || {
+                let slot = unsafe { &*(slot_ptr as *const AtomicU64) };
+                let packed = Hashbucket::pack(0x123, 1, Location::new(1));
+                slot.compare_exchange(0, packed, Ordering::Release, Ordering::Acquire)
+            });
+
+            let t2 = thread::spawn(move || {
+                let slot = unsafe { &*(slot_ptr as *const AtomicU64) };
+                let packed = Hashbucket::pack(0x456, 1, Location::new(2));
+                slot.compare_exchange(0, packed, Ordering::Release, Ordering::Acquire)
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Exactly one should succeed (starting from 0)
+            let successes = [r1.is_ok(), r2.is_ok()].iter().filter(|&&x| x).count();
+            assert_eq!(successes, 1, "Exactly one CAS from 0 should succeed");
+        });
+    }
+
+    /// Three threads doing CAS on the same key. Bounded preemption.
+    #[test]
+    fn test_three_way_cas_same_key() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(4));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            let loc_initial = Location::new(1);
+            ht.insert(b"key", loc_initial, &*verifier).unwrap();
+
+            let ht1 = ht.clone();
+            let ht2 = ht.clone();
+            let ht3 = ht.clone();
+
+            let t1 = thread::spawn(move || {
+                let loc_new = Location::new(10);
+                ht1.cas_location(b"key", loc_initial, loc_new, true)
+            });
+
+            let t2 = thread::spawn(move || {
+                let loc_new = Location::new(20);
+                ht2.cas_location(b"key", loc_initial, loc_new, true)
+            });
+
+            let t3 = thread::spawn(move || {
+                let loc_new = Location::new(30);
+                ht3.cas_location(b"key", loc_initial, loc_new, true)
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+            let r3 = t3.join().unwrap();
+
+            // Exactly one CAS should succeed
+            let successes = [r1, r2, r3].iter().filter(|&&x| x).count();
+            assert_eq!(successes, 1, "Exactly one CAS should succeed");
+
+            // Final location should be one of the new values
+            let lookup = ht.lookup(b"key", &*verifier);
+            assert!(lookup.is_some());
+            let final_loc = lookup.unwrap().0;
+            assert!(
+                final_loc == Location::new(10)
+                    || final_loc == Location::new(20)
+                    || final_loc == Location::new(30)
+            );
+        });
+    }
+
+    /// Three threads inserting different keys. Bounded preemption.
+    #[test]
+    fn test_three_way_insert_different_keys() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(8));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            let ht1 = ht.clone();
+            let v1 = verifier.clone();
+            let ht2 = ht.clone();
+            let v2 = verifier.clone();
+            let ht3 = ht.clone();
+            let v3 = verifier.clone();
+
+            let t1 = thread::spawn(move || {
+                let loc = Location::new(1);
+                ht1.insert(b"key1", loc, &*v1)
+            });
+
+            let t2 = thread::spawn(move || {
+                let loc = Location::new(2);
+                ht2.insert(b"key2", loc, &*v2)
+            });
+
+            let t3 = thread::spawn(move || {
+                let loc = Location::new(3);
+                ht3.insert(b"key3", loc, &*v3)
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+            let r3 = t3.join().unwrap();
+
+            let successes = [r1.is_ok(), r2.is_ok(), r3.is_ok()]
+                .iter()
+                .filter(|&&x| x)
+                .count();
+
+            // At least 2 should succeed with 256 buckets
+            assert!(successes >= 2, "Most inserts should succeed");
+
+            if r1.is_ok() {
+                assert!(ht.lookup(b"key1", &*verifier).is_some());
+            }
+            if r2.is_ok() {
+                assert!(ht.lookup(b"key2", &*verifier).is_some());
+            }
+            if r3.is_ok() {
+                assert!(ht.lookup(b"key3", &*verifier).is_some());
+            }
+        });
     }
 }

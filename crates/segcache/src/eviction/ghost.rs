@@ -1,4 +1,3 @@
-
 //! A ghost queue that stores fingerprints (hashes) of recently evicted items.
 //! Used by the S3-FIFO eviction policy to decide whether a newly inserted
 //! item should go directly into the main segment pool.
