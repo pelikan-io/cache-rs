@@ -33,6 +33,7 @@ impl Item {
     ///
     /// Panics if the magic bytes are incorrect, indicating that the data has
     /// become corrupted or the item was loaded from the wrong offset.
+    #[allow(dead_code)]
     pub(crate) fn check_magic(&self) {
         self.raw.check_magic()
     }

@@ -153,7 +153,15 @@ impl Builder {
     ///     .eviction(Policy::Random).build();
     /// ```
     pub fn build(self) -> Result<Segcache, std::io::Error> {
-        let hashtable = HashTable::new(self.hash_power, self.overflow_factor);
+        // The hash_power from the old API specified total slots = 2^hash_power,
+        // with 8 slots per bucket. The new hashtable takes power = number of
+        // buckets = 2^power. So we subtract 3 to convert, but ensure minimum 4.
+        let bucket_power = if self.hash_power >= 7 {
+            self.hash_power - 3
+        } else {
+            4
+        };
+        let hashtable = MultiChoiceHashtable::new(bucket_power);
         let segments = self.segments_builder.build()?;
         let ttl_buckets = TtlBuckets::default();
 

@@ -101,7 +101,7 @@ impl<'a> Segment<'a> {
     /// This function may panic if the segment is corrupted or has been
     /// constructed from invalid bytes.
     #[cfg(feature = "debug")]
-    pub(crate) fn check_integrity(&mut self, hashtable: &mut HashTable) -> bool {
+    pub(crate) fn check_integrity(&mut self, hashtable: &MultiChoiceHashtable) -> bool {
         self.check_magic();
 
         let mut integrity = true;
@@ -121,7 +121,8 @@ impl<'a> Segment<'a> {
                 break;
             }
 
-            let deleted = !hashtable.is_item_at(item.key(), self.id(), offset as u64);
+            let loc = pack_location(self.id(), offset as u64);
+            let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
             if !deleted {
                 count += 1;
             }
@@ -316,13 +317,6 @@ impl<'a> Segment<'a> {
         RawItem::from_ptr(ptr)
     }
 
-    /// Remove an item based on its item info
-    // TODO(bmartin): tombstone is currently always set
-    pub(crate) fn remove_item(&mut self, item_info: u64) {
-        let offset = get_offset(item_info) as usize;
-        self.remove_item_at(offset)
-    }
-
     /// Remove an item based on its offset into the segment
     pub(crate) fn remove_item_at(&mut self, offset: usize) {
         let item = self.get_item_at(offset).unwrap();
@@ -358,7 +352,10 @@ impl<'a> Segment<'a> {
     /// This is used as part of segment merging, it moves all occupied space to
     /// the beginning of the segment, leaving the end of the segment free
     #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn compact(&mut self, hashtable: &mut HashTable) -> Result<(), SegmentsError> {
+    pub(crate) fn compact(
+        &mut self,
+        hashtable: &MultiChoiceHashtable,
+    ) -> Result<(), SegmentsError> {
         let max_offset = self.max_item_offset();
         let mut read_offset = if cfg!(feature = "magic") {
             std::mem::size_of_val(&SEG_MAGIC)
@@ -384,7 +381,8 @@ impl<'a> Segment<'a> {
             let item_size = item.size();
 
             // don't copy deleted items
-            let deleted = !hashtable.is_item_at(item.key(), self.id(), read_offset as u64);
+            let old_loc = pack_location(self.id(), read_offset as u64);
+            let deleted = hashtable.get_item_frequency(item.key(), old_loc).is_none();
             if deleted {
                 #[cfg(feature = "metrics")]
                 {
@@ -404,16 +402,8 @@ impl<'a> Segment<'a> {
                 let src = unsafe { self.data.as_ptr().add(read_offset) };
                 let dst = unsafe { self.data.as_mut_ptr().add(write_offset) };
 
-                if hashtable
-                    .relink_item(
-                        item.key(),
-                        self.id(),
-                        self.id(),
-                        read_offset as u64,
-                        write_offset as u64,
-                    )
-                    .is_ok()
-                {
+                let new_loc = pack_location(self.id(), write_offset as u64);
+                if hashtable.cas_location(item.key(), old_loc, new_loc, true) {
                     // note that we use a copy that can handle overlap
                     unsafe {
                         std::ptr::copy(src, dst, item_size);
@@ -456,7 +446,7 @@ impl<'a> Segment<'a> {
     pub(crate) fn copy_into(
         &mut self,
         target: &mut Segment,
-        hashtable: &mut HashTable,
+        hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         let max_offset = self.max_item_offset();
         let mut read_offset = if cfg!(feature = "magic") {
@@ -483,7 +473,8 @@ impl<'a> Segment<'a> {
             let write_offset = target.write_offset() as usize;
 
             // skip deleted items and ones that won't fit in the target segment
-            let deleted = !hashtable.is_item_at(item.key(), self.id(), read_offset as u64);
+            let old_loc = pack_location(self.id(), read_offset as u64);
+            let deleted = hashtable.get_item_frequency(item.key(), old_loc).is_none();
             if deleted || write_offset + item_size >= target.data.len() {
                 read_offset += item_size;
                 continue;
@@ -492,16 +483,8 @@ impl<'a> Segment<'a> {
             let src = unsafe { self.data.as_ptr().add(read_offset) };
             let dst = unsafe { target.data.as_mut_ptr().add(write_offset) };
 
-            if hashtable
-                .relink_item(
-                    item.key(),
-                    self.id(),
-                    target.id(),
-                    read_offset as u64,
-                    write_offset as u64,
-                )
-                .is_ok()
-            {
+            let new_loc = pack_location(target.id(), write_offset as u64);
+            if hashtable.cas_location(item.key(), old_loc, new_loc, true) {
                 // since we're working with two different segments, we can use
                 // nonoverlapping copy
                 unsafe {
@@ -543,7 +526,7 @@ impl<'a> Segment<'a> {
     /// frequency is adjusted, it is returned as the result.
     pub(crate) fn prune(
         &mut self,
-        hashtable: &mut HashTable,
+        hashtable: &MultiChoiceHashtable,
         cutoff_freq: f64,
         target_ratio: f64,
     ) -> f64 {
@@ -576,9 +559,9 @@ impl<'a> Segment<'a> {
 
             let item_size = item.size();
 
-            let deleted = !hashtable.is_item_at(item.key(), self.id(), offset as u64);
+            let loc = pack_location(self.id(), offset as u64);
+            let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
             if deleted {
-                // do we need to evict again here? Why is that done in the C code?
                 offset += item_size;
                 continue;
             }
@@ -596,8 +579,7 @@ impl<'a> Segment<'a> {
                 trace!("cutoff adj to: {cutoff}");
             }
 
-            let item_frequency =
-                hashtable.get_freq(item.key(), self, offset as u64).unwrap() as f64;
+            let item_frequency = hashtable.get_item_frequency(item.key(), loc).unwrap_or(0) as f64;
             let weighted_frequency = item_frequency / (item_size as f64 / mean_size);
 
             if cutoff >= 0.0001
@@ -608,10 +590,12 @@ impl<'a> Segment<'a> {
                 trace!(
                     "evicting item size: {item_size} freq: {item_frequency} w_freq: {weighted_frequency} cutoff: {cutoff}"
                 );
-                if !hashtable.evict(item.key(), offset.try_into().unwrap(), self) {
-                    // this *shouldn't* happen, but to keep header integrity, we
-                    // warn and remove the item even if it wasn't in the
-                    // hashtable
+                if hashtable.remove(item.key(), loc) {
+                    self.remove_item_at(offset);
+
+                    #[cfg(feature = "metrics")]
+                    ITEM_EVICT.increment();
+                } else {
                     warn!("unlinked item was present in segment");
                     self.remove_item_at(offset);
                 }
@@ -634,7 +618,7 @@ impl<'a> Segment<'a> {
     /// Remove all items from the segment, unlinking them from the hashtable.
     /// If expire is true, this is treated as an expiration option. Otherwise it
     /// is treated as an eviction.
-    pub(crate) fn clear(&mut self, hashtable: &mut HashTable, expire: bool) {
+    pub(crate) fn clear(&mut self, hashtable: &MultiChoiceHashtable, expire: bool) {
         self.set_accessible(false);
         self.set_evictable(false);
 
@@ -667,15 +651,21 @@ impl<'a> Segment<'a> {
                 bytes += item.size();
             }
 
-            let deleted = !hashtable.is_item_at(item.key(), self.id(), offset as u64);
+            let loc = pack_location(self.id(), offset as u64);
+            let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
             if !deleted {
                 trace!("evicting from hashtable");
-                let removed = if expire {
-                    hashtable.expire(item.key(), offset.try_into().unwrap(), self)
+                let removed = hashtable.remove(item.key(), loc);
+                if removed {
+                    self.remove_item_at(offset);
+
+                    #[cfg(feature = "metrics")]
+                    if expire {
+                        ITEM_EXPIRE.increment();
+                    } else {
+                        ITEM_EVICT.increment();
+                    }
                 } else {
-                    hashtable.evict(item.key(), offset.try_into().unwrap(), self)
-                };
-                if !removed {
                     // this *shouldn't* happen, but to keep header integrity, we
                     // warn and remove the item even if it wasn't in the
                     // hashtable
