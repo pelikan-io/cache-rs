@@ -1,6 +1,3 @@
-// Copyright 2025 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 //! Cache-line aligned hashtable bucket.
 //!
 //! Each bucket contains 8 item slots packed as `[12-bit tag][8-bit freq][44-bit location]`.

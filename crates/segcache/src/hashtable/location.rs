@@ -1,6 +1,3 @@
-// Copyright 2025 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 //! Opaque location type for cache storage.
 //!
 //! `Location` is a 44-bit packed value that identifies where an item is stored.

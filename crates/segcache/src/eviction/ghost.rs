@@ -1,5 +1,3 @@
-// Copyright 2025 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
 
 //! A ghost queue that stores fingerprints (hashes) of recently evicted items.
 //! Used by the S3-FIFO eviction policy to decide whether a newly inserted

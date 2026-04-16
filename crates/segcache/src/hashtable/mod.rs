@@ -1,6 +1,3 @@
-// Copyright 2025 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 //! Lock-free N-choice hashtable with SIMD-accelerated bucket scanning.
 //!
 //! The hashtable maps keys to opaque [`Location`] values using 12-bit tags,
