@@ -17,10 +17,6 @@
 //! * high-throughput item storage
 //! * eager expiration of items
 //! * low metadata overhead
-//!
-//! Non-goals:
-//! * not designed for concurrent access
-//!
 
 // macro includes
 #[macro_use]
@@ -31,7 +27,6 @@ use clocksource::coarse::{Duration, Instant};
 
 // includes from core/std
 use core::hash::{BuildHasher, Hasher};
-use std::convert::TryInto;
 
 // submodules
 mod builder;
@@ -42,6 +37,7 @@ mod item;
 mod rand;
 mod segcache;
 mod segments;
+mod sync;
 mod ttl_buckets;
 
 #[cfg(feature = "metrics")]
@@ -56,12 +52,15 @@ pub use crate::segcache::Segcache;
 pub use builder::Builder;
 pub use error::SegcacheError;
 pub use eviction::Policy;
+pub use hashtable::Location;
 pub use item::Item;
 pub use keyvalue::Value;
 
 // items from submodules which are imported for convenience to the crate level
 pub(crate) use crate::rand::*;
-pub(crate) use hashtable::*;
+pub(crate) use hashtable::{
+    pack_location, unpack_location, Hashtable, MultiChoiceHashtable, SegmentsVerifier,
+};
 pub(crate) use item::*;
 pub(crate) use keyvalue::{size_of, RawItem, ITEM_HDR_SIZE};
 pub(crate) use segments::*;

@@ -42,7 +42,7 @@ impl Builder {
     /// let cache = Segcache::builder().hash_power(21).build();
     /// ```
     pub fn hash_power(mut self, hash_power: u8) -> Self {
-        assert!(hash_power >= 3, "hash power must be at least 3");
+        assert!(hash_power >= 7, "hash power must be at least 7");
         self.hash_power = hash_power;
         self
     }
@@ -153,7 +153,7 @@ impl Builder {
     ///     .eviction(Policy::Random).build();
     /// ```
     pub fn build(self) -> Result<Segcache, std::io::Error> {
-        let hashtable = HashTable::new(self.hash_power, self.overflow_factor);
+        let hashtable = MultiChoiceHashtable::new(self.hash_power);
         let segments = self.segments_builder.build()?;
         let ttl_buckets = TtlBuckets::default();
 

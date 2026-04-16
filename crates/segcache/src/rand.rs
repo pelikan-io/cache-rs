@@ -6,51 +6,6 @@
 
 pub use inner::*;
 
-use ::rand::TryRng;
-use core::cell::UnsafeCell;
-use core::convert::Infallible;
-use std::rc::Rc;
-
-pub struct ThreadRng {
-    // Rc is explicitly !Send and !Sync
-    rng: Rc<UnsafeCell<Random>>,
-}
-
-thread_local!(
-    // We require Rc<..> to avoid premature freeing when thread_rng is used
-    // within thread-local destructors. See #968.
-    static THREAD_RNG_KEY: Rc<UnsafeCell<Random>> = {
-        let rng = rng();
-        Rc::new(UnsafeCell::new(rng))
-    }
-);
-
-pub fn thread_rng() -> ThreadRng {
-    let rng = THREAD_RNG_KEY.with(|t| t.clone());
-    ThreadRng { rng }
-}
-
-impl TryRng for ThreadRng {
-    type Error = Infallible;
-
-    #[inline(always)]
-    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
-        let rng = unsafe { &mut *self.rng.get() };
-        rng.try_next_u32()
-    }
-
-    #[inline(always)]
-    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
-        let rng = unsafe { &mut *self.rng.get() };
-        rng.try_next_u64()
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
-        let rng = unsafe { &mut *self.rng.get() };
-        rng.try_fill_bytes(dest)
-    }
-}
-
 #[cfg(test)]
 mod inner {
     use ::rand::SeedableRng;

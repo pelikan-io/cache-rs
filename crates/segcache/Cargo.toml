@@ -21,6 +21,9 @@ magic = ["keyvalue/magic"]
 # enables metrics
 metrics = ["metriken"]
 
+# enables loom concurrency model checking for the hashtable
+loom = ["dep:loom"]
+
 # metafeatures
 debug = ["magic"]
 
@@ -36,6 +39,8 @@ metriken = { workspace = true, optional = true }
 rand = { workspace = true, features = ["sys_rng"] }
 rand_xoshiro = { workspace = true }
 thiserror = { workspace = true }
+
+loom = { version = "0.7", features = ["checkpoint"], optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

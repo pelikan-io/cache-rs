@@ -78,7 +78,11 @@ impl TtlBucket {
 
     /// Expire segments from this TtlBucket, returns the number of segments
     /// expired.
-    pub(super) fn expire(&mut self, hashtable: &mut HashTable, segments: &mut Segments) -> usize {
+    pub(super) fn expire(
+        &mut self,
+        hashtable: &MultiChoiceHashtable,
+        segments: &mut Segments,
+    ) -> usize {
         if self.head.is_none() {
             return 0;
         }
@@ -115,7 +119,11 @@ impl TtlBucket {
 
     /// Clear segments from this TtlBucket, returns the number of segments
     /// expired.
-    pub(super) fn clear(&mut self, hashtable: &mut HashTable, segments: &mut Segments) -> usize {
+    pub(super) fn clear(
+        &mut self,
+        hashtable: &MultiChoiceHashtable,
+        segments: &mut Segments,
+    ) -> usize {
         if self.head.is_none() {
             return 0;
         }

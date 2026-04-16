@@ -130,18 +130,15 @@ impl Segments {
         self.segment_size
     }
 
+    /// Create a `SegmentsVerifier` for key verification in the hashtable.
+    pub(crate) fn verifier(&self) -> SegmentsVerifier<'_> {
+        SegmentsVerifier::new(&self.data, self.segment_size as usize, self.cap as usize)
+    }
+
     /// Returns the number of free segments
     #[cfg(test)]
     pub fn free(&self) -> usize {
         self.free as usize
-    }
-
-    /// Retrieve a `RawItem` from the segment id and offset encoded in the
-    /// item info.
-    pub(crate) fn get_item(&mut self, item_info: u64) -> Option<RawItem> {
-        let seg_id = get_seg_id(item_info);
-        let offset = get_offset(item_info) as usize;
-        self.get_item_at(seg_id, offset)
     }
 
     /// Retrieve a `RawItem` from a specific segment id at the given offset
@@ -169,7 +166,7 @@ impl Segments {
     fn clear_segment(
         &mut self,
         id: NonZeroU32,
-        hashtable: &mut HashTable,
+        hashtable: &MultiChoiceHashtable,
         expire: bool,
     ) -> Result<(), ()> {
         let mut segment = self.get_mut(id).unwrap();
@@ -192,7 +189,7 @@ impl Segments {
     pub fn evict(
         &mut self,
         ttl_buckets: &mut TtlBuckets,
-        hashtable: &mut HashTable,
+        hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         #[cfg(feature = "metrics")]
         let now = Instant::now();
@@ -553,28 +550,13 @@ impl Segments {
         }
     }
 
-    /// Remove a single item from a segment based on the item_info
-    pub(crate) fn remove_item(
-        &mut self,
-        item_info: u64,
-        ttl_buckets: &mut TtlBuckets,
-        hashtable: &mut HashTable,
-    ) -> Result<(), SegmentsError> {
-        if let Some(seg_id) = get_seg_id(item_info) {
-            let offset = get_offset(item_info) as usize;
-            self.remove_at(seg_id, offset, ttl_buckets, hashtable)
-        } else {
-            Err(SegmentsError::BadSegmentId)
-        }
-    }
-
     /// Remove a single item from a segment based on the segment id and offset.
     pub(crate) fn remove_at(
         &mut self,
         seg_id: NonZeroU32,
         offset: usize,
         ttl_buckets: &mut TtlBuckets,
-        hashtable: &mut HashTable,
+        hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // remove the item
         {
@@ -675,7 +657,7 @@ impl Segments {
     }
 
     #[cfg(feature = "debug")]
-    pub(crate) fn check_integrity(&mut self, hashtable: &mut HashTable) -> bool {
+    pub(crate) fn check_integrity(&mut self, hashtable: &MultiChoiceHashtable) -> bool {
         let mut integrity = true;
         for id in 0..self.cap {
             if !self
@@ -756,7 +738,7 @@ impl Segments {
     fn merge_evict(
         &mut self,
         start: NonZeroU32,
-        hashtable: &mut HashTable,
+        hashtable: &MultiChoiceHashtable,
     ) -> Result<Option<NonZeroU32>, SegmentsError> {
         #[cfg(feature = "metrics")]
         SEGMENT_MERGE.increment();
@@ -863,7 +845,7 @@ impl Segments {
     fn merge_compact(
         &mut self,
         start: NonZeroU32,
-        hashtable: &mut HashTable,
+        hashtable: &MultiChoiceHashtable,
     ) -> Result<Option<NonZeroU32>, SegmentsError> {
         #[cfg(feature = "metrics")]
         SEGMENT_MERGE.increment();
@@ -996,7 +978,7 @@ impl Segments {
     fn s3fifo_evict(
         &mut self,
         ttl_buckets: &mut TtlBuckets,
-        hashtable: &mut HashTable,
+        hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // Try evicting an admission-pool segment first (promoting freq > 0)
         if let Some(seg_id) = self.find_oldest_seg_in_pool(ttl_buckets, SegmentPool::Admission) {
@@ -1021,7 +1003,7 @@ impl Segments {
         &mut self,
         seg_id: NonZeroU32,
         ttl_buckets: &mut TtlBuckets,
-        hashtable: &mut HashTable,
+        hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // First pass: copy items with freq > 0 into a main-pool segment.
         // We try to acquire a free segment for the promoted items.
@@ -1068,7 +1050,7 @@ impl Segments {
         &mut self,
         src_id: NonZeroU32,
         dst_id: NonZeroU32,
-        hashtable: &mut HashTable,
+        hashtable: &MultiChoiceHashtable,
     ) {
         let seg_size = self.segment_size() as usize;
         let (mut src, mut dst) = match self.get_mut_pair(src_id, dst_id) {
@@ -1094,29 +1076,21 @@ impl Segments {
             item.check_magic();
 
             let item_size = item.size();
-            let deleted = !hashtable.is_item_at(item.key(), src.id(), offset as u64);
+            let old_loc = pack_location(src.id(), offset as u64);
+            let freq = hashtable
+                .get_item_frequency(item.key(), old_loc)
+                .unwrap_or(0);
+            let deleted = freq == 0 && hashtable.get_item_frequency(item.key(), old_loc).is_none();
             if deleted {
                 offset += item_size;
                 continue;
             }
 
-            let freq = hashtable
-                .get_freq(item.key(), &mut src, offset as u64)
-                .unwrap_or(0)
-                & 0x7F;
-
             if freq > 0 {
                 let write_offset = dst.write_offset() as usize;
+                let new_loc = pack_location(dst.id(), write_offset as u64);
                 if write_offset + item_size < seg_size
-                    && hashtable
-                        .relink_item(
-                            item.key(),
-                            src.id(),
-                            dst.id(),
-                            offset as u64,
-                            write_offset as u64,
-                        )
-                        .is_ok()
+                    && hashtable.cas_location(item.key(), old_loc, new_loc, true)
                 {
                     unsafe {
                         let s = src.data_ptr().add(offset);
@@ -1139,7 +1113,7 @@ impl Segments {
     }
 
     /// Add hashes of remaining live items in a segment to the ghost queue.
-    fn s3fifo_ghost_remaining(&mut self, seg_id: NonZeroU32, hashtable: &mut HashTable) {
+    fn s3fifo_ghost_remaining(&mut self, seg_id: NonZeroU32, hashtable: &MultiChoiceHashtable) {
         // Collect hashes first to avoid borrow conflict with self.evict.ghost
         let mut hashes = Vec::new();
         {
@@ -1165,7 +1139,8 @@ impl Segments {
                 }
 
                 let item_size = item.size();
-                let deleted = !hashtable.is_item_at(item.key(), segment.id(), offset as u64);
+                let loc = pack_location(segment.id(), offset as u64);
+                let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
                 if !deleted {
                     let mut hasher = hashtable.hash_builder().build_hasher();
                     hasher.write(item.key());
@@ -1188,7 +1163,7 @@ impl Segments {
         &mut self,
         seg_id: NonZeroU32,
         ttl_buckets: &mut TtlBuckets,
-        hashtable: &mut HashTable,
+        hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         // Try to get a target segment for second-chance items
         let target_id = self.pop_free();

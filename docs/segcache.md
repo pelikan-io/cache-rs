@@ -69,23 +69,26 @@ Each item within a segment uses the packed format from the [keyvalue](keyvalue.m
 
 The magic field (0xDECAFBAD) is only present with the `magic` feature. Flags pack a typed-value bit, padding, and 6-bit optional data length. Total header: 5 bytes (or 9 with magic), always 8-byte aligned within the segment.
 
-## Hash Table: Bulk Chaining
+## Hash Table: Lock-Free N-Choice
 
-The hash table uses a design called **bulk chaining**. Each primary bucket is exactly 64 bytes (one cache line) containing 8 slots:
+The hash table uses lock-free N-choice hashing (2-choice by default). Each bucket is exactly 64 bytes (one cache line) containing 8 symmetric item slots — no dedicated metadata slot:
 
 ```
-HashBucket (64 bytes = 1 cache line):
-┌─────────────────────────────────────────────────────────┐
-│ Slot 0: Bucket Info (CAS:32, chain_len:8, timestamp:16) │
-│ Slot 1-7: Item Info  (tag:12, freq:8, seg_id:24, off:20)│
-└─────────────────────────────────────────────────────────┘
+Hashbucket (64 bytes = 1 cache line):
+┌──────────────────────────────────────────────────────┐
+│ Slot 0-7: Item Info  (tag:12, freq:8, location:44)   │
+└──────────────────────────────────────────────────────┘
 ```
 
-- Slot 0 is metadata: a shared CAS counter, chain length, and timestamp for frequency smoothing.
-- Slots 1-7 hold items: a 12-bit tag (partial hash for fast rejection), an 8-bit approximate frequency counter, a 24-bit segment ID, and a 20-bit offset (8-byte aligned, so 20 bits covers 8 MB).
-- Overflow chains link additional buckets when 7 slots aren't enough.
+- All 8 slots hold items: a 12-bit tag (partial hash for fast rejection), an 8-bit approximate frequency counter (ASFC), and a 44-bit opaque location encoding segment ID and offset.
+- Each slot is an `AtomicU64` — all mutations use compare-and-swap, no locks.
+- N-choice hashing: each key maps to N candidate buckets (default 2). Inserts prefer the least-full bucket. No overflow chains needed.
+- SIMD tag scanning (AVX2 on x86_64, NEON on aarch64) filters all 8 slots in parallel, falling back to scalar on other platforms.
+- Bucket and segment data prefetch hides memory latency on lookup.
 
-Lookups check the tag first (cache-friendly, as the entire bucket fits in one cache line), then verify the full key only on tag match.
+Ghost entries preserve the frequency counter after eviction by replacing the location with a sentinel (`Location::GHOST`). When a previously evicted key is re-inserted, the ghost's frequency is preserved for second-chance admission.
+
+Lookups check the tag first (cache-friendly, as the entire bucket fits in one cache line), then verify the full key via the `KeyVerifier` trait only on tag match.
 
 The frequency counter is stored in the hash table slot, not in the item itself. This means frequency checks during eviction don't require touching item data — only the hash table is scanned.
 

@@ -109,7 +109,11 @@ impl TtlBuckets {
         unsafe { self.buckets.get_unchecked_mut(index) }
     }
 
-    pub(crate) fn expire(&mut self, hashtable: &mut HashTable, segments: &mut Segments) -> usize {
+    pub(crate) fn expire(
+        &mut self,
+        hashtable: &MultiChoiceHashtable,
+        segments: &mut Segments,
+    ) -> usize {
         let now = Instant::now();
 
         if now == self.last_expired {
@@ -132,7 +136,11 @@ impl TtlBuckets {
         expired
     }
 
-    pub(crate) fn clear(&mut self, hashtable: &mut HashTable, segments: &mut Segments) -> usize {
+    pub(crate) fn clear(
+        &mut self,
+        hashtable: &MultiChoiceHashtable,
+        segments: &mut Segments,
+    ) -> usize {
         let start = Instant::now();
         let mut cleared = 0;
         for bucket in self.buckets.iter_mut() {

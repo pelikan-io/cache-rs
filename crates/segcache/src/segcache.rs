@@ -6,7 +6,7 @@
 
 use crate::Value;
 use crate::*;
-use core::hash::{BuildHasher, Hasher};
+use core::num::NonZeroU32;
 use std::cmp::min;
 
 const RESERVE_RETRIES: usize = 3;
@@ -16,7 +16,7 @@ const RESERVE_RETRIES: usize = 3;
 /// objects with nearby expiration time into the same segment, and lifting most
 /// per-object metadata into the shared segment header.
 pub struct Segcache {
-    pub(crate) hashtable: HashTable,
+    pub(crate) hashtable: MultiChoiceHashtable,
     pub(crate) segments: Segments,
     pub(crate) ttl_buckets: TtlBuckets,
     pub(crate) time: Instant,
@@ -40,6 +40,12 @@ impl Segcache {
     /// ```
     pub fn builder() -> Builder {
         Builder::default()
+    }
+
+    /// Create a SegmentsVerifier for the current segments state.
+    #[inline]
+    fn verifier(&self) -> SegmentsVerifier<'_> {
+        self.segments.verifier()
     }
 
     /// Gets a count of items in the `Segcache` instance. This is an expensive
@@ -72,7 +78,15 @@ impl Segcache {
     /// assert_eq!(item.value(), b"strong");
     /// ```
     pub fn get(&mut self, key: &[u8]) -> Option<Item> {
-        self.hashtable.get(key, self.time, &mut self.segments)
+        let verifier = self.verifier();
+        let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+        let (seg_id, offset) = unpack_location(location);
+        let raw = self.segments.get_item_at(NonZeroU32::new(seg_id), offset)?;
+        raw.check_magic();
+
+        // Use the location's raw value (truncated) as the CAS token
+        let cas = location.as_raw() as u32;
+        Some(Item::new(raw, cas))
     }
 
     /// Get the item in the `Segcache` with the provided key without
@@ -85,7 +99,14 @@ impl Segcache {
     /// assert!(cache.get_no_freq_incr(b"coffee").is_none());
     /// ```
     pub fn get_no_freq_incr(&mut self, key: &[u8]) -> Option<Item> {
-        self.hashtable.get_no_freq_incr(key, &mut self.segments)
+        let verifier = self.verifier();
+        let (location, _freq) = self.hashtable.lookup_no_freq_update(key, &verifier)?;
+        let (seg_id, offset) = unpack_location(location);
+        let raw = self.segments.get_item_at(NonZeroU32::new(seg_id), offset)?;
+        raw.check_magic();
+
+        let cas = location.as_raw() as u32;
+        Some(Item::new(raw, cas))
     }
 
     /// Insert a new item into the cache. May return an error indicating that
@@ -145,9 +166,7 @@ impl Segcache {
         if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. })
             && !self.segments.pool_has_room(target_pool)
         {
-            let _ = self
-                .segments
-                .evict(&mut self.ttl_buckets, &mut self.hashtable);
+            let _ = self.segments.evict(&mut self.ttl_buckets, &self.hashtable);
         }
 
         // try to get a `ReservedItem`
@@ -181,7 +200,7 @@ impl Segcache {
                 Err(TtlBucketsError::NoFreeSegments) => {
                     if self
                         .segments
-                        .evict(&mut self.ttl_buckets, &mut self.hashtable)
+                        .evict(&mut self.ttl_buckets, &self.hashtable)
                         .is_err()
                     {
                         retries -= 1;
@@ -207,31 +226,40 @@ impl Segcache {
             retries -= 1;
         }
 
-        // insert into the hashtable, or roll-back by removing the item
-        // TODO(bmartin): we can probably roll-back the offset and re-use the
-        // space in the segment, currently we consume the space even if the
-        // hashtable is overfull
-        if self
+        let location = pack_location(reserved.seg(), reserved.offset() as u64);
+        let verifier = self.verifier();
+
+        match self
             .hashtable
-            .insert(
-                reserved.item(),
-                reserved.seg(),
-                reserved.offset() as u64,
-                &mut self.ttl_buckets,
-                &mut self.segments,
-            )
-            .is_err()
+            .insert(reserved.item().key(), location, &verifier)
         {
-            // this just needs to alter the segment header and update stats
-            let _ = self.segments.remove_at(
-                reserved.seg(),
-                reserved.offset(),
-                &mut self.ttl_buckets,
-                &mut self.hashtable,
-            );
-            Err(SegcacheError::HashTableInsertEx)
-        } else {
-            Ok(())
+            Ok(Some(old_location)) => {
+                // Replaced existing key — remove old item from segment
+                let (old_seg_id, old_offset) = unpack_location(old_location);
+                if let Some(old_seg_id) = NonZeroU32::new(old_seg_id) {
+                    #[cfg(feature = "metrics")]
+                    ITEM_REPLACE.increment();
+
+                    let _ = self.segments.remove_at(
+                        old_seg_id,
+                        old_offset,
+                        &mut self.ttl_buckets,
+                        &self.hashtable,
+                    );
+                }
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(()) => {
+                // Hashtable full — roll back the segment allocation
+                let _ = self.segments.remove_at(
+                    reserved.seg(),
+                    reserved.offset(),
+                    &mut self.ttl_buckets,
+                    &self.hashtable,
+                );
+                Err(SegcacheError::HashTableInsertEx)
+            }
         }
     }
 
@@ -272,10 +300,19 @@ impl Segcache {
         ttl: std::time::Duration,
         cas: u32,
     ) -> Result<(), SegcacheError> {
-        match self.hashtable.try_update_cas(key, cas, &mut self.segments) {
-            Ok(()) => self.insert(key, value, optional, ttl),
-            Err(e) => Err(e),
+        // Look up the current item to check its CAS token
+        let verifier = self.verifier();
+        let (location, _freq) = self
+            .hashtable
+            .lookup_no_freq_update(key, &verifier)
+            .ok_or(SegcacheError::NotFound)?;
+
+        let current_cas = location.as_raw() as u32;
+        if current_cas != cas {
+            return Err(SegcacheError::Exists);
         }
+
+        self.insert(key, value, optional, ttl)
     }
 
     /// Remove the item with the given key, returns a bool indicating if it was
@@ -297,8 +334,33 @@ impl Segcache {
     /// ```
     // TODO(bmartin): a result would be better here
     pub fn delete(&mut self, key: &[u8]) -> bool {
-        self.hashtable
-            .delete(key, &mut self.ttl_buckets, &mut self.segments)
+        // Look up the item to get its location
+        let verifier = self.verifier();
+        let (location, _freq) = match self.hashtable.lookup_no_freq_update(key, &verifier) {
+            Some(result) => result,
+            None => return false,
+        };
+
+        // Remove from hashtable
+        if !self.hashtable.remove(key, location) {
+            return false;
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            HASH_REMOVE.increment();
+            ITEM_DELETE.increment();
+        }
+
+        // Remove from segment
+        let (seg_id, offset) = unpack_location(location);
+        if let Some(seg_id) = NonZeroU32::new(seg_id) {
+            let _ = self
+                .segments
+                .remove_at(seg_id, offset, &mut self.ttl_buckets, &self.hashtable);
+        }
+
+        true
     }
 
     /// Loops through the TTL Buckets to handle eager expiration, returns the
@@ -324,21 +386,19 @@ impl Segcache {
     /// ```
     pub fn expire(&mut self) -> usize {
         self.time = Instant::now();
-        self.ttl_buckets
-            .expire(&mut self.hashtable, &mut self.segments)
+        self.ttl_buckets.expire(&self.hashtable, &mut self.segments)
     }
 
     pub fn clear(&mut self) -> usize {
         self.time = Instant::now();
-        self.ttl_buckets
-            .clear(&mut self.hashtable, &mut self.segments)
+        self.ttl_buckets.clear(&self.hashtable, &mut self.segments)
     }
 
     /// Checks the integrity of all segments
     /// *NOTE*: this operation is relatively expensive
     #[cfg(feature = "debug")]
     pub fn check_integrity(&mut self) -> Result<(), SegcacheError> {
-        if self.segments.check_integrity(&mut self.hashtable) {
+        if self.segments.check_integrity(&self.hashtable) {
             Ok(())
         } else {
             Err(SegcacheError::DataCorrupted)
@@ -349,10 +409,18 @@ impl Segcache {
     /// Returns an error if the key is invalid, the item is not found, or the
     /// stored value is not a numeric type.
     pub fn wrapping_add(&mut self, key: &[u8], rhs: u64) -> Result<Item, SegcacheError> {
-        let mut item = self
+        let verifier = self.verifier();
+        let (location, _freq) = self
             .hashtable
-            .get(key, self.time, &mut self.segments)
+            .lookup(key, &verifier)
             .ok_or(SegcacheError::NotFound)?;
+        let (seg_id, offset) = unpack_location(location);
+        let raw = self
+            .segments
+            .get_item_at(NonZeroU32::new(seg_id), offset)
+            .ok_or(SegcacheError::NotFound)?;
+        let cas = location.as_raw() as u32;
+        let mut item = Item::new(raw, cas);
         item.wrapping_add(rhs)?;
         Ok(item)
     }
@@ -361,10 +429,18 @@ impl Segcache {
     /// key. Returns an error if the key is invalid, the item is not found, or
     /// the stored value is not a numeric type.
     pub fn saturating_sub(&mut self, key: &[u8], rhs: u64) -> Result<Item, SegcacheError> {
-        let mut item = self
+        let verifier = self.verifier();
+        let (location, _freq) = self
             .hashtable
-            .get(key, self.time, &mut self.segments)
+            .lookup(key, &verifier)
             .ok_or(SegcacheError::NotFound)?;
+        let (seg_id, offset) = unpack_location(location);
+        let raw = self
+            .segments
+            .get_item_at(NonZeroU32::new(seg_id), offset)
+            .ok_or(SegcacheError::NotFound)?;
+        let cas = location.as_raw() as u32;
+        let mut item = Item::new(raw, cas);
         item.saturating_sub(rhs)?;
         Ok(item)
     }

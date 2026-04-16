@@ -39,6 +39,9 @@ jobs:
       - name: Test with debug feature
         run: cargo test -p segcache --features debug
 
+      - name: Test with loom
+        run: cargo test -p segcache --features loom -- loom
+
   lint:
     runs-on: ubuntu-latest
     steps:

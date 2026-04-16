@@ -3,7 +3,7 @@
 // Licensed under the MIT and Apache-2.0 licenses
 
 use super::*;
-use crate::hashtable::HashBucket;
+use crate::hashtable::bucket::Hashbucket;
 use ::rand::Rng;
 use core::num::NonZeroU32;
 use keyvalue::ITEM_HDR_SIZE;
@@ -21,8 +21,7 @@ fn sizes() {
     assert_eq!(std::mem::size_of::<Segments>(), 64);
     assert_eq!(std::mem::size_of::<SegmentHeader>(), 64);
 
-    assert_eq!(std::mem::size_of::<HashBucket>(), 64);
-    assert_eq!(std::mem::size_of::<HashTable>(), 64);
+    assert_eq!(std::mem::size_of::<Hashbucket>(), 64);
 
     assert_eq!(std::mem::size_of::<crate::ttl_buckets::TtlBucket>(), 64);
     assert_eq!(std::mem::size_of::<TtlBuckets>(), 24);
@@ -195,15 +194,15 @@ fn collisions_2() {
     let mut cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
-        .hash_power(3)
+        .hash_power(7)
         .build()
         .expect("failed to create cache");
     assert_eq!(cache.items(), 0);
     assert_eq!(cache.segments.free(), 2);
 
-    // note: we can only fit 7 because the first bucket in the chain only
-    // has 7 slots. since we don't support chaining, we must have a
-    // collision on the 8th insert.
+    // With very small segments (64 bytes) and only 2 segments, we can
+    // only hold a few items. Repeatedly overwrite 3 keys to exercise
+    // the insert-replace path.
     for i in 0..1000 {
         let i = i % 3;
         let v = format!("{i:02}");
@@ -220,32 +219,37 @@ fn collisions() {
     let segments = 64;
     let heap_size = segments * segment_size as usize;
 
+    // With the N-choice hashtable, hash_power(7) gives 2^7 = 128 slots
+    // across 16 buckets with 2-choice hashing. Insert items until the
+    // hashtable is full.
     let mut cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
-        .hash_power(3)
+        .hash_power(7)
         .build()
         .expect("failed to create cache");
     assert_eq!(cache.items(), 0);
     assert_eq!(cache.segments.free(), 64);
 
-    // note: we can only fit 7 because the first bucket in the chain only
-    // has 7 slots. since we don't support chaining, we must have a
-    // collision on the 8th insert.
-    for i in 0..7 {
+    // Insert items until the hashtable is full
+    let mut inserted = 0;
+    for i in 0..256 {
         let v = format!("{i}");
-        assert!(cache.insert(v.as_bytes(), v.as_bytes(), None, ttl).is_ok());
-        let item = cache.get(v.as_bytes());
-        assert!(item.is_some());
-        assert_eq!(cache.items(), i + 1);
+        if cache.insert(v.as_bytes(), v.as_bytes(), None, ttl).is_ok() {
+            let item = cache.get(v.as_bytes());
+            assert!(item.is_some());
+            inserted += 1;
+        } else {
+            break;
+        }
     }
-    let v = b"8";
-    assert!(cache.insert(v, v, None, ttl).is_err());
-    assert_eq!(cache.items(), 7);
-    assert!(cache.delete(b"0"));
-    assert_eq!(cache.items(), 6);
-    assert!(cache.insert(v, v, None, ttl).is_ok());
-    assert_eq!(cache.items(), 7);
+    assert!(inserted > 0, "should have inserted at least one item");
+    assert_eq!(cache.items(), inserted);
+
+    // Deleting an item should free a slot
+    let v0 = b"0";
+    assert!(cache.delete(v0));
+    assert_eq!(cache.items(), inserted - 1);
 }
 
 #[test]
@@ -496,7 +500,7 @@ fn fuzz_1() {
     let mut cache = Segcache::builder()
         .segment_size(1024)
         .heap_size(8 * 1024)
-        .hash_power(3)
+        .hash_power(7)
         .overflow_factor(0.0)
         .build()
         .expect("failed to create cache");
@@ -540,7 +544,7 @@ fn fuzz_2() {
     let mut cache = Segcache::builder()
         .segment_size(1024)
         .heap_size(8 * 1024)
-        .hash_power(5)
+        .hash_power(7)
         .overflow_factor(1.0)
         .build()
         .expect("failed to create cache");
