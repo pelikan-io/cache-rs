@@ -1,126 +1,98 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-//! A collection of [`TtlBucket`]s which covers the full range of TTLs.
+//! Collection of TTL buckets covering the full TTL range.
 //!
-//! We use a total of 1024 buckets to represent the full range of TTLs. We
-//! divide the buckets into 4 ranges:
-//! * 1-2048s (1 second - ~34 minutes) are stored in buckets which are 8s wide.
-//! * 2048-32_768s (~34 minutes - ~9 hours) are stored in buckets which are 128s
-//!   (~2 minutes) wide.
-//! * 32_768-524_288s (~9 hours - ~6 days) are stored in buckets which are 2048s
-//!   (~34 minutes) wide.
-//! * 524_288-8_388_608s (~6 days - ~97 days) are stored in buckets which are
-//!   32_768s (~9 hours) wide.
-//! * TTLs beyond 8_388_608s (~97 days) and TTLs of 0 are all treated as the max
-//!   TTL.
+//! 1024 buckets organized in 4 logarithmic tiers:
 //!
-//! See the
-//! [Segcache paper](https://www.usenix.org/system/files/nsdi21-yang.pdf) for
-//! more detail.
+//! | Tier | TTL range          | Bucket width | Buckets |
+//! |------|--------------------|--------------|---------|
+//! | 1    | 1s – 2048s         | 8s           | 256     |
+//! | 2    | 2048s – 32,768s    | 128s         | 256     |
+//! | 3    | 32,768s – 524,288s | 2,048s       | 256     |
+//! | 4    | 524,288s – 8.4Ms   | 32,768s      | 256     |
+//!
+//! TTL of 0 (no expiry) and TTLs beyond ~97 days map to the last bucket.
 
 use crate::*;
 
-const N_BUCKET_PER_STEP_N_BIT: usize = 8;
-const N_BUCKET_PER_STEP: usize = 1 << N_BUCKET_PER_STEP_N_BIT;
+const BUCKETS_PER_TIER: usize = 256;
+const TIER_COUNT: usize = 4;
+const TOTAL_BUCKETS: usize = BUCKETS_PER_TIER * TIER_COUNT;
 
-const TTL_BUCKET_INTERVAL_N_BIT_1: usize = 3;
-const TTL_BUCKET_INTERVAL_N_BIT_2: usize = 7;
-const TTL_BUCKET_INTERVAL_N_BIT_3: usize = 11;
-const TTL_BUCKET_INTERVAL_N_BIT_4: usize = 15;
+// Tier widths as bit shifts (each tier is 4x wider than the previous).
+const TIER_1_SHIFT: usize = 3; //   8s
+const TIER_2_SHIFT: usize = 7; // 128s
+const TIER_3_SHIFT: usize = 11; // 2048s
+const TIER_4_SHIFT: usize = 15; // 32768s
 
-const TTL_BUCKET_INTERVAL_1: usize = 1 << TTL_BUCKET_INTERVAL_N_BIT_1;
-const TTL_BUCKET_INTERVAL_2: usize = 1 << TTL_BUCKET_INTERVAL_N_BIT_2;
-const TTL_BUCKET_INTERVAL_3: usize = 1 << TTL_BUCKET_INTERVAL_N_BIT_3;
-const TTL_BUCKET_INTERVAL_4: usize = 1 << TTL_BUCKET_INTERVAL_N_BIT_4;
+// Tier boundaries: the max TTL (exclusive) that fits in each tier.
+const TIER_1_MAX: i32 = 1 << (TIER_1_SHIFT + 8); //   2,048
+const TIER_2_MAX: i32 = 1 << (TIER_2_SHIFT + 8); //  32,768
+const TIER_3_MAX: i32 = 1 << (TIER_3_SHIFT + 8); // 524,288
 
-const TTL_BOUNDARY_1: i32 = 1 << (TTL_BUCKET_INTERVAL_N_BIT_1 + N_BUCKET_PER_STEP_N_BIT);
-const TTL_BOUNDARY_2: i32 = 1 << (TTL_BUCKET_INTERVAL_N_BIT_2 + N_BUCKET_PER_STEP_N_BIT);
-const TTL_BOUNDARY_3: i32 = 1 << (TTL_BUCKET_INTERVAL_N_BIT_3 + N_BUCKET_PER_STEP_N_BIT);
-
-const MAX_N_TTL_BUCKET: usize = N_BUCKET_PER_STEP * 4;
-const MAX_TTL_BUCKET_IDX: usize = MAX_N_TTL_BUCKET - 1;
-
+/// The full collection of TTL buckets.
 pub struct TtlBuckets {
     pub(crate) buckets: Box<[TtlBucket]>,
     pub(crate) last_expired: Instant,
 }
 
 impl TtlBuckets {
-    /// Create a new set of `TtlBuckets` which cover the full range of TTLs. See
-    /// the module-level documentation for how the range of TTLs are stored.
+    /// Create a new set of 1024 TTL buckets covering the full TTL range.
     pub fn new() -> Self {
-        let intervals = [
-            TTL_BUCKET_INTERVAL_1,
-            TTL_BUCKET_INTERVAL_2,
-            TTL_BUCKET_INTERVAL_3,
-            TTL_BUCKET_INTERVAL_4,
+        let widths = [
+            1 << TIER_1_SHIFT,
+            1 << TIER_2_SHIFT,
+            1 << TIER_3_SHIFT,
+            1 << TIER_4_SHIFT,
         ];
 
-        let mut buckets = Vec::with_capacity(0);
-        buckets.reserve_exact(intervals.len() * N_BUCKET_PER_STEP);
-
-        for interval in &intervals {
-            for j in 0..N_BUCKET_PER_STEP {
-                let ttl = interval * j + 1;
-                let bucket = TtlBucket::new(ttl as i32);
-                buckets.push(bucket);
+        let mut buckets = Vec::with_capacity(TOTAL_BUCKETS);
+        for width in &widths {
+            for j in 0..BUCKETS_PER_TIER {
+                let ttl = width * j + 1;
+                buckets.push(TtlBucket::new(ttl as i32));
             }
         }
-
-        let buckets = buckets.into_boxed_slice();
-        let last_expired = Instant::now();
 
         Self {
-            buckets,
-            last_expired,
+            buckets: buckets.into_boxed_slice(),
+            last_expired: Instant::now(),
         }
     }
 
-    /// Get the index of the `TtlBucket` for the given TTL.
+    /// Map a TTL duration to its bucket index (0–1023).
     pub(crate) fn get_bucket_index(&self, ttl: Duration) -> usize {
-        let ttl = ttl.as_secs() as i32;
-        if ttl <= 0 {
+        let secs = ttl.as_secs() as i32;
+        if secs <= 0 {
             self.buckets.len() - 1
-        } else if ttl & !(TTL_BOUNDARY_1 - 1) == 0 {
-            (ttl >> TTL_BUCKET_INTERVAL_N_BIT_1) as usize
-        } else if ttl & !(TTL_BOUNDARY_2 - 1) == 0 {
-            (ttl >> TTL_BUCKET_INTERVAL_N_BIT_2) as usize + N_BUCKET_PER_STEP
-        } else if ttl & !(TTL_BOUNDARY_3 - 1) == 0 {
-            (ttl >> TTL_BUCKET_INTERVAL_N_BIT_3) as usize + N_BUCKET_PER_STEP * 2
+        } else if secs & !(TIER_1_MAX - 1) == 0 {
+            (secs >> TIER_1_SHIFT) as usize
+        } else if secs & !(TIER_2_MAX - 1) == 0 {
+            (secs >> TIER_2_SHIFT) as usize + BUCKETS_PER_TIER
+        } else if secs & !(TIER_3_MAX - 1) == 0 {
+            (secs >> TIER_3_SHIFT) as usize + BUCKETS_PER_TIER * 2
         } else {
-            let bucket_idx = (ttl >> TTL_BUCKET_INTERVAL_N_BIT_4) as usize + N_BUCKET_PER_STEP * 3;
-            if bucket_idx > MAX_TTL_BUCKET_IDX {
-                MAX_TTL_BUCKET_IDX
-            } else {
-                bucket_idx
-            }
+            let idx = (secs >> TIER_4_SHIFT) as usize + BUCKETS_PER_TIER * 3;
+            idx.min(TOTAL_BUCKETS - 1)
         }
     }
 
-    // TODO(bmartin): confirm handling for negative TTLs here...
-    /// Get a mutable reference to the `TtlBucket` for the given TTL.
+    /// Get a mutable reference to the bucket for the given TTL.
     pub(crate) fn get_mut_bucket(&mut self, ttl: Duration) -> &mut TtlBucket {
         let index = self.get_bucket_index(ttl);
-
-        // NOTE: since get_bucket_index() must return an index within the slice,
-        // we do not need to worry about UB here.
+        // SAFETY: get_bucket_index always returns a valid index.
         unsafe { self.buckets.get_unchecked_mut(index) }
     }
 
+    /// Run eager expiration across all buckets. Returns total segments expired.
     pub(crate) fn expire(
         &mut self,
         hashtable: &MultiChoiceHashtable,
         segments: &mut Segments,
     ) -> usize {
         let now = Instant::now();
-
         if now == self.last_expired {
             return 0;
-        } else {
-            self.last_expired = now;
         }
+        self.last_expired = now;
 
         let start = Instant::now();
         let mut expired = 0;
@@ -136,6 +108,7 @@ impl TtlBuckets {
         expired
     }
 
+    /// Clear all segments across all buckets. Returns total segments cleared.
     pub(crate) fn clear(
         &mut self,
         hashtable: &MultiChoiceHashtable,
@@ -147,7 +120,7 @@ impl TtlBuckets {
             cleared += bucket.clear(hashtable, segments);
         }
         let duration = start.elapsed();
-        debug!("expired: {cleared} segments in {duration:?}");
+        debug!("cleared: {cleared} segments in {duration:?}");
 
         #[cfg(feature = "metrics")]
         CLEAR_TIME.add(duration.as_nanos() as _);
