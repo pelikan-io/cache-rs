@@ -144,7 +144,7 @@ impl SegmentHeader {
     /// When the `magic` feature is enabled, sets write_offset and live_bytes
     /// past the magic bytes region.
     pub fn init(&self) {
-        let initial_offset = if cfg!(feature = "magic") {
+        let initial_offset = if cfg!(feature = "integrity") {
             std::mem::size_of::<u64>() as i32
         } else {
             0
@@ -159,7 +159,7 @@ impl SegmentHeader {
     /// Reset the header when returning to the free queue.
     /// When the `magic` feature is enabled, preserves the magic byte offset.
     pub fn reset(&self) {
-        let initial_offset = if cfg!(feature = "magic") {
+        let initial_offset = if cfg!(feature = "integrity") {
             std::mem::size_of::<u64>() as i32
         } else {
             0

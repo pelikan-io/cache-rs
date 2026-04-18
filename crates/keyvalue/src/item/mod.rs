@@ -7,8 +7,8 @@
 mod header;
 mod raw;
 
-#[cfg(any(feature = "magic", feature = "debug"))]
-pub use header::ITEM_MAGIC_SIZE;
+#[cfg(any(feature = "integrity", feature = "debug"))]
+pub use header::ITEM_INTEGRITY_SIZE;
 
 pub use header::{ItemHeader, ITEM_HDR_SIZE};
 pub use raw::RawItem;

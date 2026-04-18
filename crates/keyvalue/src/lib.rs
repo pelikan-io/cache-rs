@@ -13,8 +13,8 @@ pub use item::{ItemHeader, RawItem, ITEM_HDR_SIZE};
 pub use tiny::{TinyItem, TinyItemHeader, TINY_ITEM_HDR_SIZE};
 pub use value::{OwnedValue, Value};
 
-#[cfg(any(feature = "magic", feature = "debug"))]
-pub use item::ITEM_MAGIC_SIZE;
+#[cfg(any(feature = "integrity", feature = "debug"))]
+pub use item::ITEM_INTEGRITY_SIZE;
 
 /// A simple error indicating the item value is not a numeric type.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]

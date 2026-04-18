@@ -9,8 +9,10 @@ use std::time::Duration;
 #[test]
 fn integration_basic() {
     let ttl = Duration::ZERO;
-    let heap_size = 2 * 256;
-    let segment_size = 256;
+    // Segment size chosen so items a,b,c fill segment 0 and
+    // d,e,f,g fill segment 1. Item h then triggers eviction.
+    let heap_size = 2 * 264;
+    let segment_size = 264;
     let mut cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
@@ -69,13 +71,13 @@ fn integration_basic() {
     assert_eq!(cache.get(b"e").map(|v| v.value().len()), Some(42));
     assert_eq!(cache.get(b"f").map(|v| v.value().len()), Some(27));
 
-    #[cfg(feature = "magic")]
+    #[cfg(feature = "integrity")]
     {
         let _ = cache.insert(b"g", b"Et tu, Brute?", None, ttl);
         assert_eq!(cache.get(b"g").map(|v| v.value().len()), Some(13));
     }
 
-    #[cfg(not(feature = "magic"))]
+    #[cfg(not(feature = "integrity"))]
     {
         let _ = cache.insert(
             b"g",

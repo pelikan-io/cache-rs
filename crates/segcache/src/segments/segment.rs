@@ -30,7 +30,7 @@ impl<'a> Segment<'a> {
 
     /// Initialize the segment. Sets magic bytes (if enabled) and resets header.
     pub fn init(&mut self) {
-        if cfg!(feature = "magic") {
+        if cfg!(feature = "integrity") {
             for (i, byte) in SEG_MAGIC.to_be_bytes().iter().enumerate() {
                 self.data[i] = *byte;
             }
@@ -38,7 +38,7 @@ impl<'a> Segment<'a> {
         self.header.init();
     }
 
-    #[cfg(feature = "magic")]
+    #[cfg(feature = "integrity")]
     #[inline]
     pub fn magic(&self) -> u64 {
         u64::from_be_bytes([
@@ -55,7 +55,7 @@ impl<'a> Segment<'a> {
 
     #[inline]
     pub fn check_magic(&self) {
-        #[cfg(feature = "magic")]
+        #[cfg(feature = "integrity")]
         assert_eq!(self.magic(), SEG_MAGIC)
     }
 
@@ -63,7 +63,7 @@ impl<'a> Segment<'a> {
     pub(crate) fn max_item_offset(&self) -> usize {
         if self.write_offset() >= ITEM_HDR_SIZE as i32 {
             std::cmp::min(self.write_offset() as usize, self.data.len()) - ITEM_HDR_SIZE
-        } else if cfg!(feature = "magic") {
+        } else if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC)
         } else {
             0
@@ -76,7 +76,7 @@ impl<'a> Segment<'a> {
 
         let mut integrity = true;
         let max_offset = self.max_item_offset();
-        let mut offset = if cfg!(feature = "magic") {
+        let mut offset = if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC)
         } else {
             0
@@ -282,7 +282,7 @@ impl<'a> Segment<'a> {
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         let max_offset = self.max_item_offset();
-        let mut read_offset = if cfg!(feature = "magic") {
+        let mut read_offset = if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC)
         } else {
             0
@@ -356,7 +356,7 @@ impl<'a> Segment<'a> {
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
         let max_offset = self.max_item_offset();
-        let mut read_offset = if cfg!(feature = "magic") {
+        let mut read_offset = if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC)
         } else {
             0
@@ -427,7 +427,7 @@ impl<'a> Segment<'a> {
         target_ratio: f64,
     ) -> f64 {
         let max_offset = self.max_item_offset();
-        let mut offset = if cfg!(feature = "magic") {
+        let mut offset = if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC)
         } else {
             0
@@ -514,7 +514,7 @@ impl<'a> Segment<'a> {
         self.set_evictable(false);
 
         let max_offset = self.max_item_offset();
-        let mut offset = if cfg!(feature = "magic") {
+        let mut offset = if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC)
         } else {
             0
@@ -573,7 +573,7 @@ impl<'a> Segment<'a> {
             panic!();
         }
 
-        let expected_size = if cfg!(feature = "magic") {
+        let expected_size = if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC) as i32
         } else {
             0
@@ -587,7 +587,7 @@ impl<'a> Segment<'a> {
     }
 }
 
-#[cfg(feature = "magic")]
+#[cfg(feature = "integrity")]
 impl std::fmt::Debug for Segment<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.debug_struct("Segment")
@@ -598,7 +598,7 @@ impl std::fmt::Debug for Segment<'_> {
     }
 }
 
-#[cfg(not(feature = "magic"))]
+#[cfg(not(feature = "integrity"))]
 impl std::fmt::Debug for Segment<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.debug_struct("Segment")

@@ -12,29 +12,32 @@
 //!
 //! FLAGS: [is_numeric:1][reserved:1][olen:6]
 //!
-//! With `magic` feature, a u32 magic (0xDECAFBAD) is prepended:
+//! With `integrity` feature, magic and CRC32 fields are added:
 //!
-//! ┌──────────────┬──────┬───────┬──────────────────────────────┐
-//! │    MAGIC     │ KLEN │ FLAGS │             VLEN             │
-//! │     u32      │  u8  │  u8   │             u32              │
-//! │    32 bit    │ 8bit │ 8bit  │            32 bit            │
-//! └──────────────┴──────┴───────┴──────────────────────────────┘
+//! ┌───────┬───────┬──────┬───────┬──────────────┬──────────────┐
+//! │MAGIC_0│MAGIC_1│ KLEN │ FLAGS │     VLEN     │    CRC32     │
+//! │  u8   │  u8   │  u8  │  u8   │     u32      │     u32      │
+//! │ 0xCA  │ 0xFE  │ 8bit │ 8bit  │    32 bit    │    32 bit    │
+//! └───────┴───────┴──────┴───────┴──────────────┴──────────────┘
+//!
+//! The CRC32 covers the full item: magic + klen + flags + vlen + optional
+//! + key + value. Computed with the CRC32 field zeroed during calculation.
 //! ```
 
 /// The size of the item header in bytes.
 pub const ITEM_HDR_SIZE: usize = std::mem::size_of::<ItemHeader>();
 
-/// Magic value written into each item header for corruption detection.
-#[cfg(feature = "magic")]
-pub const ITEM_MAGIC: u32 = 0xDECAFBAD;
+/// Magic sentinel bytes for integrity checking.
+#[cfg(feature = "integrity")]
+pub const ITEM_MAGIC: [u8; 2] = [0xCA, 0xFE];
 
-/// The size of the magic field in bytes (4 when enabled, 0 when not).
-#[cfg(feature = "magic")]
-pub const ITEM_MAGIC_SIZE: usize = std::mem::size_of::<u32>();
+/// Size of the integrity fields (magic + CRC32) when the feature is enabled.
+#[cfg(feature = "integrity")]
+pub const ITEM_INTEGRITY_SIZE: usize = 2 + 4; // magic(2) + crc32(4)
 
-#[cfg(not(feature = "magic"))]
+#[cfg(not(feature = "integrity"))]
 #[allow(dead_code)]
-pub const ITEM_MAGIC_SIZE: usize = 0;
+pub const ITEM_INTEGRITY_SIZE: usize = 0;
 
 // Flag masks within the `flags` byte.
 const NUMERIC_MASK: u8 = 0b1000_0000;
@@ -42,24 +45,26 @@ const OLEN_MASK: u8 = 0b0011_1111;
 
 /// Packed item header stored at the start of each item in segment memory.
 ///
-/// Layout: `[klen:1][flags:1][vlen:4]` = 6 bytes.
-/// With `magic` feature: `[klen:1][flags:1][vlen:4][magic:4]` = 10 bytes.
+/// Base layout: `[klen:1][flags:1][vlen:4]` = 6 bytes.
+/// With `integrity`: `[magic:2][klen:1][flags:1][vlen:4][crc32:4]` = 12 bytes.
 ///
 /// All fields are directly byte-addressable — no cross-word bit manipulation.
 #[repr(C, packed)]
 pub struct ItemHeader {
-    #[cfg(feature = "magic")]
-    magic: u32,
+    #[cfg(feature = "integrity")]
+    magic: [u8; 2],
     klen: u8,
     flags: u8,
     vlen: u32,
+    #[cfg(feature = "integrity")]
+    crc32: u32,
 }
 
 // Verify expected sizes at compile time.
-#[cfg(not(feature = "magic"))]
+#[cfg(not(feature = "integrity"))]
 const _: () = assert!(std::mem::size_of::<ItemHeader>() == 6);
-#[cfg(feature = "magic")]
-const _: () = assert!(std::mem::size_of::<ItemHeader>() == 10);
+#[cfg(feature = "integrity")]
+const _: () = assert!(std::mem::size_of::<ItemHeader>() == 12);
 
 impl ItemHeader {
     /// Initialize header fields to zero (and set magic if enabled).
@@ -67,9 +72,10 @@ impl ItemHeader {
         self.klen = 0;
         self.flags = 0;
         self.vlen = 0;
-        #[cfg(feature = "magic")]
+        #[cfg(feature = "integrity")]
         {
             self.magic = ITEM_MAGIC;
+            self.crc32 = 0;
         }
     }
 
@@ -78,15 +84,27 @@ impl ItemHeader {
     /// # Panics
     /// Panics if the magic bytes are incorrect, indicating data corruption.
     pub fn check_magic(&self) {
-        #[cfg(feature = "magic")]
+        #[cfg(feature = "integrity")]
         {
-            // Copy out of packed struct to avoid unaligned reference.
             let magic = self.magic;
             assert_eq!(
                 magic, ITEM_MAGIC,
-                "item magic mismatch: expected 0x{ITEM_MAGIC:08X}, got 0x{magic:08X}",
+                "item magic mismatch: expected {:02X?}, got {:02X?}",
+                ITEM_MAGIC, magic,
             );
         }
+    }
+
+    /// Store the CRC32 value in the header.
+    #[cfg(feature = "integrity")]
+    pub fn set_crc32(&mut self, crc: u32) {
+        self.crc32 = crc;
+    }
+
+    /// Get the stored CRC32 value.
+    #[cfg(feature = "integrity")]
+    pub fn crc32(&self) -> u32 {
+        self.crc32
     }
 
     // -- Key length --

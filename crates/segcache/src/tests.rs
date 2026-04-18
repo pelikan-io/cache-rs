@@ -12,11 +12,8 @@ use std::time::Duration;
 
 #[test]
 fn sizes() {
-    #[cfg(feature = "magic")]
-    assert_eq!(ITEM_HDR_SIZE, 10);
-
-    #[cfg(not(feature = "magic"))]
-    assert_eq!(ITEM_HDR_SIZE, 6);
+    // ITEM_HDR_SIZE is 12 with integrity (keyvalue default) or 6 without.
+    assert!(matches!(ITEM_HDR_SIZE, 6 | 12));
 
     assert_eq!(std::mem::size_of::<SegmentHeader>(), 64);
 

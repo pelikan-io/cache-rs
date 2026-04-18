@@ -349,10 +349,10 @@ impl Segments {
                 self.free_q = None;
             }
 
-            #[cfg(not(feature = "magic"))]
+            #[cfg(not(feature = "integrity"))]
             assert_eq!(self.headers[id_idx].write_offset(), 0);
 
-            #[cfg(feature = "magic")]
+            #[cfg(feature = "integrity")]
             assert_eq!(
                 self.headers[id_idx].write_offset() as usize,
                 std::mem::size_of_val(&SEG_MAGIC),
@@ -1018,7 +1018,7 @@ impl Segments {
         };
 
         let max_offset = src.max_item_offset();
-        let mut offset = if cfg!(feature = "magic") {
+        let mut offset = if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC)
         } else {
             0
@@ -1082,7 +1082,7 @@ impl Segments {
             };
 
             let max_offset = segment.max_item_offset();
-            let mut offset = if cfg!(feature = "magic") {
+            let mut offset = if cfg!(feature = "integrity") {
                 std::mem::size_of_val(&SEG_MAGIC)
             } else {
                 0

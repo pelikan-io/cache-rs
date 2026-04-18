@@ -15,8 +15,8 @@ harness = false
 
 [features]
 
-# enables setting/checking magic strings
-magic = ["keyvalue/magic"]
+# enables item header integrity (magic + CRC32)
+integrity = ["keyvalue/integrity"]
 
 # enables metrics
 metrics = ["metriken"]
@@ -25,7 +25,7 @@ metrics = ["metriken"]
 loom = ["dep:loom"]
 
 # metafeatures
-debug = ["magic"]
+debug = ["integrity"]
 
 # default set of enabled features
 default = ["metrics"]

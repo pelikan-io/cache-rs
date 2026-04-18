@@ -9,9 +9,9 @@ repository = { workspace = true }
 license = { workspace = true }
 
 [features]
-magic = ["keyvalue/magic"]
+integrity = ["keyvalue/integrity"]
 metrics = ["metriken"]
-debug = ["magic"]
+debug = ["integrity"]
 default = ["metrics"]
 
 [dependencies]

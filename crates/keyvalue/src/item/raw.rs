@@ -146,7 +146,54 @@ impl RawItem {
                     );
                 }
             }
+
+            // Compute and store CRC32 over the full item.
+            #[cfg(feature = "integrity")]
+            {
+                let crc = self.compute_crc();
+                (*self.header_mut()).set_crc32(crc);
+            }
         }
+    }
+
+    /// Verify the item's CRC32 integrity.
+    ///
+    /// Returns `true` if the stored CRC matches a freshly computed one.
+    #[cfg(feature = "integrity")]
+    pub fn check_integrity(&self) -> bool {
+        self.header().crc32() == self.compute_crc()
+    }
+
+    /// Compute CRC32 over the full item with the CRC field zeroed.
+    #[cfg(feature = "integrity")]
+    fn compute_crc(&self) -> u32 {
+        let total_len = self.value_offset() + self.vlen() as usize;
+        // CRC32 is the last 4 bytes of the header.
+        let crc_field_size = std::mem::size_of::<u32>();
+        let crc_field_offset = ITEM_HDR_SIZE - crc_field_size;
+
+        let mut hasher = crc32fast::Hasher::new();
+
+        unsafe {
+            // Hash bytes before the CRC field
+            let before = std::slice::from_raw_parts(self.data, crc_field_offset);
+            hasher.update(before);
+
+            // Skip the CRC field (treat as zeros)
+            hasher.update(&[0u8; 4]);
+
+            // Hash bytes after the CRC field through end of item
+            let after_offset = crc_field_offset + crc_field_size;
+            if total_len > after_offset {
+                let after = std::slice::from_raw_parts(
+                    self.data.add(after_offset),
+                    total_len - after_offset,
+                );
+                hasher.update(after);
+            }
+        }
+
+        hasher.finalize()
     }
 
     // -- Offset calculations --
@@ -183,6 +230,11 @@ impl RawItem {
                     self.data.add(self.value_offset()),
                     core::mem::size_of::<u64>(),
                 );
+                #[cfg(feature = "integrity")]
+                {
+                    let crc = self.compute_crc();
+                    (*self.header_mut()).set_crc32(crc);
+                }
                 Ok(())
             },
             _ => Err(NotNumericError),
@@ -199,6 +251,11 @@ impl RawItem {
                     self.data.add(self.value_offset()),
                     core::mem::size_of::<u64>(),
                 );
+                #[cfg(feature = "integrity")]
+                {
+                    let crc = self.compute_crc();
+                    (*self.header_mut()).set_crc32(crc);
+                }
                 Ok(())
             },
             _ => Err(NotNumericError),

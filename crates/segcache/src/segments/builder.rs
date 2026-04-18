@@ -49,16 +49,7 @@ impl SegmentsBuilder {
     /// - `segment_size` is not larger than the per-item header overhead
     /// - `heap_size` is zero or not a multiple of `segment_size`
     pub fn build(self) -> Result<Segments, SegmentsError> {
-        let min_size = {
-            #[cfg(not(feature = "magic"))]
-            {
-                crate::ITEM_HDR_SIZE as i32 + 1
-            }
-            #[cfg(feature = "magic")]
-            {
-                crate::ITEM_HDR_SIZE as i32 + crate::item::ITEM_MAGIC_SIZE as i32 + 1
-            }
-        };
+        let min_size = crate::ITEM_HDR_SIZE as i32 + 1;
 
         if self.segment_size < min_size {
             return Err(SegmentsError::SegmentTooSmall);
