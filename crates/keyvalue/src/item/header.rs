@@ -6,19 +6,19 @@
 //! ```text
 //! ┌──────┬───────┬──────────────────────────────┐
 //! │ KLEN │ FLAGS │             VLEN             │
-//! │ u8   │ u8    │             u32              │
+//! │  u8  │  u8   │             u32              │
 //! │ 8bit │ 8bit  │            32 bit            │
 //! └──────┴───────┴──────────────────────────────┘
 //!
 //! FLAGS: [is_numeric:1][reserved:1][olen:6]
 //!
-//! With `magic` feature, a u32 magic field (0xDECAFBAD) is appended:
+//! With `magic` feature, a u32 magic (0xDECAFBAD) is prepended:
 //!
-//! ┌──────┬───────┬──────────────────────────────┬──────────────┐
-//! │ KLEN │ FLAGS │             VLEN             │    MAGIC     │
-//! │ u8   │ u8    │             u32              │     u32      │
-//! │ 8bit │ 8bit  │            32 bit            │    32 bit    │
-//! └──────┴───────┴──────────────────────────────┴──────────────┘
+//! ┌──────────────┬──────┬───────┬──────────────────────────────┐
+//! │    MAGIC     │ KLEN │ FLAGS │             VLEN             │
+//! │     u32      │  u8  │  u8   │             u32              │
+//! │    32 bit    │ 8bit │ 8bit  │            32 bit            │
+//! └──────────────┴──────┴───────┴──────────────────────────────┘
 //! ```
 
 /// The size of the item header in bytes.
@@ -48,11 +48,11 @@ const OLEN_MASK: u8 = 0b0011_1111;
 /// All fields are directly byte-addressable — no cross-word bit manipulation.
 #[repr(C, packed)]
 pub struct ItemHeader {
+    #[cfg(feature = "magic")]
+    magic: u32,
     klen: u8,
     flags: u8,
     vlen: u32,
-    #[cfg(feature = "magic")]
-    magic: u32,
 }
 
 // Verify expected sizes at compile time.
