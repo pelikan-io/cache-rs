@@ -1,16 +1,8 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-//! TTL buckets are used to group items by TTL to enable eager expiration.
+//! TTL buckets group segments by expiration time for eager expiration.
 //!
-//! The total collection of [`TtlBuckets`] is a contiguous allocation of
-//! [`TtlBucket`]s which cover the full range of TTLs.
-//!
-//! Each [`TtlBucket`] contains a segment chain holding items with a similar
-//! TTL. See the blog post for more details on the segcache design:
-//! <https://twitter.github.io/pelikan/2021/segcache.html>
-//!
+//! Each [`TtlBucket`] contains a doubly-linked chain of segments whose
+//! items share a similar TTL. The [`TtlBuckets`] collection maps the
+//! full TTL range across 1024 buckets with logarithmic widths.
 
 mod error;
 mod ttl_bucket;
