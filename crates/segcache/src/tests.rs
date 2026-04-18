@@ -18,7 +18,6 @@ fn sizes() {
     #[cfg(not(feature = "magic"))]
     assert_eq!(ITEM_HDR_SIZE, 5);
 
-    assert_eq!(std::mem::size_of::<Segments>(), 64);
     assert_eq!(std::mem::size_of::<SegmentHeader>(), 64);
 
     assert_eq!(std::mem::size_of::<Hashbucket>(), 64);

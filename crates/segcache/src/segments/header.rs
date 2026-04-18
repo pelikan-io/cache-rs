@@ -1,301 +1,389 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-//! The `SegmentHeader` contains metadata about the segment. It is intended to
-//! be stored in DRAM as the fields are frequently accessed and changed.
+//! Segment header with atomic fields for lock-free metadata access.
 //!
-//! The header is padded out to occupy a full cacheline
+//! Each header is exactly 64 bytes (one cache line) and uses atomic types
+//! for all mutable fields, preparing for concurrent access.
+//!
 //! ```text
 //! ┌──────────────┬──────────────┬──────────────┬──────────────┐
 //! │      ID      │ WRITE OFFSET │  LIVE BYTES  │  LIVE ITEMS  │
-//! │              │              │              │              │
+//! │     u32      │  AtomicI32   │  AtomicI32   │  AtomicI32   │
 //! │    32 bit    │    32 bit    │    32 bit    │    32 bit    │
 //! ├──────────────┼──────────────┼──────────────┼──────────────┤
-//! │   PREV SEG   │   NEXT SEG   │  CREATE AT   │   MERGE AT   │
-//! │              │              │              │              │
+//! │   PREV SEG   │   NEXT SEG   │  CREATE AT   │  MERGE AT    │
+//! │  AtomicU32   │  AtomicU32   │ AtomicInstant│ AtomicInstant│
 //! │    32 bit    │    32 bit    │    32 bit    │    32 bit    │
 //! ├──────────────┼──┬──┬────────┴──────────────┴──────────────┤
-//! │     TTL      │  │  │               PADDING                │   Accessible
-//! │              │  │◀─┼──────────────────────────────────────┼──    8 bit
-//! │    32 bit    │8b│8b│                80 bit                │
-//! ├──────────────┴──┴──┴──────────────────────────────────────┤    Evictable
-//! │                          PADDING                          │      8 bit
-//! │                                                           │
-//! │                          128 bit                          │
+//! │     TTL      │ST│PL│             PADDING                  │
+//! │  AtomicU32   │8b│8b│             80 bit                   │
+//! ├──────────────┴──┴──┴──────────────────────────────────────┤
+//! │                        PADDING                            │
+//! │                       128 bit                             │
 //! └───────────────────────────────────────────────────────────┘
+//!
+//! ST = SegmentState (AtomicU8)   PL = SegmentPool (AtomicU8)
+//! Total: 512 bits = 64 bytes = 1 cache line
 //! ```
 
-use super::SEG_MAGIC;
+use crate::sync::{AtomicI32, AtomicU32, AtomicU8, Ordering};
+use clocksource::coarse::{AtomicInstant, Duration, Instant};
 use core::num::NonZeroU32;
 
-use crate::*;
-
-// the minimum age of a segment before it is eligible for eviction
-// TODO(bmartin): this should be parameterized.
+/// Minimum age before a segment can be evicted (seconds).
 const SEG_MATURE_TIME: Duration = Duration::from_secs(20);
 
-#[derive(Debug)]
-#[repr(C)]
-pub struct SegmentHeader {
-    /// The id for this segment
-    id: NonZeroU32,
-    /// Current write position
-    write_offset: i32,
-    /// The number of live bytes in the segment
-    live_bytes: i32,
-    /// The number of live items in the segment
-    live_items: i32,
-    /// The previous segment in the TtlBucket or on the free queue
-    prev_seg: Option<NonZeroU32>,
-    /// The next segment in the TtlBucket or on the free queue
-    next_seg: Option<NonZeroU32>,
-    /// The time the segment was last "created" (taken from free queue)
-    create_at: Instant,
-    /// The time the segment was last merged
-    merge_at: Instant,
-    /// The TTL of the segment in seconds
-    ttl: u32,
-    /// Is the segment accessible?
-    accessible: bool,
-    /// Is the segment evictable?
-    evictable: bool,
-    /// Which pool the segment belongs to (used by S3-FIFO policy)
-    pool: SegmentPool,
-    _pad: [u8; 24],
+/// Segment lifecycle state.
+///
+/// Replaces the old `accessible`/`evictable` boolean pair with a single
+/// enum that can be extended to more states (e.g. crucible's 9-state
+/// machine) when concurrent access is implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum SegmentState {
+    /// On the free queue, not accessible or evictable.
+    Free = 0,
+    /// Tail of a TTL bucket chain, accepting writes, not yet evictable.
+    Filling = 1,
+    /// Accessible and evictable (sealed for writes, eligible for eviction).
+    Active = 2,
+    /// Being cleared or evicted, not accessible.
+    Draining = 3,
 }
 
-/// Which pool a segment belongs to. Only meaningful under `Policy::S3Fifo`;
-/// other policies leave all segments as `Main`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+impl SegmentState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Free,
+            1 => Self::Filling,
+            2 => Self::Active,
+            3 => Self::Draining,
+            _ => Self::Free,
+        }
+    }
+}
+
+/// Which pool a segment belongs to (for S3-FIFO eviction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum SegmentPool {
     Main = 0,
     Admission = 1,
 }
 
+impl SegmentPool {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Admission,
+            _ => Self::Main,
+        }
+    }
+}
+
+/// Segment metadata header, cache-line aligned (64 bytes).
+///
+/// All mutable fields use atomic types so the header can be read via
+/// shared reference (`&self`). This enables the `Segment<'a>` view to
+/// hold `&'a SegmentHeader` instead of `&'a mut SegmentHeader`.
+///
+/// ```text
+/// Offset  Size  Field
+///  0       4    id            (u32, immutable after init)
+///  4       4    write_offset  (AtomicI32)
+///  8       4    live_bytes    (AtomicI32)
+/// 12       4    live_items    (AtomicI32)
+/// 16       4    prev_seg      (AtomicU32, 0=None)
+/// 20       4    next_seg      (AtomicU32, 0=None)
+/// 24       4    create_at     (AtomicInstant)
+/// 28       4    merge_at      (AtomicInstant)
+/// 32       4    ttl           (AtomicU32, seconds)
+/// 36       1    state         (AtomicU8, SegmentState)
+/// 37       1    pool          (AtomicU8, SegmentPool)
+/// 38      26    _pad
+/// ```
+#[repr(C, align(64))]
+pub(crate) struct SegmentHeader {
+    id: u32,
+    write_offset: AtomicI32,
+    live_bytes: AtomicI32,
+    live_items: AtomicI32,
+    prev_seg: AtomicU32,
+    next_seg: AtomicU32,
+    create_at: AtomicInstant,
+    merge_at: AtomicInstant,
+    ttl: AtomicU32,
+    state: AtomicU8,
+    pool: AtomicU8,
+    _pad: [u8; 26],
+}
+
+// Loom atomics are larger than std atomics, so skip size check under loom.
+#[cfg(not(feature = "loom"))]
+const _: () = assert!(std::mem::size_of::<SegmentHeader>() == 64);
+#[cfg(not(feature = "loom"))]
+const _: () = assert!(std::mem::align_of::<SegmentHeader>() == 64);
+
 impl SegmentHeader {
+    /// Create a new header for the given segment id.
     pub fn new(id: NonZeroU32) -> Self {
-        let now = Instant::now();
         Self {
-            id,
-            write_offset: 0,
-            live_bytes: 0,
-            live_items: 0,
-            prev_seg: None,
-            next_seg: None,
-            create_at: now,
-            ttl: 0,
-            merge_at: now,
-            accessible: false,
-            evictable: false,
-            pool: SegmentPool::Main,
-            _pad: [0; 24],
+            id: id.get(),
+            write_offset: AtomicI32::new(0),
+            live_bytes: AtomicI32::new(0),
+            live_items: AtomicI32::new(0),
+            prev_seg: AtomicU32::new(0),
+            next_seg: AtomicU32::new(0),
+            create_at: AtomicInstant::new(Instant::default()),
+            merge_at: AtomicInstant::new(Instant::default()),
+            ttl: AtomicU32::new(0),
+            state: AtomicU8::new(SegmentState::Free as u8),
+            pool: AtomicU8::new(SegmentPool::Main as u8),
+            _pad: [0; 26],
         }
     }
 
-    pub fn init(&mut self) {
-        // TODO(bmartin): should these be `debug_assert` or are we enforcing
-        // invariants? Eitherway, keeping them before changing values in the
-        // header is probably wise?
-        assert!(!self.accessible());
-        assert!(!self.evictable());
-
-        let now = Instant::now();
-
-        self.reset();
-
-        self.prev_seg = None;
-        self.next_seg = None;
-        self.live_items = 0;
-        self.create_at = now;
-        self.merge_at = now;
-        self.accessible = true;
-    }
-
-    // TODO(bmartin): maybe have some debug_assert for n_item == 0 ?
-    pub fn reset(&mut self) {
-        let offset = if cfg!(feature = "magic") {
-            std::mem::size_of_val(&SEG_MAGIC) as i32
+    /// Initialize the header for a fresh allocation.
+    /// When the `magic` feature is enabled, sets write_offset and live_bytes
+    /// past the magic bytes region.
+    pub fn init(&self) {
+        let initial_offset = if cfg!(feature = "magic") {
+            std::mem::size_of::<u64>() as i32
         } else {
             0
         };
-
-        self.write_offset = offset;
-        self.live_bytes = offset;
+        self.write_offset.store(initial_offset, Ordering::Relaxed);
+        self.live_bytes.store(initial_offset, Ordering::Relaxed);
+        self.live_items.store(0, Ordering::Relaxed);
+        self.state
+            .store(SegmentState::Free as u8, Ordering::Relaxed);
     }
+
+    /// Reset the header when returning to the free queue.
+    /// When the `magic` feature is enabled, preserves the magic byte offset.
+    pub fn reset(&self) {
+        let initial_offset = if cfg!(feature = "magic") {
+            std::mem::size_of::<u64>() as i32
+        } else {
+            0
+        };
+        self.write_offset.store(initial_offset, Ordering::Relaxed);
+        self.live_bytes.store(initial_offset, Ordering::Relaxed);
+        self.live_items.store(0, Ordering::Relaxed);
+    }
+
+    // -- Identity --
 
     #[inline]
     pub fn id(&self) -> NonZeroU32 {
-        self.id
+        // SAFETY: id is always set from NonZeroU32 in new()
+        unsafe { NonZeroU32::new_unchecked(self.id) }
     }
 
+    // -- Write offset --
+
     #[inline]
-    /// Returns the offset in the segment to begin writing the next item.
     pub fn write_offset(&self) -> i32 {
-        self.write_offset
+        self.write_offset.load(Ordering::Relaxed)
     }
 
     #[inline]
-    /// Sets the write offset to the provided value. Typically used when
-    /// resetting the segment.
-    pub fn set_write_offset(&mut self, bytes: i32) {
-        self.write_offset = bytes;
+    pub fn set_write_offset(&self, offset: i32) {
+        self.write_offset.store(offset, Ordering::Relaxed);
     }
 
+    /// Atomically add to the write offset, returning the previous value.
+    /// The returned value is the offset where the caller can write.
     #[inline]
-    /// Moves the write offset forward by some number of bytes and returns the
-    /// previous value. This is used as part of writing a new item to reserve
-    /// some number of bytes and return the position to begin writing.
-    pub fn incr_write_offset(&mut self, bytes: i32) -> i32 {
-        let prev = self.write_offset;
-        self.write_offset += bytes;
-        prev
+    pub fn fetch_add_write_offset(&self, size: i32) -> i32 {
+        self.write_offset.fetch_add(size, Ordering::Relaxed)
     }
 
-    #[inline]
-    /// Is the segment accessible?
-    pub fn accessible(&self) -> bool {
-        self.accessible
-    }
+    // -- Live bytes --
 
     #[inline]
-    /// Set whether the segment is accessible.
-    pub fn set_accessible(&mut self, accessible: bool) {
-        self.accessible = accessible;
-    }
-
-    #[inline]
-    /// Is the segment evictable?
-    pub fn evictable(&self) -> bool {
-        self.evictable
-    }
-
-    #[inline]
-    /// Set whether the segment is evictable.
-    pub fn set_evictable(&mut self, evictable: bool) {
-        self.evictable = evictable;
-    }
-
-    #[inline]
-    /// The number of live items within the segment.
-    pub fn live_items(&self) -> i32 {
-        self.live_items
-    }
-
-    #[inline]
-    /// Increment the number of live items.
-    pub fn incr_live_items(&mut self) {
-        self.live_items += 1;
-    }
-
-    #[inline]
-    /// Decrement the number of live items.
-    pub fn decr_live_items(&mut self) {
-        self.live_items -= 1;
-    }
-
-    #[inline]
-    /// Returns the TTL for the segment.
-    pub fn ttl(&self) -> Duration {
-        Duration::from_secs(self.ttl)
-    }
-
-    #[inline]
-    /// Sets the TTL for the segment.
-    pub fn set_ttl(&mut self, ttl: Duration) {
-        self.ttl = ttl.as_secs();
-    }
-
-    #[inline]
-    /// The number of bytes used in the segment.
     pub fn live_bytes(&self) -> i32 {
-        self.live_bytes
+        self.live_bytes.load(Ordering::Relaxed)
     }
 
     #[inline]
-    /// Increment the number of bytes used in the segment.
-    pub fn incr_live_bytes(&mut self, bytes: i32) -> i32 {
-        let prev = self.live_bytes;
-        self.live_bytes += bytes;
-        prev
+    pub fn incr_live_bytes(&self, bytes: i32) {
+        self.live_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     #[inline]
-    /// Decrement the number of bytes used in the segment.
-    pub fn decr_live_bytes(&mut self, bytes: i32) -> i32 {
-        let prev = self.live_bytes;
-        self.live_bytes -= bytes;
-        prev
+    pub fn decr_live_bytes(&self, bytes: i32) {
+        self.live_bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    // -- Live items --
+
+    #[inline]
+    pub fn live_items(&self) -> i32 {
+        self.live_items.load(Ordering::Relaxed)
     }
 
     #[inline]
-    /// Returns an option containing the previous segment id if there is one.
+    pub fn incr_live_items(&self) {
+        self.live_items.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn decr_live_items(&self) {
+        self.live_items.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Decrement both live items and live bytes atomically.
+    #[inline]
+    pub fn decr_item(&self, size: i32) {
+        self.decr_live_items();
+        self.decr_live_bytes(size);
+    }
+
+    // -- Chain pointers --
+
+    #[inline]
     pub fn prev_seg(&self) -> Option<NonZeroU32> {
+        NonZeroU32::new(self.prev_seg.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn set_prev_seg(&self, id: Option<NonZeroU32>) {
         self.prev_seg
+            .store(id.map_or(0, |v| v.get()), Ordering::Relaxed);
     }
 
     #[inline]
-    /// Set the previous segment to some id. Passing a negative id results in
-    /// clearing the previous segment pointer.
-    pub fn set_prev_seg(&mut self, id: Option<NonZeroU32>) {
-        self.prev_seg = id;
-    }
-
-    #[inline]
-    /// Returns an option containing the next segment id if there is one.
     pub fn next_seg(&self) -> Option<NonZeroU32> {
+        NonZeroU32::new(self.next_seg.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn set_next_seg(&self, id: Option<NonZeroU32>) {
         self.next_seg
+            .store(id.map_or(0, |v| v.get()), Ordering::Relaxed);
     }
 
-    #[inline]
-    /// Set the next segment to some id. Passing a negative id results in
-    /// clearing the next segment pointer.
-    pub fn set_next_seg(&mut self, id: Option<NonZeroU32>) {
-        self.next_seg = id;
-    }
+    // -- Timestamps --
 
     #[inline]
-    /// Returns the instant at which the segment was created
     pub fn create_at(&self) -> Instant {
-        self.create_at
+        self.create_at.load(Ordering::Relaxed)
     }
 
     #[inline]
-    /// Update the created time
-    pub fn mark_created(&mut self) {
-        self.create_at = Instant::now();
+    pub fn mark_created(&self) {
+        self.create_at.store(Instant::now(), Ordering::Relaxed);
     }
 
     #[inline]
-    /// Returns the instant at which the segment was merged
     pub fn merge_at(&self) -> Instant {
-        self.merge_at
+        self.merge_at.load(Ordering::Relaxed)
     }
 
     #[inline]
-    /// Update the created time
-    pub fn mark_merged(&mut self) {
-        self.merge_at = Instant::now();
+    pub fn mark_merged(&self) {
+        self.merge_at.store(Instant::now(), Ordering::Relaxed);
+    }
+
+    // -- TTL --
+
+    #[inline]
+    pub fn ttl(&self) -> Duration {
+        Duration::from_secs(self.ttl.load(Ordering::Relaxed))
     }
 
     #[inline]
-    /// Returns the segment pool.
-    pub fn pool(&self) -> SegmentPool {
-        self.pool
+    pub fn set_ttl(&self, ttl: Duration) {
+        self.ttl.store(ttl.as_secs(), Ordering::Relaxed);
+    }
+
+    // -- State --
+
+    #[inline]
+    pub fn state(&self) -> SegmentState {
+        SegmentState::from_u8(self.state.load(Ordering::Relaxed))
     }
 
     #[inline]
-    /// Set the segment pool.
-    pub fn set_pool(&mut self, pool: SegmentPool) {
-        self.pool = pool;
+    pub fn set_state(&self, state: SegmentState) {
+        self.state.store(state as u8, Ordering::Relaxed);
     }
 
+    /// Returns true if the segment is accessible (Filling or Active).
     #[inline]
-    /// Can the segment be evicted?
+    pub fn accessible(&self) -> bool {
+        matches!(self.state(), SegmentState::Filling | SegmentState::Active)
+    }
+
+    /// Set the segment as accessible. Maps to `Filling` if not already
+    /// `Active`, preserving the evictable distinction.
+    #[inline]
+    pub fn set_accessible(&self, accessible: bool) {
+        if accessible {
+            if self.state() == SegmentState::Free || self.state() == SegmentState::Draining {
+                self.set_state(SegmentState::Filling);
+            }
+        } else if self.state() != SegmentState::Free {
+            self.set_state(SegmentState::Draining);
+        }
+    }
+
+    /// Returns true if the segment is evictable (Active state).
+    #[inline]
+    pub fn evictable(&self) -> bool {
+        self.state() == SegmentState::Active
+    }
+
+    /// Set the segment as evictable. Transitions to Active when setting
+    /// true, ensuring the segment is at least Filling first. This makes
+    /// the call order-independent with `set_accessible`.
+    #[inline]
+    pub fn set_evictable(&self, evictable: bool) {
+        if evictable {
+            let state = self.state();
+            if state == SegmentState::Free || state == SegmentState::Draining {
+                self.set_state(SegmentState::Filling);
+            }
+            if self.state() == SegmentState::Filling {
+                self.set_state(SegmentState::Active);
+            }
+        } else if self.state() == SegmentState::Active {
+            self.set_state(SegmentState::Filling);
+        }
+    }
+
+    /// Check if the segment can actually be evicted.
+    /// Requires: Active state, has a next segment, and is mature enough.
+    #[inline]
     pub fn can_evict(&self) -> bool {
         self.evictable()
             && self.next_seg().is_some()
             && (self.create_at() + self.ttl()) >= (Instant::now() + SEG_MATURE_TIME)
+    }
+
+    // -- Pool --
+
+    #[inline]
+    pub fn pool(&self) -> SegmentPool {
+        SegmentPool::from_u8(self.pool.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn set_pool(&self, pool: SegmentPool) {
+        self.pool.store(pool as u8, Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Debug for SegmentHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentHeader")
+            .field("id", &self.id)
+            .field("write_offset", &self.write_offset())
+            .field("live_bytes", &self.live_bytes())
+            .field("live_items", &self.live_items())
+            .field("state", &self.state())
+            .field("pool", &self.pool())
+            .field("prev_seg", &self.prev_seg())
+            .field("next_seg", &self.next_seg())
+            .field("ttl", &self.ttl())
+            .finish()
     }
 }

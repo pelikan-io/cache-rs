@@ -154,7 +154,10 @@ impl Builder {
     /// ```
     pub fn build(self) -> Result<Segcache, std::io::Error> {
         let hashtable = MultiChoiceHashtable::new(self.hash_power);
-        let segments = self.segments_builder.build()?;
+        let segments = self
+            .segments_builder
+            .build()
+            .map_err(std::io::Error::other)?;
         let ttl_buckets = TtlBuckets::default();
 
         Ok(Segcache {

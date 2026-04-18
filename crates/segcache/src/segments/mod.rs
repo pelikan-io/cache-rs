@@ -1,12 +1,4 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
 //! Segments are the backing storage of the cache.
-
-use crate::*;
-
-const SEG_MAGIC: u64 = 0xBADC0FFEEBADCAFE;
 
 mod builder;
 mod error;

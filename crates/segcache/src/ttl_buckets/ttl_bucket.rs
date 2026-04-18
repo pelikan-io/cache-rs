@@ -160,12 +160,12 @@ impl TtlBucket {
         if let Some(id) = segments.pop_free() {
             {
                 if let Some(tail_id) = self.tail {
-                    let mut tail = segments.get_mut(tail_id).unwrap();
+                    let tail = segments.get_mut(tail_id).unwrap();
                     tail.set_next_seg(Some(id));
                 }
             }
 
-            let mut segment = segments.get_mut(id).unwrap();
+            let segment = segments.get_mut(id).unwrap();
             segment.set_prev_seg(self.tail);
             segment.set_next_seg(None);
             segment.set_ttl(Duration::from_secs(self.ttl as u32));
@@ -204,7 +204,7 @@ impl TtlBucket {
 
         loop {
             if let Some(id) = self.tail {
-                if let Ok(mut segment) = segments.get_mut(id) {
+                if let Ok(segment) = segments.get_mut(id) {
                     if !segment.accessible() {
                         continue;
                     }
