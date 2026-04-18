@@ -6,9 +6,6 @@
 
 mod reserved;
 
-#[cfg(any(feature = "magic", feature = "debug"))]
-pub(crate) use keyvalue::ITEM_MAGIC_SIZE;
-
 use crate::SegcacheError;
 use keyvalue::{RawItem, Value};
 

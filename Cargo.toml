@@ -24,6 +24,7 @@ memmap2 = "0.9.10"
 metriken = "0.7.0"
 rand = "0.10.1"
 rand_xoshiro = "0.8.0"
+crc32fast = "1.4"
 thiserror = "2.0.18"
 
 [profile.release]

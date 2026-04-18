@@ -8,5 +8,9 @@ repository = { workspace = true }
 license = { workspace = true }
 
 [features]
-magic = []
-debug = ["magic"]
+default = ["integrity"]
+integrity = ["crc32fast"]
+debug = ["integrity"]
+
+[dependencies]
+crc32fast = { workspace = true, optional = true }
