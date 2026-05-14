@@ -1,9 +1,9 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-//! Eviction is used to select a segment to remove when the cache becomes full.
-//! An eviction [`Policy`] determines what data will be evicted from the cache.
+//! Eviction selects which segment to reclaim when the cache is full.
+//!
+//! The [`Eviction`] struct ranks segments according to the configured
+//! [`Policy`] and returns them for eviction. For policies that need
+//! ranking (Fifo, Cte, Util), segments are sorted periodically. For
+//! stateless policies (Random, RandomFifo), ranking is skipped.
 
 use core::cmp::{max, Ordering};
 use core::num::NonZeroU32;
@@ -21,8 +21,8 @@ mod policy;
 pub(crate) use ghost::GhostQueue;
 pub use policy::Policy;
 
-/// The `Eviction` struct is used to rank and return segments for eviction. It
-/// implements eviction strategies corresponding to the `Policy`.
+/// Ranks and returns segments for eviction according to the configured
+/// [`Policy`].
 pub struct Eviction {
     policy: Policy,
     last_update_time: Instant,
@@ -34,13 +34,10 @@ pub struct Eviction {
 }
 
 impl Eviction {
-    /// Creates a new `Eviction` struct which will handle up to `nseg` segments
+    /// Creates a new `Eviction` which will handle up to `nseg` segments
     /// using the specified eviction policy.
     pub fn new(nseg: usize, policy: Policy) -> Self {
-        let mut ranked_segs = Vec::with_capacity(0);
-        ranked_segs.reserve_exact(nseg);
-        ranked_segs.resize_with(nseg, || None);
-        let ranked_segs = ranked_segs.into_boxed_slice();
+        let ranked_segs = vec![None; nseg].into_boxed_slice();
 
         // For S3-FIFO, size the ghost queue proportionally
         // (approximating the number of items in the admission pool)
@@ -65,15 +62,11 @@ impl Eviction {
         self.policy
     }
 
-    /// Returns the segment id of the least valuable segment
+    /// Returns the segment id of the least valuable segment.
     pub fn least_valuable_seg(&mut self) -> Option<NonZeroU32> {
         let index = self.index;
         self.index += 1;
-        if index < self.ranked_segs.len() {
-            self.ranked_segs[index]
-        } else {
-            None
-        }
+        self.ranked_segs.get(index).copied().flatten()
     }
 
     /// Returns a random u32
@@ -83,7 +76,6 @@ impl Eviction {
     }
 
     pub fn should_rerank(&mut self) -> bool {
-        let now = Instant::now();
         match self.policy {
             Policy::None
             | Policy::Random
@@ -91,6 +83,7 @@ impl Eviction {
             | Policy::Merge { .. }
             | Policy::S3Fifo { .. } => false,
             Policy::Fifo | Policy::Cte | Policy::Util => {
+                let now = Instant::now();
                 if self.ranked_segs[0].is_none()
                     || (now - self.last_update_time).as_secs() > 1
                     || self.ranked_segs.len() < (self.index + 8)
@@ -104,56 +97,40 @@ impl Eviction {
         }
     }
 
+    /// Sort segments by the active policy's comparator.
     pub fn rerank(&mut self, headers: &[SegmentHeader]) {
+        let cmp: fn(&SegmentHeader, &SegmentHeader) -> Ordering = match self.policy {
+            Policy::Fifo => Self::compare_fifo,
+            Policy::Cte => Self::compare_cte,
+            Policy::Util => Self::compare_util,
+            _ => return,
+        };
+
         let mut ids: Vec<NonZeroU32> = headers.iter().map(|h| h.id()).collect();
-        match self.policy {
-            Policy::None
-            | Policy::Random
-            | Policy::RandomFifo
-            | Policy::Merge { .. }
-            | Policy::S3Fifo { .. } => {
-                return;
-            }
-            Policy::Fifo => {
-                ids.sort_by(|a, b| {
-                    Self::compare_fifo(
-                        &headers[a.get() as usize - 1],
-                        &headers[b.get() as usize - 1],
-                    )
-                });
-            }
-            Policy::Cte => {
-                ids.sort_by(|a, b| {
-                    Self::compare_cte(
-                        &headers[a.get() as usize - 1],
-                        &headers[b.get() as usize - 1],
-                    )
-                });
-            }
-            Policy::Util => {
-                ids.sort_by(|a, b| {
-                    Self::compare_util(
-                        &headers[a.get() as usize - 1],
-                        &headers[b.get() as usize - 1],
-                    )
-                });
-            }
-        }
-        for (i, id) in self.ranked_segs.iter_mut().enumerate() {
-            *id = Some(ids[i]);
+        ids.sort_by(|a, b| {
+            cmp(
+                &headers[a.get() as usize - 1],
+                &headers[b.get() as usize - 1],
+            )
+        });
+
+        for (slot, id) in self.ranked_segs.iter_mut().zip(ids.iter()) {
+            *slot = Some(*id);
         }
         self.index = 0;
     }
+
+    // -- Comparators --
 
     fn compare_fifo(lhs: &SegmentHeader, rhs: &SegmentHeader) -> Ordering {
         if !lhs.can_evict() {
             Ordering::Greater
         } else if !rhs.can_evict() {
             Ordering::Less
-        } else if max(lhs.create_at(), lhs.merge_at()) > max(rhs.create_at(), rhs.merge_at()) {
-            Ordering::Greater
         } else {
-            Ordering::Less
+            let lhs_age = max(lhs.create_at(), lhs.merge_at());
+            let rhs_age = max(rhs.create_at(), rhs.merge_at());
+            lhs_age.cmp(&rhs_age).reverse()
         }
     }
 
@@ -162,10 +139,10 @@ impl Eviction {
             Ordering::Greater
         } else if !rhs.can_evict() {
             Ordering::Less
-        } else if (lhs.create_at() + lhs.ttl()) > (rhs.create_at() + rhs.ttl()) {
-            Ordering::Greater
         } else {
-            Ordering::Less
+            let lhs_expire = lhs.create_at() + lhs.ttl();
+            let rhs_expire = rhs.create_at() + rhs.ttl();
+            lhs_expire.cmp(&rhs_expire)
         }
     }
 
@@ -174,17 +151,16 @@ impl Eviction {
             Ordering::Greater
         } else if !rhs.can_evict() {
             Ordering::Less
-        } else if lhs.live_bytes() > rhs.live_bytes() {
-            Ordering::Greater
         } else {
-            Ordering::Less
+            lhs.live_bytes().cmp(&rhs.live_bytes())
         }
     }
 
-    #[inline]
+    // -- Merge parameters --
+
     /// Returns the maximum number of segments which can be merged during a
-    /// single merge operation. Applies to both eviction and compaction merge
-    /// passes.
+    /// single merge operation.
+    #[inline]
     pub fn max_merge(&self) -> usize {
         if let Policy::Merge { max, .. } = self.policy {
             max
@@ -193,9 +169,8 @@ impl Eviction {
         }
     }
 
+    /// Returns the number of segments to combine during an eviction merge.
     #[inline]
-    /// Returns the number of segments which should be combined during an
-    /// eviction merge.
     pub fn n_merge(&self) -> usize {
         if let Policy::Merge { merge, .. } = self.policy {
             merge
@@ -204,9 +179,8 @@ impl Eviction {
         }
     }
 
+    /// Returns the number of segments to combine during a compaction merge.
     #[inline]
-    /// Returns the number of segments which should be combined during a
-    /// compaction merge.
     pub fn n_compact(&self) -> usize {
         if let Policy::Merge { compact, .. } = self.policy {
             compact
@@ -215,9 +189,8 @@ impl Eviction {
         }
     }
 
+    /// The compact ratio serves as a low watermark for triggering compaction.
     #[inline]
-    /// The compact ratio serves as a low watermark for triggering compaction
-    /// and combining segments without eviction.
     pub fn compact_ratio(&self) -> f64 {
         if self.n_compact() == 0 {
             0.0
@@ -226,17 +199,16 @@ impl Eviction {
         }
     }
 
+    /// The target ratio represents the desired occupancy of a segment after
+    /// eviction-based merge pruning.
     #[inline]
-    /// The target ratio is used during eviction based merging and represents
-    /// the desired occupancy of a segment once least accessed items are
-    /// evicted.
     pub fn target_ratio(&self) -> f64 {
         1.0 / self.n_merge() as f64
     }
 
+    /// The stop ratio is a high watermark that causes a merge pass to stop
+    /// when the target segment exceeds this occupancy.
     #[inline]
-    /// The stop ratio is used during merging as a high watermark and causes
-    /// the merge pass to stop when the target segment has a higher occupancy
     pub fn stop_ratio(&self) -> f64 {
         self.target_ratio() * (self.n_merge() - 1) as f64 + 0.05
     }

@@ -1,78 +1,82 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
+//! Eviction policies for segment selection.
 
-/// Policies define the eviction strategy to be used. All eviction strategies
-/// exclude segments which are currently accepting new items.
+/// Strategy for choosing which segment to reclaim under memory pressure.
+///
+/// Every policy operates at segment granularity — individual items are
+/// never evicted in isolation (except during merge pruning). Segments
+/// that are still the active write target for a TTL bucket are always
+/// excluded from eviction.
 #[derive(Copy, Clone, Debug)]
 pub enum Policy {
-    /// No eviction. When all the segments are full, inserts will fail until
-    /// segments are freed by TTL expiration.
+    /// Disable eviction entirely. Insertions return an error once every
+    /// segment is occupied. Segments are only reclaimed via TTL expiry.
     None,
-    /// Segment random eviction. Selects a random segment and evicts it. Similar
-    /// to slab random eviction.
+
+    /// Choose an evictable segment uniformly at random. Simple and fast,
+    /// but blind to item value — equivalent to random slab eviction.
     Random,
-    /// Random FIFO eviction. Selects a random TTL Bucket, weighted by the
-    /// number of segments, and evicts the oldest segment in the bucket. This
-    /// strategy helps preserve the TTL distribution of the working set and
-    /// prioritizes keeping newer items.
+
+    /// Select a random *occupied* segment, find the TTL bucket it
+    /// belongs to, and evict that bucket's head (oldest) segment. This
+    /// weights eviction toward TTL ranges that consume the most memory
+    /// while preserving the overall TTL distribution of the cache.
     RandomFifo,
-    /// FIFO segment eviction. Selects the oldest segment and evicts it. As
-    /// segments are append-only, this is similar to both slab LRU and slab LRC
-    /// eviction strategies.
+
+    /// Evict the oldest segment across all TTL buckets, measured by the
+    /// later of its creation and last-merge timestamps. Because segments
+    /// are append-only, this behaves like LRU at segment granularity.
     Fifo,
-    /// Closest to expiration. Selects the segment that would expire first and
-    /// evicts it. This is a unique eviction strategy in segcache and
-    /// effectively causes early expiration to free a segment.
+
+    /// Evict the segment whose items will expire soonest
+    /// (`create_at + ttl`). Effectively brings forward an expiration
+    /// that would have happened shortly anyway, minimising wasted work.
     Cte,
-    /// Least utilized segment. As segments are append-only, when an item is
-    /// replaced or removed the segment containing that item now has dead bytes.
-    /// This eviction strategy will free the segment that has the lowest number
-    /// of live bytes. This strategy should cause the smallest impact to the
-    /// number of live bytes held in the cache.
+
+    /// Evict the segment with the lowest `live_bytes`. Segments
+    /// accumulate dead space when items are overwritten or deleted, so
+    /// this policy targets the most fragmented segments first —
+    /// reclaiming the most capacity with the least data loss.
     Util,
-    /// Merge eviction is a unique feature in segcache. It tries to retain items
-    /// which have the biggest positive effect on hitrate.
-    /// At its core, the idea is to take sequential segments in a chain,
-    /// and merge their items into one segment. Unlike the NSDI paper, this
-    /// implementation performs two different types of merge operations. The one
-    /// matching the NSDI paper is used during eviction and may cause items to
-    /// be evicted based on an estimate of their hit frequency. The other
-    /// possible merge operation is a simple compaction which will combine
-    /// segments which have low utilization (due to item replacement/deletion)
-    /// without evicting any live items. Compaction has proven to be beneficial
-    /// in workloads that frequently overwrite or delete items in the cache.
+
+    /// Merge-based eviction from the segcache NSDI paper. Walks a chain
+    /// of adjacent segments, scores each item by its approximate
+    /// frequency, and copies high-value items into a compacted target
+    /// segment while dropping the rest.
+    ///
+    /// Two sub-modes:
+    /// - **Eviction merge**: prunes low-frequency items to free space.
+    /// - **Compaction merge**: copies without pruning, triggered when a
+    ///   segment's occupancy drops below `1/compact`. Useful for
+    ///   workloads with heavy overwrites or deletes.
     Merge {
-        /// The maximum number of segments to merge in a single pass. This can
-        /// be used to bound the tail latency impact of a merge operation.
+        /// Upper bound on segments consumed in a single merge pass.
+        /// Limits tail-latency impact of eviction.
         max: usize,
-        /// The target number of segments to merge during eviction. Setting this
-        /// higher will result in fewer eviction passes and allow the algorithm
-        /// to see more item frequencies. Setting this lower will cause fewer
-        /// item evictions per pass.
+        /// Number of segments to consider during an eviction merge.
+        /// Higher values give the frequency estimator more data;
+        /// lower values evict fewer items per pass.
         merge: usize,
-        /// The target number of segments to merge during compaction. Compaction
-        /// will only occur if a segment falls below `1/N`th occupancy. Setting
-        /// this higher will cause fewer compaction runs but can result in a
-        /// larger percentage of dead bytes.
-        ///
-        /// Note: Compaction will be disabled by setting this parameter to zero.
+        /// Number of segments to combine during compaction. Compaction
+        /// fires when a segment falls below `1/compact` live-byte
+        /// occupancy. Set to 0 to disable compaction entirely.
         compact: usize,
     },
-    /// S3-FIFO eviction (S3-Segcache) uses two pools of segments — admission
-    /// and main — plus a ghost queue of recently evicted key fingerprints.
-    /// New items are written to admission-pool segments. When an admission
-    /// segment is evicted, items with frequency > 0 are promoted (copied
-    /// into a main-pool segment); items with frequency == 0 are dropped and
-    /// their hashes added to the ghost queue. Main-pool segments use
-    /// CLOCK-style second-chance eviction.
+
+    /// S3-FIFO (S3-Segcache): a two-pool design with a ghost filter.
     ///
-    /// If a newly inserted key's hash is found in the ghost queue, the item
-    /// is written directly to a main-pool segment, bypassing admission.
+    /// Fresh items enter the *admission* pool. When an admission segment
+    /// is evicted, items whose frequency counter is non-zero are promoted
+    /// to the *main* pool; zero-frequency items are discarded and their
+    /// key hashes recorded in a ghost queue. On a subsequent insert, if
+    /// the key's hash appears in the ghost queue, the item skips
+    /// admission and goes directly to main — a second-chance mechanism
+    /// that avoids re-admitting one-hit wonders. The main pool evicts
+    /// using a CLOCK sweep that gives each item one additional chance
+    /// based on its frequency.
     S3Fifo {
-        /// Ratio of total segments allocated to the admission pool,
-        /// between 0.0 and 1.0. The remaining segments form the main
-        /// pool. Typical values are 0.05–0.20. Default: 0.10.
+        /// Fraction of total segments allocated to the admission pool
+        /// (0.0–1.0). The remainder forms the main pool. Typical range
+        /// is 0.05–0.20.
         admission_ratio: f64,
     },
 }
