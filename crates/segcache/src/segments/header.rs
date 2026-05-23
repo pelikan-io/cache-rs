@@ -28,9 +28,6 @@ use crate::sync::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 use clocksource::coarse::{AtomicInstant, Duration, Instant};
 use core::num::NonZeroU32;
 
-/// Minimum age before a segment can be evicted (seconds).
-const SEG_MATURE_TIME: Duration = Duration::from_secs(20);
-
 /// Segment lifecycle state.
 ///
 /// Replaces the old `accessible`/`evictable` boolean pair with a single
@@ -351,12 +348,10 @@ impl SegmentHeader {
     }
 
     /// Check if the segment can actually be evicted.
-    /// Requires: Active state, has a next segment, and is mature enough.
+    /// Requires: Active state and has a next segment (not the current write target).
     #[inline]
     pub fn can_evict(&self) -> bool {
-        self.evictable()
-            && self.next_seg().is_some()
-            && (self.create_at() + self.ttl()) >= (Instant::now() + SEG_MATURE_TIME)
+        self.evictable() && self.next_seg().is_some()
     }
 
     // -- Pool --
