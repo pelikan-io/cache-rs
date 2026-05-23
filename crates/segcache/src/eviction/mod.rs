@@ -130,7 +130,7 @@ impl Eviction {
         } else {
             let lhs_age = max(lhs.create_at(), lhs.merge_at());
             let rhs_age = max(rhs.create_at(), rhs.merge_at());
-            lhs_age.cmp(&rhs_age).reverse()
+            lhs_age.cmp(&rhs_age)
         }
     }
 
