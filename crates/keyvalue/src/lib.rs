@@ -9,12 +9,12 @@ pub mod item;
 pub mod tiny;
 mod value;
 
-pub use item::{BasicHeader, ItemGuard, RawItem, BASIC_HDR_SIZE};
+pub use item::{ItemGuard, ItemHeader, RawItem, ITEM_HDR_SIZE};
 pub use tiny::{TinyItem, TinyItemHeader, TINY_ITEM_HDR_SIZE};
 pub use value::{OwnedValue, Value};
 
 #[cfg(any(feature = "integrity", feature = "debug"))]
-pub use item::BASIC_INTEGRITY_SIZE;
+pub use item::ITEM_INTEGRITY_SIZE;
 
 /// A simple error indicating the item value is not a numeric type.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]

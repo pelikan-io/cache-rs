@@ -72,7 +72,7 @@ impl KeyVerifier for SegmentsVerifier<'_> {
 
         let byte_offset = self.segment_size * (seg_id as usize - 1) + offset;
 
-        if byte_offset + keyvalue::BASIC_HDR_SIZE > self.data.len() {
+        if byte_offset + keyvalue::ITEM_HDR_SIZE > self.data.len() {
             return false;
         }
 

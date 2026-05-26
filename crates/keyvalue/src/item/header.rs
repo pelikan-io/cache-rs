@@ -10,7 +10,7 @@
 //! │ 8bit │ 8bit  │            32 bit            │
 //! └──────┴───────┴──────────────────────────────┘
 //!
-//! FLAGS: [is_numeric:1][is_deleted:1][optional_len:6]
+//! FLAGS: [is_numeric:1][is_deleted:1][olen:6]
 //!
 //! With `integrity` feature, magic and CRC32 fields are added:
 //!
@@ -25,27 +25,33 @@
 //! ```
 
 /// The size of the item header in bytes.
-pub const BASIC_HDR_SIZE: usize = std::mem::size_of::<BasicHeader>();
+pub const ITEM_HDR_SIZE: usize = std::mem::size_of::<ItemHeader>();
+
+/// Magic sentinel bytes for integrity checking.
+#[cfg(feature = "integrity")]
+pub const ITEM_MAGIC: [u8; 2] = [0xCA, 0xFE];
 
 /// Size of the integrity fields (magic + CRC32) when the feature is enabled.
 #[cfg(feature = "integrity")]
-pub const BASIC_INTEGRITY_SIZE: usize = 2 + 4; // magic(2) + crc32(4)
+pub const ITEM_INTEGRITY_SIZE: usize = 2 + 4; // magic(2) + crc32(4)
 
 #[cfg(not(feature = "integrity"))]
 #[allow(dead_code)]
-pub const BASIC_INTEGRITY_SIZE: usize = 0;
+pub const ITEM_INTEGRITY_SIZE: usize = 0;
 
 // Flag masks within the `flags` byte.
 const NUMERIC_MASK: u8 = 0b1000_0000;
 const DELETE_MASK: u8 = 0b0100_0000;
-const OPT_MASK: u8 = 0b0011_1111;
+const OLEN_MASK: u8 = 0b0011_1111;
 
 /// Packed item header stored at the start of each item in segment memory.
 ///
 /// Base layout: `[klen:1][flags:1][vlen:4]` = 6 bytes.
 /// With `integrity`: `[magic:2][klen:1][flags:1][vlen:4][crc32:4]` = 12 bytes.
+///
+/// All fields are directly byte-addressable — no cross-word bit manipulation.
 #[repr(C, packed)]
-pub struct BasicHeader {
+pub struct ItemHeader {
     #[cfg(feature = "integrity")]
     magic: [u8; 2],
     klen: u8,
@@ -55,26 +61,27 @@ pub struct BasicHeader {
     crc32: u32,
 }
 
+// Verify expected sizes at compile time.
 #[cfg(not(feature = "integrity"))]
-const _: () = assert!(std::mem::size_of::<BasicHeader>() == 6);
+const _: () = assert!(std::mem::size_of::<ItemHeader>() == 6);
 #[cfg(feature = "integrity")]
-const _: () = assert!(std::mem::size_of::<BasicHeader>() == 12);
+const _: () = assert!(std::mem::size_of::<ItemHeader>() == 12);
 
-impl BasicHeader {
-    pub const MAGIC0: u8 = 0xCA;
-    pub const MAGIC1: u8 = 0xFE;
-
+impl ItemHeader {
+    /// Initialize header fields to zero (and set magic if enabled).
     pub fn init(&mut self) {
         self.klen = 0;
         self.flags = 0;
         self.vlen = 0;
         #[cfg(feature = "integrity")]
         {
-            self.magic = [Self::MAGIC0, Self::MAGIC1];
+            self.magic = ITEM_MAGIC;
             self.crc32 = 0;
         }
     }
 
+    /// Check that the magic bytes match the expected value.
+    ///
     /// # Panics
     /// Panics if the magic bytes are incorrect, indicating data corruption.
     pub fn check_magic(&self) {
@@ -82,20 +89,20 @@ impl BasicHeader {
         {
             let magic = self.magic;
             assert_eq!(
-                magic,
-                [Self::MAGIC0, Self::MAGIC1],
+                magic, ITEM_MAGIC,
                 "item magic mismatch: expected {:02X?}, got {:02X?}",
-                [Self::MAGIC0, Self::MAGIC1],
-                magic,
+                ITEM_MAGIC, magic,
             );
         }
     }
 
+    /// Store the CRC32 value in the header.
     #[cfg(feature = "integrity")]
     pub fn set_crc32(&mut self, crc: u32) {
         self.crc32 = crc;
     }
 
+    /// Get the stored CRC32 value.
     #[cfg(feature = "integrity")]
     pub fn crc32(&self) -> u32 {
         self.crc32
@@ -104,38 +111,38 @@ impl BasicHeader {
     // -- Key length --
 
     #[inline]
-    pub fn key_len(&self) -> u8 {
+    pub fn klen(&self) -> u8 {
         self.klen
     }
 
     #[inline]
-    pub fn set_key_len(&mut self, klen: u8) {
+    pub fn set_klen(&mut self, klen: u8) {
         self.klen = klen;
     }
 
     // -- Value length --
 
     #[inline]
-    pub fn value_len(&self) -> u32 {
+    pub fn vlen(&self) -> u32 {
         self.vlen
     }
 
     #[inline]
-    pub fn set_value_len(&mut self, vlen: u32) {
+    pub fn set_vlen(&mut self, vlen: u32) {
         self.vlen = vlen;
     }
 
     // -- Optional data length (6 bits, max 63) --
 
     #[inline]
-    pub fn optional_len(&self) -> u8 {
-        self.flags & OPT_MASK
+    pub fn olen(&self) -> u8 {
+        self.flags & OLEN_MASK
     }
 
     #[inline]
-    pub fn set_optional_len(&mut self, olen: u8) {
-        debug_assert!(olen <= OPT_MASK, "optional_len exceeds 6-bit max (63)");
-        self.flags = (self.flags & !OPT_MASK) | (olen & OPT_MASK);
+    pub fn set_olen(&mut self, olen: u8) {
+        debug_assert!(olen <= OLEN_MASK, "olen exceeds 6-bit max (63)");
+        self.flags = (self.flags & !OLEN_MASK) | (olen & OLEN_MASK);
     }
 
     // -- Numeric flag --
@@ -171,12 +178,12 @@ impl BasicHeader {
     }
 }
 
-impl std::fmt::Debug for BasicHeader {
+impl std::fmt::Debug for ItemHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BasicHeader")
-            .field("key_len", &self.key_len())
-            .field("value_len", &self.value_len())
-            .field("optional_len", &self.optional_len())
+        f.debug_struct("ItemHeader")
+            .field("klen", &self.klen())
+            .field("vlen", &self.vlen())
+            .field("olen", &self.olen())
             .field("is_numeric", &self.is_numeric())
             .field("is_deleted", &self.is_deleted())
             .finish()
@@ -187,7 +194,7 @@ impl std::fmt::Debug for BasicHeader {
 mod tests {
     use super::*;
 
-    fn zeroed() -> BasicHeader {
+    fn zeroed() -> ItemHeader {
         unsafe { std::mem::zeroed() }
     }
 
@@ -206,13 +213,13 @@ mod tests {
         let mut h = zeroed();
         h.set_deleted(true);
         h.set_numeric(true);
-        h.set_optional_len(5);
+        h.set_olen(5);
         assert!(
             h.is_deleted(),
-            "is_deleted should survive set_numeric and set_optional_len"
+            "is_deleted should survive set_numeric and set_olen"
         );
         assert!(h.is_numeric());
-        assert_eq!(h.optional_len(), 5);
+        assert_eq!(h.olen(), 5);
     }
 
     #[test]

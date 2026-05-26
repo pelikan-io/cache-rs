@@ -10,9 +10,9 @@ mod raw;
 use crate::Value;
 
 #[cfg(any(feature = "integrity", feature = "debug"))]
-pub use header::BASIC_INTEGRITY_SIZE;
+pub use header::ITEM_INTEGRITY_SIZE;
 
-pub use header::{BasicHeader, BASIC_HDR_SIZE};
+pub use header::{ItemHeader, ITEM_HDR_SIZE};
 pub use raw::RawItem;
 
 /// Trait for zero-copy read access to a cache item's data.
