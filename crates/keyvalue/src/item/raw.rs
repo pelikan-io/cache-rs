@@ -103,6 +103,15 @@ impl RawItem {
         self.header().check_magic()
     }
 
+    #[inline]
+    pub fn is_deleted(&self) -> bool {
+        self.header().is_deleted()
+    }
+
+    pub fn set_deleted(&mut self, deleted: bool) {
+        unsafe { (*self.header_mut()).set_deleted(deleted) }
+    }
+
     /// Write key, value, and optional data into the item buffer.
     pub fn define(&mut self, key: &[u8], value: Value, optional: &[u8]) {
         unsafe {
