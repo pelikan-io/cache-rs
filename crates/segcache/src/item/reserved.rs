@@ -15,23 +15,27 @@ pub(crate) struct ReservedItem {
 }
 
 impl ReservedItem {
+    /// Create a `ReservedItem` from its parts
     pub fn new(item: RawItem, seg: NonZeroU32, offset: usize) -> Self {
         Self { item, seg, offset }
     }
 
-    /// Write key, value, and optional data into the reserved item buffer.
+    /// Store the key, value, and optional data into the item
     pub fn define(&mut self, key: &[u8], value: Value, optional: &[u8]) {
         self.item.define(key, value, optional)
     }
 
+    /// Get the `RawItem` that backs the `ReservedItem`
     pub fn item(&self) -> RawItem {
         self.item
     }
 
+    /// Get the segment offset
     pub fn offset(&self) -> usize {
         self.offset
     }
 
+    /// Get the segment id
     pub fn seg(&self) -> NonZeroU32 {
         self.seg
     }

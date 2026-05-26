@@ -23,28 +23,22 @@ impl Item {
         self.raw.check_magic()
     }
 
-    /// CAS token for compare-and-swap operations.
-    pub fn cas(&self) -> u32 {
-        self.cas
-    }
-
-    /// Borrow the item key.
-    ///
-    /// Kept as a standalone method so callers inside segcache do not need to
-    /// import the `ItemGuard` trait explicitly.
+    /// Borrow the item key
     pub fn key(&self) -> &[u8] {
         self.raw.key()
     }
 
-    /// Borrow the item value.
-    ///
-    /// Kept as a standalone method so callers inside segcache do not need to
-    /// import the `ItemGuard` trait explicitly.
+    /// Borrow the item value
     pub fn value(&self) -> Value<'_> {
         self.raw.value()
     }
 
-    /// Borrow the optional bytes associated with the item.
+    /// CAS value for the item
+    pub fn cas(&self) -> u32 {
+        self.cas
+    }
+
+    /// Borrow the optional data
     pub fn optional(&self) -> Option<&[u8]> {
         self.raw.optional()
     }
