@@ -6,14 +6,14 @@ use super::*;
 use crate::hashtable::bucket::Hashbucket;
 use ::rand::Rng;
 use core::num::NonZeroU32;
-use keyvalue::ITEM_HDR_SIZE;
+use keyvalue::BASIC_HDR_SIZE;
 
 use std::time::Duration;
 
 #[test]
 fn sizes() {
-    // ITEM_HDR_SIZE is 12 with integrity (keyvalue default) or 6 without.
-    assert!(matches!(ITEM_HDR_SIZE, 6 | 12));
+    // BASIC_HDR_SIZE is 12 with integrity (keyvalue default) or 6 without.
+    assert!(matches!(BASIC_HDR_SIZE, 6 | 12));
 
     assert_eq!(std::mem::size_of::<SegmentHeader>(), 64);
 

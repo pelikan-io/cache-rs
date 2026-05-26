@@ -1,7 +1,7 @@
 //! A raw byte-level representation of an item.
 //!
 //! The [`RawItem`] provides direct byte-level access to item data stored as
-//! a packed buffer of `[ItemHeader][optional][key][value]`.
+//! a packed buffer of `[BasicHeader][optional][key][value]`.
 
 use crate::item::*;
 use crate::NotNumericError;
@@ -24,26 +24,26 @@ impl RawItem {
     /// # Safety
     ///
     /// The pointer must point to a valid item buffer with a properly
-    /// initialized [`ItemHeader`]. Undefined behavior results from
+    /// initialized [`BasicHeader`]. Undefined behavior results from
     /// passing an invalid or misaligned pointer.
     pub fn from_ptr(ptr: *mut u8) -> RawItem {
         Self { data: ptr }
     }
 
     /// Get an immutable reference to the item's header.
-    pub fn header(&self) -> &ItemHeader {
-        unsafe { &*(self.data as *const ItemHeader) }
+    pub fn header(&self) -> &BasicHeader {
+        unsafe { &*(self.data as *const BasicHeader) }
     }
 
     /// Get a mutable pointer to the item's header.
-    fn header_mut(&mut self) -> *mut ItemHeader {
-        self.data as *mut ItemHeader
+    fn header_mut(&mut self) -> *mut BasicHeader {
+        self.data as *mut BasicHeader
     }
 
     /// Returns the key length.
     #[inline]
     pub fn klen(&self) -> u8 {
-        self.header().klen()
+        self.header().key_len()
     }
 
     /// Borrow the key bytes.
@@ -58,7 +58,7 @@ impl RawItem {
     /// Returns the value length as stored in the header.
     #[inline]
     fn vlen(&self) -> u32 {
-        self.header().vlen()
+        self.header().value_len()
     }
 
     /// Borrow the value, returning either bytes or a decoded u64.
@@ -81,7 +81,7 @@ impl RawItem {
     /// Returns the optional data length.
     #[inline]
     pub fn olen(&self) -> u8 {
-        self.header().olen()
+        self.header().optional_len()
     }
 
     /// Borrow the optional data, if any.
@@ -107,8 +107,8 @@ impl RawItem {
     pub fn define(&mut self, key: &[u8], value: Value, optional: &[u8]) {
         unsafe {
             (*self.header_mut()).init();
-            (*self.header_mut()).set_olen(optional.len() as u8);
-            (*self.header_mut()).set_klen(key.len() as u8);
+            (*self.header_mut()).set_optional_len(optional.len() as u8);
+            (*self.header_mut()).set_key_len(key.len() as u8);
 
             // Copy optional data
             std::ptr::copy_nonoverlapping(
@@ -128,7 +128,7 @@ impl RawItem {
             match value {
                 Value::Bytes(v) => {
                     (*self.header_mut()).set_numeric(false);
-                    (*self.header_mut()).set_vlen(v.len() as u32);
+                    (*self.header_mut()).set_value_len(v.len() as u32);
                     std::ptr::copy_nonoverlapping(
                         v.as_ptr(),
                         self.data.add(self.value_offset()),
@@ -138,7 +138,7 @@ impl RawItem {
                 Value::U64(v) => {
                     (*self.header_mut()).set_numeric(true);
                     let bytes = v.to_be_bytes();
-                    (*self.header_mut()).set_vlen(bytes.len() as u32);
+                    (*self.header_mut()).set_value_len(bytes.len() as u32);
                     std::ptr::copy_nonoverlapping(
                         bytes.as_ptr(),
                         self.data.add(self.value_offset()),
@@ -170,7 +170,7 @@ impl RawItem {
         let total_len = self.value_offset() + self.vlen() as usize;
         // CRC32 is the last 4 bytes of the header.
         let crc_field_size = std::mem::size_of::<u32>();
-        let crc_field_offset = ITEM_HDR_SIZE - crc_field_size;
+        let crc_field_offset = BASIC_HDR_SIZE - crc_field_size;
 
         let mut hasher = crc32fast::Hasher::new();
 
@@ -200,7 +200,7 @@ impl RawItem {
 
     #[inline]
     fn optional_offset(&self) -> usize {
-        ITEM_HDR_SIZE
+        BASIC_HDR_SIZE
     }
 
     #[inline]
@@ -216,7 +216,7 @@ impl RawItem {
     /// Returns item size, rounded up to 8-byte alignment.
     pub fn size(&self) -> usize {
         let raw =
-            ITEM_HDR_SIZE + self.olen() as usize + self.klen() as usize + self.vlen() as usize;
+            BASIC_HDR_SIZE + self.olen() as usize + self.klen() as usize + self.vlen() as usize;
         ((raw >> 3) + 1) << 3
     }
 

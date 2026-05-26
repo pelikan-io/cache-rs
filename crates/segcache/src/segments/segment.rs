@@ -61,8 +61,8 @@ impl<'a> Segment<'a> {
 
     /// Maximum valid item start offset within the data slice.
     pub(crate) fn max_item_offset(&self) -> usize {
-        if self.write_offset() >= ITEM_HDR_SIZE as i32 {
-            std::cmp::min(self.write_offset() as usize, self.data.len()) - ITEM_HDR_SIZE
+        if self.write_offset() >= BASIC_HDR_SIZE as i32 {
+            std::cmp::min(self.write_offset() as usize, self.data.len()) - BASIC_HDR_SIZE
         } else if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC)
         } else {

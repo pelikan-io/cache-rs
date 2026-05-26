@@ -10,7 +10,7 @@
 //! │ 8bit │ 8bit  │            32 bit            │
 //! └──────┴───────┴──────────────────────────────┘
 //!
-//! FLAGS: [is_numeric:1][reserved:1][olen:6]
+//! FLAGS: [is_numeric:1][is_deleted:1][optional_len:6]
 //!
 //! With `integrity` feature, magic and CRC32 fields are added:
 //!
@@ -25,32 +25,26 @@
 //! ```
 
 /// The size of the item header in bytes.
-pub const ITEM_HDR_SIZE: usize = std::mem::size_of::<ItemHeader>();
-
-/// Magic sentinel bytes for integrity checking.
-#[cfg(feature = "integrity")]
-pub const ITEM_MAGIC: [u8; 2] = [0xCA, 0xFE];
+pub const BASIC_HDR_SIZE: usize = std::mem::size_of::<BasicHeader>();
 
 /// Size of the integrity fields (magic + CRC32) when the feature is enabled.
 #[cfg(feature = "integrity")]
-pub const ITEM_INTEGRITY_SIZE: usize = 2 + 4; // magic(2) + crc32(4)
+pub const BASIC_INTEGRITY_SIZE: usize = 2 + 4; // magic(2) + crc32(4)
 
 #[cfg(not(feature = "integrity"))]
 #[allow(dead_code)]
-pub const ITEM_INTEGRITY_SIZE: usize = 0;
+pub const BASIC_INTEGRITY_SIZE: usize = 0;
 
 // Flag masks within the `flags` byte.
 const NUMERIC_MASK: u8 = 0b1000_0000;
-const OLEN_MASK: u8 = 0b0011_1111;
+const OPT_MASK: u8 = 0b0011_1111;
 
 /// Packed item header stored at the start of each item in segment memory.
 ///
 /// Base layout: `[klen:1][flags:1][vlen:4]` = 6 bytes.
 /// With `integrity`: `[magic:2][klen:1][flags:1][vlen:4][crc32:4]` = 12 bytes.
-///
-/// All fields are directly byte-addressable — no cross-word bit manipulation.
 #[repr(C, packed)]
-pub struct ItemHeader {
+pub struct BasicHeader {
     #[cfg(feature = "integrity")]
     magic: [u8; 2],
     klen: u8,
@@ -60,27 +54,26 @@ pub struct ItemHeader {
     crc32: u32,
 }
 
-// Verify expected sizes at compile time.
 #[cfg(not(feature = "integrity"))]
-const _: () = assert!(std::mem::size_of::<ItemHeader>() == 6);
+const _: () = assert!(std::mem::size_of::<BasicHeader>() == 6);
 #[cfg(feature = "integrity")]
-const _: () = assert!(std::mem::size_of::<ItemHeader>() == 12);
+const _: () = assert!(std::mem::size_of::<BasicHeader>() == 12);
 
-impl ItemHeader {
-    /// Initialize header fields to zero (and set magic if enabled).
+impl BasicHeader {
+    pub const MAGIC0: u8 = 0xCA;
+    pub const MAGIC1: u8 = 0xFE;
+
     pub fn init(&mut self) {
         self.klen = 0;
         self.flags = 0;
         self.vlen = 0;
         #[cfg(feature = "integrity")]
         {
-            self.magic = ITEM_MAGIC;
+            self.magic = [Self::MAGIC0, Self::MAGIC1];
             self.crc32 = 0;
         }
     }
 
-    /// Check that the magic bytes match the expected value.
-    ///
     /// # Panics
     /// Panics if the magic bytes are incorrect, indicating data corruption.
     pub fn check_magic(&self) {
@@ -88,20 +81,20 @@ impl ItemHeader {
         {
             let magic = self.magic;
             assert_eq!(
-                magic, ITEM_MAGIC,
+                magic,
+                [Self::MAGIC0, Self::MAGIC1],
                 "item magic mismatch: expected {:02X?}, got {:02X?}",
-                ITEM_MAGIC, magic,
+                [Self::MAGIC0, Self::MAGIC1],
+                magic,
             );
         }
     }
 
-    /// Store the CRC32 value in the header.
     #[cfg(feature = "integrity")]
     pub fn set_crc32(&mut self, crc: u32) {
         self.crc32 = crc;
     }
 
-    /// Get the stored CRC32 value.
     #[cfg(feature = "integrity")]
     pub fn crc32(&self) -> u32 {
         self.crc32
@@ -110,38 +103,38 @@ impl ItemHeader {
     // -- Key length --
 
     #[inline]
-    pub fn klen(&self) -> u8 {
+    pub fn key_len(&self) -> u8 {
         self.klen
     }
 
     #[inline]
-    pub fn set_klen(&mut self, klen: u8) {
+    pub fn set_key_len(&mut self, klen: u8) {
         self.klen = klen;
     }
 
     // -- Value length --
 
     #[inline]
-    pub fn vlen(&self) -> u32 {
+    pub fn value_len(&self) -> u32 {
         self.vlen
     }
 
     #[inline]
-    pub fn set_vlen(&mut self, vlen: u32) {
+    pub fn set_value_len(&mut self, vlen: u32) {
         self.vlen = vlen;
     }
 
     // -- Optional data length (6 bits, max 63) --
 
     #[inline]
-    pub fn olen(&self) -> u8 {
-        self.flags & OLEN_MASK
+    pub fn optional_len(&self) -> u8 {
+        self.flags & OPT_MASK
     }
 
     #[inline]
-    pub fn set_olen(&mut self, olen: u8) {
-        debug_assert!(olen <= OLEN_MASK, "olen exceeds 6-bit max (63)");
-        self.flags = (self.flags & !OLEN_MASK) | (olen & OLEN_MASK);
+    pub fn set_optional_len(&mut self, olen: u8) {
+        debug_assert!(olen <= OPT_MASK, "optional_len exceeds 6-bit max (63)");
+        self.flags = (self.flags & !OPT_MASK) | (olen & OPT_MASK);
     }
 
     // -- Numeric flag --
@@ -161,12 +154,12 @@ impl ItemHeader {
     }
 }
 
-impl std::fmt::Debug for ItemHeader {
+impl std::fmt::Debug for BasicHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ItemHeader")
-            .field("klen", &self.klen())
-            .field("vlen", &self.vlen())
-            .field("olen", &self.olen())
+        f.debug_struct("BasicHeader")
+            .field("key_len", &self.key_len())
+            .field("value_len", &self.value_len())
+            .field("optional_len", &self.optional_len())
             .field("is_numeric", &self.is_numeric())
             .finish()
     }

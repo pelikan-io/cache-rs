@@ -139,7 +139,7 @@ impl Segcache {
         let optional = optional.unwrap_or(&[]);
 
         // calculate size for item
-        let size = (((ITEM_HDR_SIZE + key.len() + size_of(&value) + optional.len()) >> 3) + 1) << 3;
+        let size = (((BASIC_HDR_SIZE + key.len() + size_of(&value) + optional.len()) >> 3) + 1) << 3;
 
         let ttl = Duration::from_secs(min(u32::MAX as u64, ttl.as_secs()) as u32);
 
