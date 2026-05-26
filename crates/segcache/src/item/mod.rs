@@ -3,7 +3,7 @@
 mod reserved;
 
 use crate::SegcacheError;
-use keyvalue::{ItemGuard, RawItem, Value};
+use keyvalue::{RawItem, Value};
 
 pub(crate) use reserved::ReservedItem;
 
@@ -12,12 +12,6 @@ pub struct Item {
     cas: u32,
     raw: RawItem,
 }
-
-// SAFETY: `Item` is returned from single-threaded cache lookups and the
-// underlying pointer lives for the duration of the cache borrow.  The
-// `ItemGuard` trait requires `Send` so that future concurrent designs can
-// pass items across thread boundaries safely.
-unsafe impl Send for Item {}
 
 impl Item {
     pub(crate) fn new(raw: RawItem, cas: u32) -> Self {
@@ -50,6 +44,11 @@ impl Item {
         self.raw.value()
     }
 
+    /// Borrow the optional bytes associated with the item.
+    pub fn optional(&self) -> Option<&[u8]> {
+        self.raw.optional()
+    }
+
     /// Returns true if the item has been soft-deleted.
     pub fn is_deleted(&self) -> bool {
         self.raw.is_deleted()
@@ -67,20 +66,6 @@ impl Item {
         self.raw
             .saturating_sub(rhs)
             .map_err(|_| SegcacheError::NotNumeric)
-    }
-}
-
-impl<'a> ItemGuard<'a> for Item {
-    fn key(&self) -> &[u8] {
-        self.raw.key()
-    }
-
-    fn value(&self) -> Value<'_> {
-        self.raw.value()
-    }
-
-    fn optional(&self) -> &[u8] {
-        self.raw.optional().unwrap_or(&[])
     }
 }
 
