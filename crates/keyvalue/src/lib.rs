@@ -9,7 +9,7 @@ pub mod item;
 pub mod tiny;
 mod value;
 
-pub use item::{BasicHeader, RawItem, BASIC_HDR_SIZE};
+pub use item::{BasicHeader, ItemGuard, RawItem, BASIC_HDR_SIZE};
 pub use tiny::{TinyItem, TinyItemHeader, TINY_ITEM_HDR_SIZE};
 pub use value::{OwnedValue, Value};
 
