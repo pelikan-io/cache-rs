@@ -207,7 +207,10 @@ mod tests {
         h.set_deleted(true);
         h.set_numeric(true);
         h.set_optional_len(5);
-        assert!(h.is_deleted(), "is_deleted should survive set_numeric and set_optional_len");
+        assert!(
+            h.is_deleted(),
+            "is_deleted should survive set_numeric and set_optional_len"
+        );
         assert!(h.is_numeric());
         assert_eq!(h.optional_len(), 5);
     }
