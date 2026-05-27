@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(gh pr *)",
-      "Bash(xargs ls *)",
-      "Bash(cargo test *)"
-    ]
-  }
-}
