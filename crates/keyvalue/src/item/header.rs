@@ -10,7 +10,7 @@
 //! │ 8bit │ 8bit  │            32 bit            │
 //! └──────┴───────┴──────────────────────────────┘
 //!
-//! FLAGS: [is_numeric:1][reserved:1][olen:6]
+//! FLAGS: [is_numeric:1][is_deleted:1][olen:6]
 //!
 //! With `integrity` feature, magic and CRC32 fields are added:
 //!
@@ -41,6 +41,7 @@ pub const ITEM_INTEGRITY_SIZE: usize = 0;
 
 // Flag masks within the `flags` byte.
 const NUMERIC_MASK: u8 = 0b1000_0000;
+const DELETE_MASK: u8 = 0b0100_0000;
 const OLEN_MASK: u8 = 0b0011_1111;
 
 /// Packed item header stored at the start of each item in segment memory.
@@ -159,6 +160,22 @@ impl ItemHeader {
             self.flags &= !NUMERIC_MASK;
         }
     }
+
+    // -- Deleted flag --
+
+    #[inline]
+    pub fn is_deleted(&self) -> bool {
+        self.flags & DELETE_MASK != 0
+    }
+
+    #[inline]
+    pub fn set_deleted(&mut self, deleted: bool) {
+        if deleted {
+            self.flags |= DELETE_MASK;
+        } else {
+            self.flags &= !DELETE_MASK;
+        }
+    }
 }
 
 impl std::fmt::Debug for ItemHeader {
@@ -168,6 +185,48 @@ impl std::fmt::Debug for ItemHeader {
             .field("vlen", &self.vlen())
             .field("olen", &self.olen())
             .field("is_numeric", &self.is_numeric())
+            .field("is_deleted", &self.is_deleted())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zeroed() -> ItemHeader {
+        unsafe { std::mem::zeroed() }
+    }
+
+    #[test]
+    fn is_deleted_roundtrip() {
+        let mut h = zeroed();
+        assert!(!h.is_deleted());
+        h.set_deleted(true);
+        assert!(h.is_deleted());
+        h.set_deleted(false);
+        assert!(!h.is_deleted());
+    }
+
+    #[test]
+    fn is_deleted_independent_of_other_flags() {
+        let mut h = zeroed();
+        h.set_deleted(true);
+        h.set_numeric(true);
+        h.set_olen(5);
+        assert!(
+            h.is_deleted(),
+            "is_deleted should survive set_numeric and set_olen"
+        );
+        assert!(h.is_numeric());
+        assert_eq!(h.olen(), 5);
+    }
+
+    #[test]
+    fn set_numeric_does_not_clear_deleted() {
+        let mut h = zeroed();
+        h.set_deleted(true);
+        h.set_numeric(false);
+        assert!(h.is_deleted());
     }
 }

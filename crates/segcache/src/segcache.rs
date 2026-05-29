@@ -355,6 +355,9 @@ impl Segcache {
         // Remove from segment
         let (seg_id, offset) = unpack_location(location);
         if let Some(seg_id) = NonZeroU32::new(seg_id) {
+            if let Some(mut item) = self.segments.get_item_at(Some(seg_id), offset) {
+                item.set_deleted(true);
+            }
             let _ = self
                 .segments
                 .remove_at(seg_id, offset, &mut self.ttl_buckets, &self.hashtable);

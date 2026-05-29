@@ -1036,11 +1036,14 @@ impl Segments {
 
             let item_size = item.size();
             let old_loc = pack_location(src.id(), offset as u64);
+            if item.is_deleted() {
+                offset += item_size;
+                continue;
+            }
             let freq = hashtable
                 .get_item_frequency(item.key(), old_loc)
                 .unwrap_or(0);
-            let deleted = freq == 0 && hashtable.get_item_frequency(item.key(), old_loc).is_none();
-            if deleted {
+            if freq == 0 {
                 offset += item_size;
                 continue;
             }
@@ -1098,12 +1101,14 @@ impl Segments {
                 }
 
                 let item_size = item.size();
-                let loc = pack_location(segment.id(), offset as u64);
-                let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
-                if !deleted {
-                    let mut hasher = hashtable.hash_builder().build_hasher();
-                    hasher.write(item.key());
-                    hashes.push(hasher.finish());
+                if !item.is_deleted() {
+                    let loc = pack_location(segment.id(), offset as u64);
+                    let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
+                    if !deleted {
+                        let mut hasher = hashtable.hash_builder().build_hasher();
+                        hasher.write(item.key());
+                        hashes.push(hasher.finish());
+                    }
                 }
 
                 offset += item_size;

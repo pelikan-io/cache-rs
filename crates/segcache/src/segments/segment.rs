@@ -90,10 +90,12 @@ impl<'a> Segment<'a> {
                 break;
             }
 
-            let loc = pack_location(self.id(), offset as u64);
-            let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
-            if !deleted {
-                count += 1;
+            if !item.is_deleted() {
+                let loc = pack_location(self.id(), offset as u64);
+                let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
+                if !deleted {
+                    count += 1;
+                }
             }
             offset += item.size();
         }
@@ -305,7 +307,8 @@ impl<'a> Segment<'a> {
             let item_size = item.size();
 
             let old_loc = pack_location(self.id(), read_offset as u64);
-            let deleted = hashtable.get_item_frequency(item.key(), old_loc).is_none();
+            let deleted =
+                item.is_deleted() || hashtable.get_item_frequency(item.key(), old_loc).is_none();
             if deleted {
                 #[cfg(feature = "metrics")]
                 {
@@ -378,7 +381,8 @@ impl<'a> Segment<'a> {
             let write_offset = target.write_offset() as usize;
 
             let old_loc = pack_location(self.id(), read_offset as u64);
-            let deleted = hashtable.get_item_frequency(item.key(), old_loc).is_none();
+            let deleted =
+                item.is_deleted() || hashtable.get_item_frequency(item.key(), old_loc).is_none();
             if deleted || write_offset + item_size >= target.data.len() {
                 read_offset += item_size;
                 continue;
@@ -454,7 +458,14 @@ impl<'a> Segment<'a> {
             item.check_magic();
             let item_size = item.size();
 
+            // Fast path: item was explicitly deleted — no hashtable lookup needed.
+            if item.is_deleted() {
+                offset += item_size;
+                continue;
+            }
+
             let loc = pack_location(self.id(), offset as u64);
+            // Fallback for items deleted before is_deleted was introduced.
             let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
             if deleted {
                 offset += item_size;

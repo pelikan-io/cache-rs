@@ -1,16 +1,12 @@
-// Copyright 2021 Twitter, Inc.
-// Copyright 2023 Pelikan Cache contributors
-// Licensed under the MIT and Apache-2.0 licenses
-
-//! A reserved item is an item which has been allocated, but has not been
-//! defined or linked in the hashtable.
+//! A reserved item is an item which has been allocated but not yet linked
+//! in the hashtable.
 
 use crate::RawItem;
 use crate::Value;
 use core::num::NonZeroU32;
 
-/// Represents an item which has been allocated but is not defined or linked in
-/// the hashtable yet.
+/// An item that has been allocated in a segment but is not yet defined or
+/// linked in the hashtable.
 #[derive(Debug)]
 pub(crate) struct ReservedItem {
     item: RawItem,
