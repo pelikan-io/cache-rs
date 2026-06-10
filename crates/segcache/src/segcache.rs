@@ -84,8 +84,7 @@ impl Segcache {
         let raw = self.segments.get_item_at(NonZeroU32::new(seg_id), offset)?;
         raw.check_magic();
 
-        // Use the location's raw value (truncated) as the CAS token
-        let cas = location.as_raw() as u32;
+        let cas = self.hashtable.cas_value(key);
         Some(Item::new(raw, cas))
     }
 
@@ -105,7 +104,7 @@ impl Segcache {
         let raw = self.segments.get_item_at(NonZeroU32::new(seg_id), offset)?;
         raw.check_magic();
 
-        let cas = location.as_raw() as u32;
+        let cas = self.hashtable.cas_value(key);
         Some(Item::new(raw, cas))
     }
 
@@ -300,18 +299,19 @@ impl Segcache {
         ttl: std::time::Duration,
         cas: u32,
     ) -> Result<(), SegcacheError> {
-        // Look up the current item to check its CAS token
+        // Look up the current item (counting as a hit) to check its CAS token
         let verifier = self.verifier();
-        let (location, _freq) = self
-            .hashtable
-            .lookup_no_freq_update(key, &verifier)
+        self.hashtable
+            .lookup(key, &verifier)
             .ok_or(SegcacheError::NotFound)?;
 
-        let current_cas = location.as_raw() as u32;
-        if current_cas != cas {
+        if self.hashtable.cas_value(key) != cas {
             return Err(SegcacheError::Exists);
         }
 
+        // Bump the CAS value on a successful check, then insert (which bumps
+        // it again) — matching the original implementation's behavior.
+        self.hashtable.incr_cas_value(key);
         self.insert(key, value, optional, ttl)
     }
 
@@ -419,7 +419,7 @@ impl Segcache {
             .segments
             .get_item_at(NonZeroU32::new(seg_id), offset)
             .ok_or(SegcacheError::NotFound)?;
-        let cas = location.as_raw() as u32;
+        let cas = self.hashtable.cas_value(key);
         let mut item = Item::new(raw, cas);
         item.wrapping_add(rhs)?;
         Ok(item)
@@ -439,7 +439,7 @@ impl Segcache {
             .segments
             .get_item_at(NonZeroU32::new(seg_id), offset)
             .ok_or(SegcacheError::NotFound)?;
-        let cas = location.as_raw() as u32;
+        let cas = self.hashtable.cas_value(key);
         let mut item = Item::new(raw, cas);
         item.saturating_sub(rhs)?;
         Ok(item)

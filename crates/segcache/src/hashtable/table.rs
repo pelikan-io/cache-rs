@@ -10,7 +10,7 @@
 use crate::hashtable::bucket::Hashbucket;
 use crate::hashtable::location::Location;
 use crate::hashtable::traits::{Hashtable, KeyVerifier};
-use crate::sync::Ordering;
+use crate::sync::{AtomicU32, Ordering};
 use ahash::RandomState;
 use core::hash::{BuildHasher, Hasher};
 
@@ -26,6 +26,11 @@ pub const MAX_CHOICES: u8 = 8;
 pub struct MultiChoiceHashtable {
     hash_builder: Box<RandomState>,
     buckets: Box<[Hashbucket]>,
+    /// Per-bucket CAS counters, indexed by a key's primary (first-choice)
+    /// bucket. Incremented on every successful insert so that CAS tokens are
+    /// small, monotonically increasing integers, matching the semantics of
+    /// the original bucket-info CAS counter.
+    cas_counters: Box<[AtomicU32]>,
     num_buckets: usize,
     mask: u64,
     num_choices: u8,
@@ -76,9 +81,15 @@ impl MultiChoiceHashtable {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
+        let cas_counters = (0..num_buckets)
+            .map(|_| AtomicU32::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         Self {
             hash_builder: Box::new(hash_builder),
             buckets,
+            cas_counters,
             num_buckets,
             mask,
             num_choices,
@@ -129,6 +140,28 @@ impl MultiChoiceHashtable {
         let mut hasher = self.hash_builder.build_hasher();
         hasher.write(key);
         hasher.finish()
+    }
+
+    /// Index of the CAS counter for a hash: the primary (first-choice) bucket.
+    #[inline]
+    fn cas_index(&self, hash: u64) -> usize {
+        (hash & self.mask) as usize
+    }
+
+    /// Current CAS value for a key.
+    ///
+    /// The counter is shared by all keys with the same primary bucket and is
+    /// incremented on every successful insert of such a key, so a stale token
+    /// can spuriously fail a CAS but a matching token is always current.
+    pub fn cas_value(&self, key: &[u8]) -> u32 {
+        let hash = self.hash_key(key);
+        self.cas_counters[self.cas_index(hash)].load(Ordering::Relaxed)
+    }
+
+    /// Increment the CAS value for a key.
+    pub fn incr_cas_value(&self, key: &[u8]) {
+        let hash = self.hash_key(key);
+        self.cas_counters[self.cas_index(hash)].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Compute bucket indices for N-choice hashing.
@@ -872,39 +905,49 @@ impl Hashtable for MultiChoiceHashtable {
 
         let new_packed = Hashbucket::pack(tag, 1, location);
 
-        // First pass: try to find existing key or ghost in any bucket
-        for &bucket_index in choices {
-            if let Some(result) =
-                self.try_link_in_bucket(bucket_index, tag, key, new_packed, verifier)
-            {
-                return result;
-            }
-        }
-
-        // Second pass: find least-full bucket and try to insert there
-        if self.num_choices > 1 {
-            let target = choices
-                .iter()
-                .copied()
-                .min_by_key(|&b| self.count_occupied(b))
-                .unwrap();
-
-            if let Some(result) = self.try_link_in_bucket(target, tag, key, new_packed, verifier) {
-                return result;
-            }
-
-            let mut sorted: Vec<_> = choices.to_vec();
-            sorted.sort_by_key(|&b| self.count_occupied(b));
-            for bucket_index in sorted {
+        let result = 'link: {
+            // First pass: try to find existing key or ghost in any bucket
+            for &bucket_index in choices {
                 if let Some(result) =
                     self.try_link_in_bucket(bucket_index, tag, key, new_packed, verifier)
                 {
-                    return result;
+                    break 'link result;
                 }
             }
+
+            // Second pass: find least-full bucket and try to insert there
+            if self.num_choices > 1 {
+                let target = choices
+                    .iter()
+                    .copied()
+                    .min_by_key(|&b| self.count_occupied(b))
+                    .unwrap();
+
+                if let Some(result) =
+                    self.try_link_in_bucket(target, tag, key, new_packed, verifier)
+                {
+                    break 'link result;
+                }
+
+                let mut sorted: Vec<_> = choices.to_vec();
+                sorted.sort_by_key(|&b| self.count_occupied(b));
+                for bucket_index in sorted {
+                    if let Some(result) =
+                        self.try_link_in_bucket(bucket_index, tag, key, new_packed, verifier)
+                    {
+                        break 'link result;
+                    }
+                }
+            }
+
+            Err(())
+        };
+
+        if result.is_ok() {
+            self.cas_counters[self.cas_index(hash)].fetch_add(1, Ordering::Relaxed);
         }
 
-        Err(())
+        result
     }
 
     fn remove(&self, key: &[u8], expected: Location) -> bool {
@@ -1004,6 +1047,9 @@ impl Hashtable for MultiChoiceHashtable {
                 slot.store(0, Ordering::Release);
             }
         }
+        for counter in self.cas_counters.iter() {
+            counter.store(0, Ordering::Release);
+        }
     }
 }
 
@@ -1093,6 +1139,40 @@ mod tests {
         // Ghost frequency should be retrievable
         let freq = ht.get_ghost_frequency(b"test");
         assert!(freq.is_some());
+    }
+
+    #[test]
+    fn test_cas_value_counter() {
+        let ht = MultiChoiceHashtable::new(10);
+        let mut verifier = MockVerifier::new();
+
+        let loc1 = Location::new(100);
+        let loc2 = Location::new(200);
+        verifier.add(b"test", loc1, false);
+        verifier.add(b"test", loc2, false);
+
+        // CAS value starts at zero and increments on each successful insert
+        assert_eq!(ht.cas_value(b"test"), 0);
+        ht.insert(b"test", loc1, &verifier).unwrap();
+        assert_eq!(ht.cas_value(b"test"), 1);
+        ht.insert(b"test", loc2, &verifier).unwrap();
+        assert_eq!(ht.cas_value(b"test"), 2);
+
+        // explicit increment (used by CAS operations)
+        ht.incr_cas_value(b"test");
+        assert_eq!(ht.cas_value(b"test"), 3);
+
+        // relocation (cas_location) does not change the CAS value
+        assert!(ht.cas_location(b"test", loc2, loc1, true));
+        assert_eq!(ht.cas_value(b"test"), 3);
+
+        // removal does not change the CAS value
+        assert!(ht.remove(b"test", loc1));
+        assert_eq!(ht.cas_value(b"test"), 3);
+
+        // clear resets CAS values
+        ht.clear();
+        assert_eq!(ht.cas_value(b"test"), 0);
     }
 
     #[test]

@@ -103,6 +103,47 @@ fn cas() {
     assert_eq!(cache.cas(b"coffee", b"iced", None, ttl, item.cas()), Ok(()));
 }
 
+// CAS tokens must be small, deterministic, monotonically increasing integers
+// (one increment per write, two per successful CAS), matching the original
+// bucket-counter implementation. Memcache integration tests depend on these
+// exact values.
+#[test]
+fn cas_deterministic() {
+    let ttl = Duration::ZERO;
+    let segment_size = 4096;
+    let segments = 64;
+    let heap_size = segments * segment_size as usize;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(heap_size)
+        .build()
+        .expect("failed to create cache");
+
+    // first write of a key sets its CAS value to 1
+    assert!(cache.insert(b"coffee", b"hot", None, ttl).is_ok());
+    assert_eq!(cache.get(b"coffee").unwrap().cas(), 1);
+
+    // a stale token fails with Exists and does not advance the CAS value
+    assert_eq!(
+        cache.cas(b"coffee", b"iced", None, ttl, 0),
+        Err(SegcacheError::Exists)
+    );
+    assert_eq!(cache.get(b"coffee").unwrap().cas(), 1);
+
+    // overwriting increments the CAS value
+    assert!(cache.insert(b"coffee", b"warm", None, ttl).is_ok());
+    assert_eq!(cache.get(b"coffee").unwrap().cas(), 2);
+
+    // a successful CAS bumps twice: once for the check, once for the insert
+    assert_eq!(cache.cas(b"coffee", b"iced", None, ttl, 2), Ok(()));
+    assert_eq!(cache.get(b"coffee").unwrap().cas(), 4);
+    assert_eq!(cache.get(b"coffee").unwrap().value(), b"iced");
+
+    // the CAS value is stable across reads
+    assert_eq!(cache.get(b"coffee").unwrap().cas(), 4);
+}
+
 #[test]
 fn overwrite() {
     let ttl = Duration::ZERO;
