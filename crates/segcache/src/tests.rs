@@ -35,6 +35,65 @@ fn segment_header_generation_bumps_on_reset() {
     assert_eq!(header.generation(), 2);
 }
 
+// A held Item pins its segment: heavy eviction churn must neither move
+// nor recycle the pinned segment, so the held value stays readable and
+// the key's CAS token (location + generation) is unchanged.
+#[test]
+fn pinned_segment_survives_eviction_churn() {
+    let segment_size = 4096;
+    let segments = 8;
+    let heap_size = segments * segment_size as usize;
+    let ttl = Duration::ZERO;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(heap_size)
+        .eviction(Policy::Fifo)
+        .build()
+        .expect("failed to create cache");
+
+    // canary lands in the oldest segment — Fifo's first victim
+    assert!(cache.insert(b"pinned", b"canary", None, ttl).is_ok());
+    let item = cache.get(b"pinned").unwrap();
+    let token = item.cas();
+
+    // churn roughly 10x the heap through the cache; every insert must
+    // succeed because all other segments remain evictable
+    let filler = [0xABu8; 128];
+    for i in 0..2000u32 {
+        let key = format!("filler_{i}");
+        cache
+            .insert(key.as_bytes(), &filler[..], None, ttl)
+            .expect("insert must succeed while only one segment is pinned");
+    }
+
+    // the held item's bytes never moved
+    assert_eq!(item.value(), b"canary");
+
+    // the key still resolves, at the same location and generation
+    let fresh = cache.get(b"pinned").unwrap();
+    assert_eq!(fresh.value(), b"canary");
+    assert_eq!(
+        fresh.cas(),
+        token,
+        "pinned segment was moved or recycled during churn"
+    );
+}
+
+#[test]
+fn can_evict_respects_ref_count() {
+    let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+    header.set_state(SegmentState::Active);
+    header.set_next_seg(NonZeroU32::new(2));
+    assert!(header.can_evict());
+
+    assert!(header.try_acquire_reader());
+    assert!(!header.can_evict());
+
+    header.release_reader();
+    assert!(header.can_evict());
+}
+
 #[test]
 fn reader_pin_acquire_release() {
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
@@ -493,6 +552,8 @@ fn clear() {
 
     let item = cache.get(b"coffee").unwrap();
     assert_eq!(item.value(), b"strong", "item is: {item:?}");
+    // the item pins its segment; release it so clear() can reclaim
+    drop(item);
 
     cache.clear();
     assert_eq!(cache.segments.free(), segments);

@@ -332,6 +332,11 @@ impl Segments {
         }
 
         let id_idx = id.get() as usize - 1;
+        debug_assert_eq!(
+            self.headers[id_idx].ref_count(),
+            0,
+            "freed a segment pinned by readers"
+        );
 
         // Unlink from current chain.
         self.unlink(id);
@@ -412,6 +417,11 @@ impl Segments {
     ) -> Result<(), ()> {
         let mut segment = self.get_mut(id).unwrap();
         if segment.next_seg().is_none() && !expire {
+            Err(())
+        } else if segment.ref_count() != 0 {
+            // Pinned by readers — cannot be cleared this pass.
+            #[cfg(feature = "metrics")]
+            SEGMENT_PINNED_SKIP.increment();
             Err(())
         } else {
             assert!(segment.evictable(), "segment was not evictable");

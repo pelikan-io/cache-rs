@@ -419,10 +419,11 @@ impl SegmentHeader {
     }
 
     /// Check if the segment can actually be evicted.
-    /// Requires: Active state and has a next segment (not the current write target).
+    /// Requires: Active state, has a next segment (not the current write
+    /// target), and no readers pinning it.
     #[inline]
     pub fn can_evict(&self) -> bool {
-        self.evictable() && self.next_seg().is_some()
+        self.evictable() && self.next_seg().is_some() && self.ref_count() == 0
     }
 
     // -- Pool --
