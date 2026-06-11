@@ -115,6 +115,60 @@ fn cas() {
     assert_eq!(cache.cas(b"coffee", b"iced", None, ttl, item.cas()), Ok(()));
 }
 
+// A stale CAS token must not match after its segment is recycled, even if
+// the same key lands at the same location (segment id + offset). Without
+// the per-segment generation counter in the token, the identical location
+// bits would make the stale token falsely succeed (ABA).
+#[test]
+fn cas_stale_token_rejected_after_segment_recycle() {
+    let ttl = Duration::ZERO;
+    let segment_size = 4096;
+    let segments = 64;
+    let heap_size = segments * segment_size as usize;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(heap_size)
+        .build()
+        .expect("failed to create cache");
+
+    assert!(cache.insert(b"coffee", b"hot", None, ttl).is_ok());
+    let stale = cache.get(b"coffee").unwrap().cas();
+
+    // clear() frees the one used segment via push_free, which prepends it
+    // to the free queue (LIFO) and bumps its generation. The next insert
+    // pops the same segment and writes the same key at the same offset,
+    // reproducing the identical 44-bit location.
+    cache.clear();
+    assert_eq!(cache.segments.free(), segments);
+    assert!(cache.get(b"coffee").is_none());
+
+    assert!(cache.insert(b"coffee", b"cold", None, ttl).is_ok());
+    let fresh = cache.get(b"coffee").unwrap().cas();
+
+    // Precondition: this really is the ABA scenario — same location bits.
+    // If free-queue ordering ever changes, fail loudly here rather than
+    // silently passing without exercising ABA.
+    assert_eq!(
+        stale & CasToken::LOCATION_MASK,
+        fresh & CasToken::LOCATION_MASK,
+        "test precondition violated: item did not land at the same location"
+    );
+    assert_ne!(stale, fresh, "generation must differentiate the tokens");
+
+    // The actual regression: with location-only tokens this falsely
+    // returned Ok(()) and replaced a value the client never observed.
+    assert_eq!(
+        cache.cas(b"coffee", b"iced", None, ttl, stale),
+        Err(SegcacheError::Exists)
+    );
+    assert_eq!(cache.get(b"coffee").unwrap().value(), b"cold");
+
+    // The fresh token still works.
+    assert_eq!(cache.cas(b"coffee", b"iced", None, ttl, fresh), Ok(()));
+    assert_eq!(cache.get(b"coffee").unwrap().value(), b"iced");
+}
+
 #[test]
 fn overwrite() {
     let ttl = Duration::ZERO;

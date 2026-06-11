@@ -178,7 +178,7 @@ fuzz_target!(|data: &[u8]| {
                         key, value, ttl
                     );
                 }
-                let _ = cache.cas(key, value, None, Duration::from_secs(ttl.into()), cas);
+                let _ = cache.cas(key, value, None, Duration::from_secs(ttl.into()), u64::from(cas));
             }
             6 => { // incr
                 if i >= data.len() {
@@ -323,7 +323,7 @@ fuzz_target!(|data: &[u8]| {
                         key, value, ttl
                     );
                 }
-                let _ = cache.cas(key, value, None, Duration::from_secs(ttl.into()), cas);
+                let _ = cache.cas(key, value, None, Duration::from_secs(ttl.into()), u64::from(cas));
             }
             _ => {
                 return;
