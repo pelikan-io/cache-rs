@@ -80,6 +80,73 @@ fn pinned_segment_survives_eviction_churn() {
     );
 }
 
+// clear() must always drain the hashtable, but a pinned segment is not
+// freed until its readers drop; the held Item keeps reading its bytes,
+// and a later clear() reclaims the segment.
+#[test]
+fn pinned_segment_survives_clear() {
+    let segment_size = 4096;
+    let segments = 64;
+    let heap_size = segments * segment_size as usize;
+    let ttl = Duration::ZERO;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(heap_size)
+        .build()
+        .expect("failed to create cache");
+
+    assert!(cache.insert(b"coffee", b"strong", None, ttl).is_ok());
+    let item = cache.get(b"coffee").unwrap();
+
+    // pinned segment is drained but not freed
+    assert_eq!(cache.clear(), 0);
+    assert_eq!(cache.segments.free(), segments - 1);
+    assert_eq!(item.value(), b"strong");
+    assert!(cache.get(b"coffee").is_none());
+
+    // inserting with a drained (inaccessible) tail must expand past it
+    // rather than spin
+    assert!(cache.insert(b"tea", b"green", None, ttl).is_ok());
+    assert!(cache.get(b"tea").is_some());
+
+    // once the pin drops, the next clear reclaims everything
+    drop(item);
+    cache.clear();
+    assert_eq!(cache.segments.free(), segments);
+}
+
+// wrapping_add returns an Item that pins its segment like any other;
+// dropping it releases the pin.
+#[test]
+fn numeric_op_item_pins_segment() {
+    let segment_size = 4096;
+    let segments = 64;
+    let heap_size = segments * segment_size as usize;
+    let ttl = Duration::ZERO;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(heap_size)
+        .build()
+        .expect("failed to create cache");
+
+    assert!(cache.insert(b"n", 0, None, ttl).is_ok());
+
+    // temporary result: guard released at end of statement
+    assert!(cache.wrapping_add(b"n", 1).is_ok());
+
+    // held result: pins the segment across clear()
+    let held = cache.wrapping_add(b"n", 1).unwrap();
+    cache.clear();
+    assert_eq!(cache.segments.free(), segments - 1);
+    assert_eq!(held.value(), 2);
+
+    drop(held);
+    cache.clear();
+    assert_eq!(cache.segments.free(), segments);
+}
+
 #[test]
 fn can_evict_respects_ref_count() {
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
