@@ -36,6 +36,30 @@ fn segment_header_generation_bumps_on_reset() {
 }
 
 #[test]
+fn reader_pin_acquire_release() {
+    let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+
+    // acquisition succeeds in readable states and counts pins
+    header.set_state(SegmentState::Filling);
+    assert!(header.try_acquire_reader());
+    assert!(header.try_acquire_reader());
+    assert_eq!(header.ref_count(), 2);
+
+    header.release_reader();
+    header.release_reader();
+    assert_eq!(header.ref_count(), 0);
+
+    // acquisition fails in non-readable states and leaves no pin
+    header.set_state(SegmentState::Draining);
+    assert!(!header.try_acquire_reader());
+    assert_eq!(header.ref_count(), 0);
+
+    header.set_state(SegmentState::Free);
+    assert!(!header.try_acquire_reader());
+    assert_eq!(header.ref_count(), 0);
+}
+
+#[test]
 fn init() {
     let mut cache = Segcache::builder()
         .segment_size(4096)
