@@ -9,12 +9,12 @@ pub(crate) use reserved::ReservedItem;
 
 /// The base unit of data returned by a cache lookup.
 pub struct Item {
-    cas: u32,
+    cas: u64,
     raw: RawItem,
 }
 
 impl Item {
-    pub(crate) fn new(raw: RawItem, cas: u32) -> Self {
+    pub(crate) fn new(raw: RawItem, cas: u64) -> Self {
         Item { cas, raw }
     }
 
@@ -33,8 +33,11 @@ impl Item {
         self.raw.value()
     }
 
-    /// CAS value for the item
-    pub fn cas(&self) -> u32 {
+    /// CAS value for the item, matching the memcache protocol's 64-bit
+    /// "cas unique". Combines the item's location with its segment's
+    /// generation counter; any update, relocation, or segment recycle
+    /// invalidates outstanding values.
+    pub fn cas(&self) -> u64 {
         self.cas
     }
 

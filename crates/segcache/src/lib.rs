@@ -30,6 +30,7 @@ use core::hash::{BuildHasher, Hasher};
 
 // submodules
 mod builder;
+mod cas;
 mod error;
 mod eviction;
 mod hashtable;
@@ -58,6 +59,7 @@ pub use keyvalue::Value;
 
 // items from submodules which are imported for convenience to the crate level
 pub(crate) use crate::rand::*;
+pub(crate) use cas::CasToken;
 pub(crate) use hashtable::{
     pack_location, unpack_location, Hashtable, MultiChoiceHashtable, SegmentsVerifier,
 };

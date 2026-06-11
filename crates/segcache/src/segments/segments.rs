@@ -156,6 +156,14 @@ impl Segments {
         self.free as usize
     }
 
+    /// Returns the generation counter for a segment. Bumped each time the
+    /// segment is returned to the free queue, so CAS tokens built from it
+    /// are invalidated when the segment is recycled.
+    #[inline]
+    pub(crate) fn generation(&self, seg_id: NonZeroU32) -> u16 {
+        self.headers[seg_id.get() as usize - 1].generation()
+    }
+
     // ── Item access ──────────────────────────────────────────────────
 
     /// Retrieve a `RawItem` from a specific segment id at the given offset.

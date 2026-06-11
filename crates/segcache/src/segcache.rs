@@ -81,11 +81,11 @@ impl Segcache {
         let verifier = self.verifier();
         let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
         let (seg_id, offset) = unpack_location(location);
-        let raw = self.segments.get_item_at(NonZeroU32::new(seg_id), offset)?;
+        let seg_id = NonZeroU32::new(seg_id)?;
+        let raw = self.segments.get_item_at(Some(seg_id), offset)?;
         raw.check_magic();
 
-        // Use the location's raw value (truncated) as the CAS token
-        let cas = location.as_raw() as u32;
+        let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
         Some(Item::new(raw, cas))
     }
 
@@ -102,10 +102,11 @@ impl Segcache {
         let verifier = self.verifier();
         let (location, _freq) = self.hashtable.lookup_no_freq_update(key, &verifier)?;
         let (seg_id, offset) = unpack_location(location);
-        let raw = self.segments.get_item_at(NonZeroU32::new(seg_id), offset)?;
+        let seg_id = NonZeroU32::new(seg_id)?;
+        let raw = self.segments.get_item_at(Some(seg_id), offset)?;
         raw.check_magic();
 
-        let cas = location.as_raw() as u32;
+        let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
         Some(Item::new(raw, cas))
     }
 
@@ -298,7 +299,7 @@ impl Segcache {
         value: T,
         optional: Option<&[u8]>,
         ttl: std::time::Duration,
-        cas: u32,
+        cas: u64,
     ) -> Result<(), SegcacheError> {
         // Look up the current item to check its CAS token
         let verifier = self.verifier();
@@ -307,7 +308,9 @@ impl Segcache {
             .lookup_no_freq_update(key, &verifier)
             .ok_or(SegcacheError::NotFound)?;
 
-        let current_cas = location.as_raw() as u32;
+        let (seg_id, _offset) = unpack_location(location);
+        let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
+        let current_cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
         if current_cas != cas {
             return Err(SegcacheError::Exists);
         }
@@ -418,11 +421,12 @@ impl Segcache {
             .lookup(key, &verifier)
             .ok_or(SegcacheError::NotFound)?;
         let (seg_id, offset) = unpack_location(location);
+        let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
         let raw = self
             .segments
-            .get_item_at(NonZeroU32::new(seg_id), offset)
+            .get_item_at(Some(seg_id), offset)
             .ok_or(SegcacheError::NotFound)?;
-        let cas = location.as_raw() as u32;
+        let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
         let mut item = Item::new(raw, cas);
         item.wrapping_add(rhs)?;
         Ok(item)
@@ -438,11 +442,12 @@ impl Segcache {
             .lookup(key, &verifier)
             .ok_or(SegcacheError::NotFound)?;
         let (seg_id, offset) = unpack_location(location);
+        let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
         let raw = self
             .segments
-            .get_item_at(NonZeroU32::new(seg_id), offset)
+            .get_item_at(Some(seg_id), offset)
             .ok_or(SegcacheError::NotFound)?;
-        let cas = location.as_raw() as u32;
+        let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
         let mut item = Item::new(raw, cas);
         item.saturating_sub(rhs)?;
         Ok(item)
