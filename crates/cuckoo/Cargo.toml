@@ -1,6 +1,6 @@
 [package]
 name = "cuckoo-cache"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cuckoo hash based cache storage engine with fixed-size item slots"
 authors = ["Pelikan Cache contributors"]
 
