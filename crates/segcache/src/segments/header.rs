@@ -12,10 +12,10 @@
 //! │   PREV SEG   │   NEXT SEG   │  CREATE AT   │  MERGE AT    │
 //! │  AtomicU32   │  AtomicU32   │ AtomicInstant│ AtomicInstant│
 //! │    32 bit    │    32 bit    │    32 bit    │    32 bit    │
-//! ├──────────────┼──┬──┬──────┬─┴──────────────┴──────────────┤
-//! │     TTL      │ST│PL│ GEN  │            PADDING            │
-//! │  AtomicU32   │8b│8b│ 16b  │            64 bit             │
-//! ├──────────────┴──┴──┴──────┴───────────────────────────────┤
+//! ├──────────────┼──┬──┬──────┬─┴────────────┬─┴──────────────┤
+//! │     TTL      │ST│PL│ GEN  │  REF COUNT   │    PADDING     │
+//! │  AtomicU32   │8b│8b│ 16b  │  AtomicU32   │     32 bit     │
+//! ├──────────────┴──┴──┴──────┴──────────────┴────────────────┤
 //! │                        PADDING                            │
 //! │                       128 bit                             │
 //! └───────────────────────────────────────────────────────────┘
@@ -96,7 +96,8 @@ impl SegmentPool {
 /// 36       1    state         (AtomicU8, SegmentState)
 /// 37       1    pool          (AtomicU8, SegmentPool)
 /// 38       2    generation    (AtomicU16, bumped on recycle)
-/// 40      24    _pad
+/// 40       4    ref_count     (AtomicU32, active readers)
+/// 44      20    _pad
 /// ```
 #[repr(C, align(64))]
 pub(crate) struct SegmentHeader {
@@ -112,7 +113,8 @@ pub(crate) struct SegmentHeader {
     state: AtomicU8,
     pool: AtomicU8,
     generation: AtomicU16,
-    _pad: [u8; 24],
+    ref_count: AtomicU32,
+    _pad: [u8; 20],
 }
 
 // Loom atomics are larger than std atomics, so skip size check under loom.
@@ -137,7 +139,8 @@ impl SegmentHeader {
             state: AtomicU8::new(SegmentState::Free as u8),
             pool: AtomicU8::new(SegmentPool::Main as u8),
             generation: AtomicU16::new(0),
-            _pad: [0; 24],
+            ref_count: AtomicU32::new(0),
+            _pad: [0; 20],
         }
     }
 
@@ -180,6 +183,58 @@ impl SegmentHeader {
     #[inline]
     pub fn generation(&self) -> u16 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    // -- Reader pinning --
+
+    /// Try to pin this segment for reading, using a two-phase protocol:
+    /// check the state, increment the reader count, then re-check the
+    /// state. If the segment became inaccessible between the first check
+    /// and the increment, back out and fail.
+    ///
+    /// While the reader count is non-zero the segment must not be
+    /// recycled, merged, or compacted. Every successful acquire must be
+    /// paired with exactly one [`Self::release_reader`].
+    ///
+    /// Uses explicit `Acquire` loads on the state (rather than the
+    /// `Relaxed` loads in [`Self::accessible`]) so the protocol is sound
+    /// once concurrent writers exist.
+    #[inline]
+    pub fn try_acquire_reader(&self) -> bool {
+        let readable = |s: u8| {
+            matches!(
+                SegmentState::from_u8(s),
+                SegmentState::Filling | SegmentState::Active
+            )
+        };
+
+        if !readable(self.state.load(Ordering::Acquire)) {
+            return false;
+        }
+
+        self.ref_count.fetch_add(1, Ordering::Acquire);
+
+        // Re-check after the increment: a writer that observed
+        // ref_count == 0 may have transitioned the state concurrently.
+        if !readable(self.state.load(Ordering::Acquire)) {
+            self.ref_count.fetch_sub(1, Ordering::Release);
+            return false;
+        }
+
+        true
+    }
+
+    /// Release a reader pin taken with [`Self::try_acquire_reader`].
+    #[inline]
+    pub fn release_reader(&self) {
+        let prev = self.ref_count.fetch_sub(1, Ordering::Release);
+        debug_assert!(prev > 0, "release_reader without matching acquire");
+    }
+
+    /// Number of active readers pinning this segment.
+    #[inline]
+    pub fn ref_count(&self) -> u32 {
+        self.ref_count.load(Ordering::Acquire)
     }
 
     // -- Identity --
@@ -364,10 +419,11 @@ impl SegmentHeader {
     }
 
     /// Check if the segment can actually be evicted.
-    /// Requires: Active state and has a next segment (not the current write target).
+    /// Requires: Active state, has a next segment (not the current write
+    /// target), and no readers pinning it.
     #[inline]
     pub fn can_evict(&self) -> bool {
-        self.evictable() && self.next_seg().is_some()
+        self.evictable() && self.next_seg().is_some() && self.ref_count() == 0
     }
 
     // -- Pool --
@@ -396,5 +452,83 @@ impl std::fmt::Debug for SegmentHeader {
             .field("next_seg", &self.next_seg())
             .field("ttl", &self.ttl())
             .finish()
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use core::num::NonZeroU32;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    // Two readers race a writer that mirrors the production eviction gate
+    // (check ref_count == 0 and evictable, then store Draining). The store
+    // is not a CAS because production writers run under `&mut Segments`
+    // exclusivity today; there is a benign interleaving where a reader
+    // passes its re-check just before the writer's store, which is only
+    // safe because of that exclusivity. The AwaitingRelease state-machine
+    // port must replace the plain store with a CAS transition
+    // (Active -> Draining only if ref_count == 0) before real concurrent
+    // writers exist, at which point this model gains strong assertions.
+    #[test]
+    fn loom_two_readers_one_writer_refcount() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            header.set_state(SegmentState::Active);
+
+            let readers: Vec<_> = (0..2)
+                .map(|_| {
+                    let h = Arc::clone(&header);
+                    thread::spawn(move || {
+                        if h.try_acquire_reader() {
+                            // simulate a read while pinned
+                            let _ = h.state();
+                            h.release_reader();
+                        }
+                    })
+                })
+                .collect();
+
+            let writer = {
+                let h = Arc::clone(&header);
+                thread::spawn(move || {
+                    // mirrors can_evict() + drain in production
+                    if h.ref_count() == 0 && h.evictable() {
+                        h.set_state(SegmentState::Draining);
+                    }
+                })
+            };
+
+            for r in readers {
+                r.join().unwrap();
+            }
+            writer.join().unwrap();
+
+            // all pins released; state is one of the two valid outcomes
+            assert_eq!(header.ref_count(), 0);
+            assert!(matches!(
+                header.state(),
+                SegmentState::Active | SegmentState::Draining
+            ));
+        });
+    }
+
+    // Once a segment is Draining, acquisition must fail in every
+    // interleaving, and a failed acquire must leave no pin behind.
+    #[test]
+    fn loom_acquire_fails_after_drain() {
+        loom::model(|| {
+            let header = Arc::new(SegmentHeader::new(NonZeroU32::new(1).unwrap()));
+            header.set_state(SegmentState::Draining);
+
+            let h = Arc::clone(&header);
+            let reader = thread::spawn(move || h.try_acquire_reader());
+
+            assert!(!reader.join().unwrap());
+            assert_eq!(header.ref_count(), 0);
+        });
     }
 }

@@ -2,6 +2,7 @@
 
 mod builder;
 mod error;
+mod guard;
 mod header;
 mod segment;
 #[allow(clippy::module_inception)]
@@ -9,6 +10,9 @@ mod segments;
 
 pub(crate) use builder::SegmentsBuilder;
 pub(crate) use error::SegmentsError;
+pub(crate) use guard::SegmentGuard;
+#[cfg(test)]
+pub(crate) use header::SegmentState;
 pub(crate) use header::{SegmentHeader, SegmentPool};
 pub(crate) use segment::Segment;
 pub(crate) use segments::Segments;

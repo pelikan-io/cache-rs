@@ -82,11 +82,11 @@ impl Segcache {
         let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
         let (seg_id, offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id)?;
-        let raw = self.segments.get_item_at(Some(seg_id), offset)?;
+        let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
         raw.check_magic();
 
         let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
-        Some(Item::new(raw, cas))
+        Some(Item::new(raw, cas, guard))
     }
 
     /// Get the item in the `Segcache` with the provided key without
@@ -103,11 +103,11 @@ impl Segcache {
         let (location, _freq) = self.hashtable.lookup_no_freq_update(key, &verifier)?;
         let (seg_id, offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id)?;
-        let raw = self.segments.get_item_at(Some(seg_id), offset)?;
+        let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
         raw.check_magic();
 
         let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
-        Some(Item::new(raw, cas))
+        Some(Item::new(raw, cas, guard))
     }
 
     /// Insert a new item into the cache. May return an error indicating that
@@ -422,12 +422,12 @@ impl Segcache {
             .ok_or(SegcacheError::NotFound)?;
         let (seg_id, offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
-        let raw = self
+        let (raw, guard) = self
             .segments
-            .get_item_at(Some(seg_id), offset)
+            .acquire_item_at(seg_id, offset)
             .ok_or(SegcacheError::NotFound)?;
         let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
-        let mut item = Item::new(raw, cas);
+        let mut item = Item::new(raw, cas, guard);
         item.wrapping_add(rhs)?;
         Ok(item)
     }
@@ -443,12 +443,12 @@ impl Segcache {
             .ok_or(SegcacheError::NotFound)?;
         let (seg_id, offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
-        let raw = self
+        let (raw, guard) = self
             .segments
-            .get_item_at(Some(seg_id), offset)
+            .acquire_item_at(seg_id, offset)
             .ok_or(SegcacheError::NotFound)?;
         let cas = CasToken::new(location, self.segments.generation(seg_id)).as_raw();
-        let mut item = Item::new(raw, cas);
+        let mut item = Item::new(raw, cas, guard);
         item.saturating_sub(rhs)?;
         Ok(item)
     }

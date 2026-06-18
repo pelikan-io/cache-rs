@@ -43,6 +43,13 @@ pub static SEGMENT_EVICT: Counter = Counter::new();
 pub static SEGMENT_EVICT_EX: Counter = Counter::new();
 
 #[metric(
+    name = "segment_pinned_skip",
+    description = "number of times a segment could not be evicted or reclaimed because readers pinned it",
+    metadata = { engine = "segcache" }
+)]
+pub static SEGMENT_PINNED_SKIP: Counter = Counter::new();
+
+#[metric(
     name = "segment_return",
     description = "total number of segments returned to the free pool",
     metadata = { engine = "segcache" }

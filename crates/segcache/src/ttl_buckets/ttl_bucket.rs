@@ -74,33 +74,40 @@ impl TtlBucket {
 
     /// Expire segments whose TTL has elapsed.
     ///
-    /// Walks the chain from head, clearing and freeing segments whose
-    /// `create_at + ttl <= now`. Returns the number of segments expired.
+    /// Walks the chain from head, draining segments whose
+    /// `create_at + ttl <= now` and freeing the unpinned ones. A segment
+    /// pinned by readers is drained from the hashtable but stays linked
+    /// in the chain; a later `expire()` or `clear()` pass reclaims it
+    /// once the pins drop (`Segment::clear` is idempotent). Returns the
+    /// number of segments actually freed.
     pub(super) fn expire(
         &mut self,
         hashtable: &MultiChoiceHashtable,
         segments: &mut Segments,
     ) -> usize {
-        if self.head.is_none() {
-            return 0;
-        }
-
         let mut expired = 0;
         let now = Instant::now();
+        let mut cursor = self.head;
 
-        loop {
-            let seg_id = match self.head {
-                Some(id) => id,
-                None => return expired,
-            };
-
+        while let Some(seg_id) = cursor {
             let mut segment = segments.get_mut(seg_id).unwrap();
-            if segment.create_at() + segment.ttl() <= now {
-                self.head = segment.next_seg();
-                if self.head.is_none() {
-                    self.tail = None;
+            // the chain is oldest-first: stop at the first live segment
+            if segment.create_at() + segment.ttl() > now {
+                break;
+            }
+            let next = segment.next_seg();
+            let prev = segment.prev_seg();
+
+            segment.clear(hashtable, true);
+
+            if segment.ref_count() == 0 {
+                if self.head == Some(seg_id) {
+                    self.head = next;
                 }
-                segment.clear(hashtable, true);
+                if self.tail == Some(seg_id) {
+                    self.tail = prev;
+                }
+                // push_free unlinks the segment, splicing its neighbors
                 segments.push_free(seg_id);
 
                 #[cfg(feature = "metrics")]
@@ -108,42 +115,57 @@ impl TtlBucket {
 
                 expired += 1;
             } else {
-                return expired;
+                #[cfg(feature = "metrics")]
+                SEGMENT_PINNED_SKIP.increment();
             }
+
+            cursor = next;
         }
+
+        expired
     }
 
-    /// Clear all segments in this bucket. Returns the count cleared.
+    /// Clear all segments in this bucket, draining every one from the
+    /// hashtable and freeing those not pinned by readers. Pinned segments
+    /// stay linked and are reclaimed by a later pass once the pins drop.
+    /// Returns the number of segments actually freed.
     pub(super) fn clear(
         &mut self,
         hashtable: &MultiChoiceHashtable,
         segments: &mut Segments,
     ) -> usize {
-        if self.head.is_none() {
-            return 0;
-        }
-
         let mut cleared = 0;
+        let mut cursor = self.head;
 
-        loop {
-            let seg_id = match self.head {
-                Some(id) => id,
-                None => return cleared,
-            };
-
+        while let Some(seg_id) = cursor {
             let mut segment = segments.get_mut(seg_id).unwrap();
-            self.head = segment.next_seg();
-            if self.head.is_none() {
-                self.tail = None;
-            }
+            let next = segment.next_seg();
+            let prev = segment.prev_seg();
+
             segment.clear(hashtable, true);
-            segments.push_free(seg_id);
 
-            #[cfg(feature = "metrics")]
-            SEGMENT_CLEAR.increment();
+            if segment.ref_count() == 0 {
+                if self.head == Some(seg_id) {
+                    self.head = next;
+                }
+                if self.tail == Some(seg_id) {
+                    self.tail = prev;
+                }
+                segments.push_free(seg_id);
 
-            cleared += 1;
+                #[cfg(feature = "metrics")]
+                SEGMENT_CLEAR.increment();
+
+                cleared += 1;
+            } else {
+                #[cfg(feature = "metrics")]
+                SEGMENT_PINNED_SKIP.increment();
+            }
+
+            cursor = next;
         }
+
+        cleared
     }
 
     /// Allocate a new segment and link it as the tail of this bucket.
@@ -196,13 +218,16 @@ impl TtlBucket {
         loop {
             if let Some(id) = self.tail {
                 if let Ok(segment) = segments.get_mut(id) {
-                    if !segment.accessible() {
-                        continue;
-                    }
-                    let offset = segment.write_offset() as usize;
-                    if offset + size <= seg_size {
-                        let item = segment.alloc_item(size as i32);
-                        return Ok(ReservedItem::new(item, segment.id(), offset));
+                    // An inaccessible tail (e.g. drained while pinned by a
+                    // reader) falls through to expansion: a fresh segment
+                    // is linked after it. Spinning here would never make
+                    // the tail accessible again.
+                    if segment.accessible() {
+                        let offset = segment.write_offset() as usize;
+                        if offset + size <= seg_size {
+                            let item = segment.alloc_item(size as i32);
+                            return Ok(ReservedItem::new(item, segment.id(), offset));
+                        }
                     }
                 }
             }

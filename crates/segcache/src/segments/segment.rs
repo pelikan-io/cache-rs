@@ -176,6 +176,11 @@ impl<'a> Segment<'a> {
     }
 
     #[inline]
+    pub fn ref_count(&self) -> u32 {
+        self.header.ref_count()
+    }
+
+    #[inline]
     pub fn ttl(&self) -> Duration {
         self.header.ttl()
     }

@@ -2,20 +2,30 @@
 
 mod reserved;
 
+use crate::segments::SegmentGuard;
 use crate::SegcacheError;
 use keyvalue::{RawItem, Value};
 
 pub(crate) use reserved::ReservedItem;
 
 /// The base unit of data returned by a cache lookup.
+///
+/// An `Item` pins the segment it points into: while it is alive, that
+/// segment cannot be recycled, merged, or compacted, so the key and
+/// value bytes it exposes remain stable.
 pub struct Item {
     cas: u64,
     raw: RawItem,
+    _guard: SegmentGuard,
 }
 
 impl Item {
-    pub(crate) fn new(raw: RawItem, cas: u64) -> Self {
-        Item { cas, raw }
+    pub(crate) fn new(raw: RawItem, cas: u64, guard: SegmentGuard) -> Self {
+        Item {
+            cas,
+            raw,
+            _guard: guard,
+        }
     }
 
     #[allow(dead_code)]
