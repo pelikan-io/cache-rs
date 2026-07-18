@@ -760,7 +760,7 @@ impl Segments {
                     let ttl_bucket = &mut ttl_buckets.buckets[bucket_id];
                     if let Some(first_seg) = ttl_bucket.head() {
                         let start = ttl_bucket.next_to_merge().unwrap_or(first_seg);
-                        match self.merge_evict(start, hashtable) {
+                        match self.merge_evict(start, ttl_bucket, hashtable) {
                             Ok(next_to_merge) => {
                                 debug!("merged ttl_bucket: {bucket_id} seg: {start}");
                                 ttl_bucket.set_next_to_merge(next_to_merge);
@@ -1049,24 +1049,53 @@ impl Segments {
     }
 
     /// Merge a chain of segments starting at `start`, pruning low-frequency
-    /// items and copying survivors into the first segment. Returns the next
-    /// segment id to merge from (if any).
+    /// items and copying the survivors into a fresh spare segment. The spare
+    /// is reserved from the held-back spare queue and head-inserted into
+    /// `ttl_bucket` exactly once; every candidate's survivors are appended to
+    /// it (reader-safe — bytes are never relocated in place) and the candidate
+    /// is then drained via `clear_segment`. Returns the next segment id to
+    /// merge from (if any).
     fn merge_evict(
         &mut self,
         start: NonZeroU32,
+        ttl_bucket: &mut TtlBucket,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<Option<NonZeroU32>, SegmentsError> {
         #[cfg(feature = "metrics")]
         SEGMENT_MERGE.increment();
 
-        let dst_id = start;
         let chain_len = self.merge_evict_chain_len(start);
 
         if chain_len < 3 {
             return Err(SegmentsError::NoEvictableSegments);
         }
 
-        let mut next_id = self.get_mut(start).map(|s| s.next_seg())?;
+        // Reserve the copy destination. At "full" this comes from the
+        // held-back spare; if even that is empty, degrade gracefully to
+        // dropping the head candidate whole rather than compacting a
+        // readable segment in place.
+        let spare_id = match self.reserve_spare() {
+            Some(id) => id,
+            None => return self.merge_evict_fallback_drop(start, ttl_bucket, hashtable),
+        };
+
+        // Configure the spare and head-insert it as Sealed exactly ONCE:
+        // readable and evictable immediately, but never the write tail (the
+        // tail is Live). Because the spare is never drained, the bucket head
+        // points at it for the entire candidate loop below — draining a
+        // candidate only unlinks it from the middle of the chain (its
+        // neighbours are patched by clear_segment's recycle/condemn), so no
+        // per-candidate head fixup is required here.
+        let src_ttl = self.headers[start.get() as usize - 1].ttl();
+        {
+            let sidx = spare_id.get() as usize - 1;
+            self.headers[sidx].set_ttl(src_ttl);
+            self.headers[sidx].set_pool(SegmentPool::Main);
+            self.headers[sidx].mark_merged();
+        }
+        let old_head = ttl_bucket.head();
+        self.link_at_head(spare_id, old_head);
+        ttl_bucket.set_head(Some(spare_id));
 
         // Merge state.
         let mut cutoff = 1.0;
@@ -1085,120 +1114,92 @@ impl Segments {
             self.evict.target_ratio()
         };
 
-        // Prune and compact the destination segment.
-        {
-            let mut dst = self.get_mut(start)?;
-            let dst_old_size = dst.live_bytes();
-
-            trace!("prune merge with cutoff: {cutoff}");
-            cutoff = dst.prune(hashtable, cutoff, target_ratio);
-            trace!("cutoff is now: {cutoff}");
-
-            // SCOPE: the destination stays Sealed (readable) during this
-            // in-place compaction, which is incompatible with concurrent
-            // readers — sound today only because reads and eviction are
-            // serialized by &mut. The eviction drain-protocol work
-            // (roadmap item 5) replaces in-place compaction; do not
-            // attempt to fix it here.
-            dst.compact(hashtable)?;
-
-            let dst_new_size = dst.live_bytes();
-            trace!("dst {dst_id}: {dst_old_size} bytes -> {dst_new_size} bytes");
-
-            dst.mark_merged();
-            merged += 1;
-        }
-
-        // Walk the chain, pruning source segments and copying survivors into
-        // the destination.
-        while let Some(src_id) = next_id {
+        // Walk the chain, pruning each candidate and copying its survivors
+        // into the spare, then draining the candidate.
+        let mut next_id = Some(start);
+        while let Some(cand_id) = next_id {
             if merged > max_merge {
                 trace!("stop merge: merged max segments");
                 break;
             }
 
-            if !self.get_mut(src_id).map(|s| s.can_evict()).unwrap_or(false) {
-                trace!("stop merge: can't evict source segment");
-                return Ok(None);
-            }
-
-            // Take exclusivity of the source before moving any bytes out
-            // of it (SeqCst: Dekker pair with try_acquire_reader), then
-            // re-check the reader count. A pin that raced in between the
-            // can_evict gate and the CAS must abort the merge before
-            // copy_into relocates data a reader is looking at — revert
-            // to Sealed and stop the pass (a port-local transition;
-            // crucible's merge runs behind Relinking machinery we have
-            // not ported).
-            {
-                let src_hdr = &self.headers[src_id.get() as usize - 1];
-                if !src_hdr.cas_metadata(
-                    State::Sealed,
-                    State::Draining,
-                    None,
-                    None,
-                    Ordering::SeqCst,
-                ) {
-                    trace!("stop merge: source not sealed");
-                    return Ok(None);
-                }
-                if src_hdr.ref_count_seqcst() != 0 {
-                    let reverted = src_hdr.cas_metadata(
-                        State::Draining,
-                        State::Sealed,
-                        None,
-                        None,
-                        Ordering::AcqRel,
-                    );
-                    debug_assert!(reverted);
-                    trace!("stop merge: source pinned by readers");
-                    #[cfg(feature = "metrics")]
-                    SEGMENT_PINNED_SKIP.increment();
-                    return Ok(None);
-                }
-            }
-
-            let (mut dst, mut src) = self.get_mut_pair(dst_id, src_id)?;
-
-            let dst_start_size = dst.live_bytes();
-            let src_start_size = src.live_bytes();
-
-            if dst_start_size >= stop_bytes {
-                trace!("stop merge: target segment is full");
-                let reverted =
-                    src.cas_metadata(State::Draining, State::Sealed, None, None, Ordering::AcqRel);
-                debug_assert!(reverted);
+            // Stop once the spare reaches the high-watermark occupancy.
+            if self.headers[spare_id.get() as usize - 1].live_bytes() >= stop_bytes {
+                trace!("stop merge: spare segment is full");
                 break;
             }
 
-            trace!("pruning source segment");
-            cutoff = src.prune(hashtable, cutoff, target_ratio);
+            if !self
+                .get_mut(cand_id)
+                .map(|s| s.can_evict())
+                .unwrap_or(false)
+            {
+                trace!("stop merge: can't evict candidate segment");
+                break;
+            }
 
-            trace!(
-                "src {}: {} bytes -> {} bytes",
-                src_id,
-                src_start_size,
-                src.live_bytes()
-            );
+            // Advance the chain pointer BEFORE draining the candidate: once
+            // clear_segment recycles it, its links are reset and reading
+            // next_seg() would observe a stale/reused segment.
+            next_id = self.headers[cand_id.get() as usize - 1].next_seg();
 
-            trace!("copying source into target");
-            let _ = src.copy_into(&mut dst, hashtable);
-            trace!("copy dropped {} bytes", src.live_bytes());
+            // Prune low-frequency items (marks them deleted — moves no
+            // bytes), then copy the survivors into the spare. copy_into
+            // appends past the spare's write-offset and republishes each
+            // survivor via the hashtable's Release-CAS, so no readable
+            // segment's live bytes are ever moved in place.
+            {
+                let mut cand = self.get_mut(cand_id)?;
+                let cand_old_size = cand.live_bytes();
+                cutoff = cand.prune(hashtable, cutoff, target_ratio);
+                trace!(
+                    "cand {cand_id}: {cand_old_size} bytes -> {} bytes after prune",
+                    cand.live_bytes()
+                );
+            }
+            {
+                let (mut cand, mut spare) = self.get_mut_pair(cand_id, spare_id)?;
+                let _ = cand.copy_into(&mut spare, hashtable);
+            }
 
-            trace!(
-                "dst {}: {} bytes -> {} bytes",
-                dst_id,
-                dst_start_size,
-                dst.live_bytes()
-            );
-
-            next_id = src.next_seg();
-            src.clear(hashtable, false);
-            self.recycle(src_id);
+            // Drain the candidate (Sealed->Draining + ref_count recheck +
+            // condemn-if-pinned). An unpinned candidate is recycled — which
+            // replenishes the spare via return_segment; a pinned candidate is
+            // condemned to its last reader. Either way it leaves the chain,
+            // and clear_segment's unlink patches the neighbours, so the spare
+            // remains the bucket head.
+            match self.clear_segment(cand_id, hashtable, false) {
+                Ok(_outcome) => {}
+                Err(()) => break,
+            }
             merged += 1;
         }
 
         Ok(next_id)
+    }
+
+    /// Graceful degradation when no spare is available: drop the chain head
+    /// whole via the drain machinery, freeing one segment (which also
+    /// replenishes the spare via `return_segment` on the next unpinned
+    /// recycle). No spare was head-inserted, so this path DOES fix the bucket
+    /// head when the dropped segment was itself the head.
+    fn merge_evict_fallback_drop(
+        &mut self,
+        start: NonZeroU32,
+        ttl_bucket: &mut TtlBucket,
+        hashtable: &MultiChoiceHashtable,
+    ) -> Result<Option<NonZeroU32>, SegmentsError> {
+        let meta = self.headers[start.get() as usize - 1].metadata(Ordering::Acquire);
+        let next = meta.next;
+        match self.clear_segment(start, hashtable, false) {
+            Ok(ClearOutcome::Freed) => {
+                if meta.prev.is_none() {
+                    ttl_bucket.set_head(next);
+                }
+                Ok(next)
+            }
+            _ => Err(SegmentsError::NoEvictableSegments),
+        }
     }
 
     /// Merge-compact a chain of segments without pruning. Combines segments

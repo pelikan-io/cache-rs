@@ -1068,6 +1068,165 @@ fn evict_expires_before_merging() {
     let _ = crate::metrics::SEGMENT_MERGE.value();
 }
 
+// Roadmap item 5b, §1: the Merge policy evicts by copying survivors into a
+// fresh spare segment (reader-safe, append-only) and draining every
+// candidate — it never compacts a readable segment in place. This test
+// forces a single merge pass over a full segment chain and checks:
+//   (a) the bucket head becomes the reserved spare segment, Sealed and
+//       holding the copied survivors;
+//   (b) the candidate segments were freed and nothing leaked (available +
+//       readable == total);
+//   (c) high-frequency items survive the merge and are served from their
+//       relocated copies in the spare.
+//
+// Uses the Task-1 spare accessors (`free`, `free_only`, `spare_count`),
+// which are compiled only outside the `loom` feature.
+#[test]
+#[cfg(not(feature = "loom"))]
+fn merge_evict_copies_survivors_into_spare() {
+    const ITEMS_PER_SEGMENT: usize = 64;
+    const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
+    let value: &[u8] = b"v";
+    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(value), 0);
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    // 1 held-back spare (Merge policy) + 5 normal free segments.
+    let free_segments = 5usize;
+    let total_segments = free_segments + 1;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(segment_size as usize * total_segments)
+        .hash_power(16)
+        .eviction(Policy::Merge {
+            max: 8,
+            merge: 4,
+            compact: 0,
+        })
+        .build()
+        .expect("failed to create cache");
+
+    assert_eq!(cache.segments.free_only(), free_segments);
+    assert_eq!(cache.segments.spare_count(), 1);
+
+    // Long TTL: items never expire during the test, so evict() falls
+    // through the expire-first fast path into the actual merge.
+    let ttl = Duration::from_secs(3600);
+
+    // Fill every normal free segment exactly full; all share one TTL bucket
+    // (the chain merge walks). The last one stays the Live write tail.
+    let fill_count = ITEMS_PER_SEGMENT * free_segments;
+    let mut keys = Vec::with_capacity(fill_count);
+    for i in 0..fill_count {
+        let key = format!("k{i:06}");
+        assert_eq!(key.len(), KEY_LEN, "key width must stay fixed-size");
+        cache
+            .insert(key.as_bytes(), value, None, ttl)
+            .expect("fill inserts must succeed without needing eviction");
+        keys.push(key);
+    }
+    assert_eq!(
+        cache.segments.free_only(),
+        0,
+        "fill must exactly exhaust the free queue"
+    );
+
+    // Bump the frequency of a few keys from the first candidate segment so
+    // prune keeps them: high-frequency items are the survivors copied into
+    // the spare. get() returns a pinned Item, so each lookup is dropped at
+    // the end of its statement — no candidate stays pinned during the merge.
+    let hot: Vec<String> = keys.iter().take(3).cloned().collect();
+    for _ in 0..40 {
+        for k in &hot {
+            assert!(cache.get(k.as_bytes()).is_some());
+        }
+    }
+
+    let items_before = cache.items();
+    let free_before = cache.segments.free(); // free_only(0) + spare(1)
+    assert_eq!(free_before, 1, "only the held-back spare is available");
+
+    // The spare seeded at construction is segment id 1 (idx 0 < spare
+    // capacity); reserve_free handed out ids 2.. for the fill, leaving id 1
+    // in the spare queue for merge to reserve as the copy destination.
+    let spare_id = NonZeroU32::new(1).unwrap();
+
+    // Drive exactly one eviction pass. With a single occupied bucket the
+    // policy's random start still finds it (evict scans every bucket).
+    cache
+        .segments
+        .evict(&mut cache.ttl_buckets, &cache.hashtable)
+        .expect("merge eviction must succeed on a full 5-segment chain");
+
+    // (a) The bucket head is now the spare segment, Sealed and holding the
+    // copied survivors.
+    let seg_ttl = cache.segments.header(spare_id).ttl();
+    let head = cache.ttl_buckets.get_mut_bucket(seg_ttl).head();
+    assert_eq!(head, Some(spare_id), "merge must head-insert the spare");
+    {
+        let spare = cache.segments.get_mut(spare_id).unwrap();
+        assert_eq!(spare.state(), State::Sealed);
+        assert!(spare.live_items() > 0, "spare must hold copied survivors");
+    }
+
+    // (b) Candidates were drained and nothing leaked. Every candidate that
+    // clear_segment recycles becomes Free and is pushed back to a queue
+    // (spare first, then free), so the count of Free segments equals the
+    // number of drained candidates equals the available depth. At least one
+    // candidate must have been drained, and every segment must be accounted
+    // for as either available or in a readable chain (no pins are held, so
+    // there are no condemned segments).
+    let free_after = cache.segments.free();
+    assert!(free_after >= free_before, "availability must not shrink");
+    let freed = (1..=total_segments as u32)
+        .filter(|&id| {
+            cache
+                .segments
+                .get_mut(NonZeroU32::new(id).unwrap())
+                .unwrap()
+                .state()
+                == State::Free
+        })
+        .count();
+    assert!(freed >= 1, "merge must have drained at least one candidate");
+    assert_eq!(
+        free_after, freed,
+        "available depth must equal the number of drained (Free) candidates"
+    );
+    let readable = (1..=total_segments as u32)
+        .filter(|&id| {
+            cache
+                .segments
+                .get_mut(NonZeroU32::new(id).unwrap())
+                .unwrap()
+                .state()
+                .is_readable()
+        })
+        .count();
+    assert_eq!(
+        free_after + readable,
+        total_segments,
+        "no leak: available + readable segments must account for the whole pool"
+    );
+
+    // (c) High-frequency items survived and are served from their relocated
+    // copies in the spare.
+    for k in &hot {
+        let item = cache
+            .get(k.as_bytes())
+            .unwrap_or_else(|| panic!("hot key {k} must survive the merge"));
+        assert_eq!(item.value(), b"v");
+    }
+
+    // The merge pruned low-frequency items: not every original item can
+    // remain (the chain held far more than one spare's worth of survivors).
+    assert!(
+        cache.items() < items_before,
+        "merge must have pruned low-frequency items"
+    );
+}
+
 #[test]
 fn clear() {
     let ttl = Duration::ZERO;
