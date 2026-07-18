@@ -731,6 +731,13 @@ impl Segments {
         ttl_buckets: &mut TtlBuckets,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
+        // Cheap path first: drop whole expired segments (no spare, no
+        // copy). If any segment frees, a subsequent reserve_free will now
+        // succeed, and the spare-consuming merge is skipped entirely.
+        if ttl_buckets.expire(hashtable, self) > 0 {
+            return Ok(());
+        }
+
         #[cfg(feature = "metrics")]
         let now = Instant::now();
 

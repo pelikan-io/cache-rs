@@ -940,6 +940,134 @@ fn expiration() {
     assert_eq!(cache.segments.free(), segments);
 }
 
+// Roadmap item 5b, §3: `evict()` must attempt whole-segment expiration
+// BEFORE running the spare-consuming Merge eviction. If expiration alone
+// frees a segment, merge must not run at all.
+//
+// Distinguishing signal: Merge's prune step scores items by frequency and
+// keeps a target *ratio* of survivors even when every item has the same
+// (zero) frequency — so if merge runs on a bucket whose items are all
+// past their TTL, some previously-inserted keys will still be readable
+// afterward and `cache.items()` will be > 1. Whole-segment expiration, by
+// contrast, drops the entire chain unconditionally: every previously
+// inserted key becomes `None` and only the newly inserted trigger item
+// remains. This is process-local and deterministic (unlike the shared
+// `SEGMENT_MERGE` counter, which other tests running in parallel can also
+// increment).
+//
+// Uses `Segments::free_only`, which (like the rest of the Task-1 spare
+// accessors) is only compiled outside the `loom` feature.
+#[test]
+#[cfg(not(feature = "loom"))]
+fn evict_expires_before_merging() {
+    // Fixed-width key + fixed value so every insert consumes exactly the
+    // same number of bytes. `keyvalue::item_size` is the same size
+    // formula `reserve_and_define` uses internally, computed here at
+    // runtime so the test is correct regardless of ITEM_HDR_SIZE (i.e.
+    // under both the default and `integrity`/`debug` feature builds).
+    const ITEMS_PER_SEGMENT: usize = 6;
+    const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
+    let value: &[u8] = b"payload-bytes-value";
+    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(value), 0);
+    // Under this crate's own `integrity` feature (enabled by `debug`),
+    // `Segment::init` writes an 8-byte SEG_MAGIC canary at the start of
+    // every segment's data region, shrinking the usable capacity. Fold
+    // that into the segment size so ITEMS_PER_SEGMENT items fit exactly
+    // regardless of feature flags.
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    // 1 held-back spare (Merge policy) + 5 free. Filling all 5 free
+    // segments exactly (no partial last segment) forms a chain long
+    // enough (chain_len >= 3) that a merge, if it ran, would actually
+    // execute rather than bailing out on a too-short chain.
+    let free_segments = 5usize;
+    let total_segments = free_segments + 1; // + spare
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(segment_size as usize * total_segments)
+        .hash_power(16)
+        .eviction(Policy::Merge {
+            max: 8,
+            merge: 4,
+            compact: 0,
+        })
+        .build()
+        .expect("failed to create cache");
+
+    assert_eq!(
+        cache.segments.free_only(),
+        free_segments,
+        "sanity: Merge policy must hold back exactly one spare"
+    );
+
+    // All inserts share one short TTL so they land in a single TTL
+    // bucket's segment chain -- the same chain merge would walk.
+    let ttl = Duration::from_secs(1);
+
+    // Fill every normal (non-spare) free segment exactly full with
+    // short-TTL items. Because segment_size is an exact multiple of
+    // item_size, the last segment ends precisely full too -- eviction is
+    // not needed (and must not run) during this fill.
+    let fill_count = ITEMS_PER_SEGMENT * free_segments;
+    let mut inserted = Vec::with_capacity(fill_count);
+    for i in 0..fill_count {
+        let key = format!("k{i:06}");
+        assert_eq!(key.len(), KEY_LEN, "key width must stay fixed-size");
+        cache
+            .insert(key.as_bytes(), value, None, ttl)
+            .expect("fill inserts must succeed without needing eviction");
+        inserted.push(key);
+    }
+    assert_eq!(
+        cache.segments.free_only(),
+        0,
+        "fill must exactly exhaust the free queue, including the last segment"
+    );
+
+    // Let every inserted item's TTL elapse. clocksource::coarse has 1s
+    // resolution, so a >1s real sleep guarantees create_at + ttl <= now
+    // for every segment in the chain.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // This insert needs a fresh segment: the pool is genuinely full and
+    // the last segment has no spare room. It must be served by evict()
+    // reclaiming the whole expired chain via expiration, not by merging
+    // it.
+    let result = cache.insert(b"trigger", b"new value", None, ttl);
+    assert!(
+        result.is_ok(),
+        "insert must succeed by reclaiming the expired chain"
+    );
+    assert!(cache.get(b"trigger").is_some());
+
+    // Whole-segment expiration drops every item in the chain -- nothing
+    // survives. A merge would instead have pruned by frequency and kept
+    // a target *ratio* of survivors alive even though every item here has
+    // the same (zero) frequency, so any surviving key below proves merge
+    // ran instead of expiration.
+    for key in &inserted {
+        assert!(
+            cache.get(key.as_bytes()).is_none(),
+            "key {key} must be gone: expiration (not merge) must have reclaimed the chain"
+        );
+    }
+    assert_eq!(
+        cache.items(),
+        1,
+        "only the trigger item should remain; a merge would have kept survivors"
+    );
+
+    // Secondary, non-load-bearing signal: SEGMENT_MERGE is a process-global
+    // metriken counter that other tests running in parallel can also
+    // increment, so it is deliberately not asserted against a before/after
+    // delta here -- the deterministic per-key and items() checks above are
+    // what prove the ordering.
+    #[cfg(feature = "metrics")]
+    let _ = crate::metrics::SEGMENT_MERGE.value();
+}
+
 #[test]
 fn clear() {
     let ttl = Duration::ZERO;
