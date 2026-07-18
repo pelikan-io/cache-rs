@@ -32,6 +32,14 @@ pub(crate) struct Segments {
     /// hold a raw pointer to it so the AwaitingRelease handoff can return
     /// segments without `&mut Segments`.
     free_queue: Box<crossbeam_deque::Injector<u32>>,
+    /// Held-back spare segments for merge compaction. Never handed out by
+    /// `reserve_free` (normal writes), so a destination is always available
+    /// to merge even when the main free queue is empty.
+    spare_queue: Box<crossbeam_deque::Injector<u32>>,
+    /// Target number of segments to keep in the spare queue.
+    spare_capacity: u32,
+    /// Current spare-queue depth (atomic for item-7 readiness).
+    spare_count: crate::sync::AtomicU32,
     /// Eviction configuration and state.
     evict: Box<Eviction>,
     /// Max segments in the admission pool (S3-FIFO only, 0 for other policies).
@@ -85,10 +93,21 @@ impl Segments {
         let heap_size = segments * segment_size as usize;
         let mut data = MmapOptions::new().populate().len(heap_size).map_anon()?;
 
-        // Initialize each segment and fill the free queue. Segments rest
-        // in the Free state with no chain links; the free queue itself is
-        // a lock-free Injector rather than an intrusive list.
+        // A Merge-policy cache holds back one segment as a copy
+        // destination for compaction, always available even when the
+        // normal free queue is drained to empty. Other policies never
+        // compact in place, so they need no spare.
+        let spare_capacity: u32 = if matches!(evict_policy, Policy::Merge { .. }) {
+            1
+        } else {
+            0
+        };
+
+        // Initialize each segment and fill the free/spare queues. Segments
+        // rest in the Free state with no chain links; both queues are
+        // lock-free Injectors rather than intrusive lists.
         let free_queue = Box::new(crossbeam_deque::Injector::new());
+        let spare_queue = Box::new(crossbeam_deque::Injector::new());
         for idx in 0..segments {
             let begin = segment_size as usize * idx;
             let end = begin + segment_size as usize;
@@ -96,7 +115,12 @@ impl Segments {
             let mut segment = Segment::from_raw_parts(&headers[idx], &mut data[begin..end]);
             segment.init();
 
-            free_queue.push(idx as u32 + 1); // segments are 1-indexed
+            let id = idx as u32 + 1; // segments are 1-indexed
+            if (idx as u32) < spare_capacity {
+                spare_queue.push(id);
+            } else {
+                free_queue.push(id);
+            }
         }
 
         #[cfg(feature = "metrics")]
@@ -116,6 +140,9 @@ impl Segments {
             segment_size,
             cap: segments as u32,
             free_queue,
+            spare_queue,
+            spare_capacity,
+            spare_count: crate::sync::AtomicU32::new(spare_capacity),
             data,
             evict: Box::new(Eviction::new(segments, evict_policy)),
             admission_cap,
@@ -163,10 +190,33 @@ impl Segments {
         )
     }
 
-    /// Returns the number of free segments.
+    /// Returns the number of available segments (free queue + spare
+    /// queue).
     #[cfg(test)]
     pub fn free(&self) -> usize {
+        self.free_queue.len() + self.spare_queue.len()
+    }
+
+    /// Returns the number of segments available to normal writes (free
+    /// queue only, excluding the held-back spare).
+    #[cfg(test)]
+    #[allow(dead_code)] // only exercised by spare_tests, excluded under the loom feature
+    pub(crate) fn free_only(&self) -> usize {
         self.free_queue.len()
+    }
+
+    /// Target number of segments held back in the spare queue.
+    #[cfg(test)]
+    #[allow(dead_code)] // only exercised by spare_tests, excluded under the loom feature
+    pub(crate) fn spare_capacity(&self) -> u32 {
+        self.spare_capacity
+    }
+
+    /// Current spare-queue depth.
+    #[cfg(test)]
+    #[allow(dead_code)] // only exercised by spare_tests, excluded under the loom feature
+    pub(crate) fn spare_count(&self) -> u32 {
+        self.spare_count.load(Ordering::Relaxed)
     }
 
     /// Shared access to a segment's header by id.
@@ -446,7 +496,7 @@ impl Segments {
         );
         debug_assert!(freed, "recycled a segment that was not Draining");
 
-        self.free_queue.push(id.get());
+        self.return_segment(id.get());
 
         #[cfg(feature = "metrics")]
         {
@@ -485,6 +535,54 @@ impl Segments {
         }
     }
 
+    /// Reserve a segment for merge compaction. Prefers the held-back
+    /// spare queue; falls back to the normal free queue when the spare is
+    /// empty. Returns a `Reserved` segment, like `reserve_free`.
+    ///
+    /// Unused until the Task-3 merge rework calls it; the accessors below
+    /// and this method are exercised today by `spare_tests` only.
+    #[allow(dead_code)]
+    pub(crate) fn reserve_spare(&self) -> Option<NonZeroU32> {
+        loop {
+            match self.spare_queue.steal() {
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => return self.reserve_free(),
+                crossbeam_deque::Steal::Success(raw) => {
+                    debug_assert!(raw >= 1 && raw <= self.cap);
+                    let id = NonZeroU32::new(raw)?;
+                    if self.headers[raw as usize - 1].try_reserve() {
+                        self.spare_count.fetch_sub(1, Ordering::Relaxed);
+                        #[cfg(feature = "metrics")]
+                        {
+                            SEGMENT_REQUEST.increment();
+                            SEGMENT_REQUEST_SUCCESS.increment();
+                            SEGMENT_FREE.decrement();
+                        }
+                        return Some(id);
+                    }
+                    // Not actually Free (a transient state raced through
+                    // the queue) — put it back and let the caller retry
+                    // or run eviction.
+                    self.spare_queue.push(raw);
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Return a segment id to the pool, replenishing the held-back spare
+    /// queue before the normal free queue. Callers push the id after
+    /// their own state transition to Free; this only decides which queue
+    /// it lands in.
+    fn return_segment(&self, id: u32) {
+        if self.spare_count.load(Ordering::Relaxed) < self.spare_capacity {
+            self.spare_count.fetch_add(1, Ordering::Relaxed);
+            self.spare_queue.push(id);
+        } else {
+            self.free_queue.push(id);
+        }
+    }
+
     /// Return a Reserved (or Linking) segment that was never published
     /// into a chain — the loser path of the chain-extension election
     /// and allocation error paths.
@@ -494,7 +592,7 @@ impl Segments {
             released,
             "release_unused on a segment not in Reserved/Linking"
         );
-        self.free_queue.push(id.get());
+        self.return_segment(id.get());
 
         #[cfg(feature = "metrics")]
         {
@@ -606,7 +704,7 @@ impl Segments {
         if self.headers[id_idx].ref_count_seqcst() == 0
             && self.headers[id_idx].try_release_condemned()
         {
-            self.free_queue.push(id.get());
+            self.return_segment(id.get());
 
             #[cfg(feature = "metrics")]
             {
@@ -1554,5 +1652,76 @@ impl Segments {
             }
         }
         integrity
+    }
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod spare_tests {
+    use super::*;
+    use crate::eviction::Policy;
+
+    fn build(policy: Policy, segs: usize) -> Segments {
+        SegmentsBuilder::default()
+            .segment_size(4096)
+            .heap_size(4096 * segs)
+            .eviction_policy(policy)
+            .build()
+            .expect("build segments")
+    }
+
+    #[test]
+    fn merge_policy_holds_back_one_spare() {
+        let segments = build(
+            Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            },
+            16,
+        );
+        // 16 total: 1 spare + 15 free.
+        assert_eq!(segments.spare_capacity(), 1);
+        assert_eq!(segments.free(), 16, "free() counts free + spare");
+        assert_eq!(
+            segments.free_only(),
+            15,
+            "normal free queue excludes the spare"
+        );
+    }
+
+    #[test]
+    fn non_merge_policy_holds_back_no_spare() {
+        let segments = build(Policy::Random, 16);
+        assert_eq!(segments.spare_capacity(), 0);
+        assert_eq!(segments.free_only(), 16);
+    }
+
+    #[test]
+    fn reserve_spare_prefers_spare_then_falls_back_to_free() {
+        let segments = build(
+            Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            },
+            4,
+        );
+        // Drain the whole normal free queue via reserve_free (3 segments).
+        let mut taken = Vec::new();
+        while let Some(id) = segments.reserve_free() {
+            taken.push(id);
+        }
+        assert_eq!(taken.len(), 3, "reserve_free must not hand out the spare");
+        // The spare is still available to reserve_spare.
+        let spare = segments.reserve_spare().expect("spare available at full");
+        // Now truly empty.
+        assert!(segments.reserve_spare().is_none());
+        // Returning the spare replenishes the spare queue first.
+        segments.release_unused(spare);
+        assert_eq!(
+            segments.spare_count(),
+            1,
+            "return replenished the spare, not the free queue"
+        );
     }
 }

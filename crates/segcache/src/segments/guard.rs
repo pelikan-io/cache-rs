@@ -59,6 +59,13 @@ impl Drop for SegmentGuard {
             // We were the last reader of a condemned segment and won the
             // AwaitingRelease -> Free transition: return it to the free
             // queue ourselves.
+            //
+            // Intentionally bypasses the spare-aware `return_segment`
+            // helper: this guard only holds a raw pointer to the free
+            // queue (see the struct doc), not `&Segments`, so it cannot
+            // see or update the spare queue/count. A segment freed here
+            // always lands in the free queue; the held-back spare
+            // self-heals on the next unpinned `recycle`/`condemn` return.
             unsafe { (*self.free_queue).push(header.id().get()) };
 
             #[cfg(feature = "metrics")]
