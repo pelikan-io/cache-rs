@@ -38,7 +38,12 @@ pub(crate) struct Segments {
     spare_queue: Box<crossbeam_deque::Injector<u32>>,
     /// Target number of segments to keep in the spare queue.
     spare_capacity: u32,
-    /// Current spare-queue depth (atomic for item-7 readiness).
+    /// Current spare-queue depth. Single-writer today — eviction (the
+    /// only caller of `reserve_spare`/`return_segment`) is `&mut`-
+    /// serialized, so the check-then-act in `return_segment` is race-free
+    /// in practice. This is `Atomic` for the type to stay stable, but a
+    /// CAS/bounded-push is required here before item-7 makes returns
+    /// concurrent.
     spare_count: crate::sync::AtomicU32,
     /// Eviction configuration and state.
     evict: Box<Eviction>,
@@ -199,22 +204,19 @@ impl Segments {
 
     /// Returns the number of segments available to normal writes (free
     /// queue only, excluding the held-back spare).
-    #[cfg(test)]
-    #[allow(dead_code)] // only exercised by spare_tests, excluded under the loom feature
+    #[cfg(all(test, not(feature = "loom")))]
     pub(crate) fn free_only(&self) -> usize {
         self.free_queue.len()
     }
 
     /// Target number of segments held back in the spare queue.
-    #[cfg(test)]
-    #[allow(dead_code)] // only exercised by spare_tests, excluded under the loom feature
+    #[cfg(all(test, not(feature = "loom")))]
     pub(crate) fn spare_capacity(&self) -> u32 {
         self.spare_capacity
     }
 
     /// Current spare-queue depth.
-    #[cfg(test)]
-    #[allow(dead_code)] // only exercised by spare_tests, excluded under the loom feature
+    #[cfg(all(test, not(feature = "loom")))]
     pub(crate) fn spare_count(&self) -> u32 {
         self.spare_count.load(Ordering::Relaxed)
     }
@@ -575,6 +577,9 @@ impl Segments {
     /// their own state transition to Free; this only decides which queue
     /// it lands in.
     fn return_segment(&self, id: u32) {
+        // Check-then-act on `spare_count`: race-free only because eviction
+        // is `&mut`-serialized (see the field doc). Needs a CAS/bounded-
+        // push before this can be called concurrently (item-7).
         if self.spare_count.load(Ordering::Relaxed) < self.spare_capacity {
             self.spare_count.fetch_add(1, Ordering::Relaxed);
             self.spare_queue.push(id);
@@ -1722,6 +1727,50 @@ mod spare_tests {
             segments.spare_count(),
             1,
             "return replenished the spare, not the free queue"
+        );
+        assert_eq!(
+            segments.free_only(),
+            0,
+            "the returned segment replenished the spare, not the free queue"
+        );
+    }
+
+    #[test]
+    fn reserve_spare_falls_back_to_free_when_spare_empty() {
+        let segments = build(
+            Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            },
+            4,
+        );
+        // 4 total: 1 spare + 3 free.
+        assert_eq!(segments.free_only(), 3);
+
+        // Reserve the spare directly (not via reserve_free): the normal
+        // free queue must be untouched.
+        let from_spare = segments.reserve_spare().expect("spare available");
+        assert_eq!(
+            segments.free_only(),
+            3,
+            "reserving the spare must not touch the free queue"
+        );
+
+        // The spare is now empty: the next reserve_spare must hit
+        // Steal::Empty and fall back to reserve_free, returning Some and
+        // pulling one segment out of the normal free queue.
+        let from_free = segments
+            .reserve_spare()
+            .expect("reserve_spare must fall back to the free queue when the spare is empty");
+        assert_eq!(
+            segments.free_only(),
+            2,
+            "the fallback reservation must come from the free queue"
+        );
+        assert_ne!(
+            from_spare, from_free,
+            "spare and fallback must be distinct segments"
         );
     }
 }

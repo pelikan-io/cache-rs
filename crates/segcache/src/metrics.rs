@@ -100,7 +100,7 @@ pub static EVICT_TIME: Counter = Counter::new();
 
 #[metric(
     name = "segment_free",
-    description = "current number of free segments",
+    description = "current number of free segments; includes the held-back spare reserve (not available to normal writes)",
     metadata = { engine = "segcache" }
 )]
 pub static SEGMENT_FREE: Gauge = Gauge::new();
