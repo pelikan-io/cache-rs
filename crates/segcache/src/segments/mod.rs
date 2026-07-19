@@ -9,6 +9,9 @@ mod segment;
 mod segments;
 pub(crate) mod state;
 
+#[cfg(all(test, not(feature = "loom")))]
+mod eviction_concurrency_tests;
+
 pub(crate) use builder::SegmentsBuilder;
 pub(crate) use error::SegmentsError;
 pub(crate) use guard::SegmentGuard;
