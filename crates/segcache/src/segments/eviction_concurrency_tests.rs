@@ -1,17 +1,26 @@
-//! Reader-vs-eviction byte-integrity tests for drain-safe merge (roadmap
-//! item 5b).
+//! Reader-vs-eviction tests for drain-safe merge (roadmap item 5b).
 //!
-//! The core safety property of the copy-to-spare merge rework: **a merge never
-//! moves a readable segment's live bytes in place, so a reader holding a
-//! pointer into a candidate segment always reads intact bytes.** The test below
-//! proves this and would FAIL if in-place `compact()` were reintroduced.
-//!
-//! It is single-threaded by construction. `acquire_item_at(&self) -> Option<(
-//! RawItem, SegmentGuard)>` returns a guard holding raw pointers (segment
-//! header + free queue), NOT a borrow of `Segments`. Once it returns, the
-//! immutable borrow ends, so `evict(&mut self)` can run while the `RawItem` and
-//! `SegmentGuard` stay alive — exactly the pin-across-eviction scenario item 7
+//! This test is single-threaded by construction. `acquire_item_at(&self) ->
+//! Option<(RawItem, SegmentGuard)>` returns a guard holding raw pointers
+//! (segment header + free queue), NOT a borrow of `Segments`. Once it returns,
+//! the immutable borrow ends, so `evict(&mut self)` can run while the `RawItem`
+//! and `SegmentGuard` stay alive — the pin-across-eviction composition item 7
 //! will enable under real concurrency. No threads, no `RwLock`.
+//!
+//! SCOPE — what a single-threaded test can and cannot prove here. The
+//! copy-to-spare rework's headline safety property ("a merge never moves a
+//! readable segment's live bytes under a *racing* reader pin") is inherently
+//! CONCURRENT and is NOT tested here. The reason: the merge's gates
+//! (`merge_evict_chain_len`, then `can_evict`) observe any *pre-existing* pin
+//! and bail BEFORE processing that segment — so single-threaded, neither the
+//! old in-place `compact()` nor the new copy-to-spare merge ever mutates a
+//! segment a reader has already pinned. The old-vs-new difference only appears
+//! when a pin RACES IN after the gate check, a window that requires the `&self`
+//! concurrency of item 7. There is no sound single-threaded test that
+//! distinguishes copy-to-spare from in-place compaction (reading a
+//! recycled/unpinned pointer post-drain would be racy/unsound). That
+//! verification is deferred to item 7, where a concurrent/loom test can
+//! exercise the racing-pin window.
 
 use super::*;
 use crate::eviction::Policy;
@@ -20,13 +29,22 @@ use core::num::NonZeroU32;
 use keyvalue::Value;
 use std::time::Duration;
 
-/// A reader that pins an item in a LATER merge candidate must keep reading that
-/// item's exact key/value bytes across a merge pass — because a pinned
-/// candidate (`ref_count >= 1`) fails `can_evict()`, stopping the merge before
-/// its bytes are ever touched. The earlier, unpinned candidates ARE drained via
-/// copy-to-spare, proving the reader-safe copy path runs while the pin holds.
+/// Pin an item X in a LATER merge candidate and run a full `evict()` pass while
+/// the pin is held. This proves the following (all genuinely single-threaded
+/// properties — see the module SCOPE note for what is deliberately NOT proven):
+///
+/// - the merge does real copy-to-spare work on the *unpinned* candidates
+///   (seg2/3/4 → Free; their survivors are relocated into the spare and remain
+///   reachable via `get()` with their correct distinct values);
+/// - the merge HALTS CLEANLY at the pinned candidate: a pin makes `can_evict()`
+///   false, so the candidate loop stops at seg5 and leaves it Sealed, pinned,
+///   and byte-for-byte intact (it is never drained or condemned);
+/// - a reader pin held across a full `evict()` keeps its segment alive and
+///   readable — the guard / raw-pointer mechanism composes with eviction;
+/// - no leak (free + spare + readable == total) and the pool stays consistent
+///   after the guard drops.
 #[test]
-fn readers_see_intact_bytes_across_merge() {
+fn merge_halts_at_pinned_candidate_and_relocates_survivors() {
     const ITEMS_PER_SEGMENT: usize = 8;
     const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
     const VAL_LEN: usize = 7; // "V" + 6 zero-padded digits
@@ -171,19 +189,22 @@ fn readers_see_intact_bytes_across_merge() {
         .evict(&mut cache.ttl_buckets, &cache.hashtable)
         .expect("merge eviction must succeed on the 3-candidate prefix");
 
-    // ── CORE ASSERTION: with guard_x STILL ALIVE, re-read X through the pinned
-    //    pointer. The merge stopped at seg5 without touching it, so the bytes
-    //    MUST be byte-for-byte identical. An in-place compaction that moved
-    //    readable bytes under this pointer would fail here.
+    // ── With guard_x STILL ALIVE, re-read X through the pinned pointer. The
+    //    merge halted at seg5 (can_evict == false) without draining it, so the
+    //    bytes MUST be byte-for-byte identical. NOTE: this does not by itself
+    //    distinguish copy-to-spare from in-place compaction — the merge gates
+    //    on the pre-existing pin and never processes seg5 under EITHER design
+    //    single-threaded (see the module SCOPE note). It verifies the clean
+    //    halt: the pinned candidate is left untouched.
     assert_eq!(
         raw_item_x.key(),
         x_key.as_bytes(),
-        "reader saw a moved/torn KEY across the merge"
+        "pinned candidate's KEY must be untouched by the halted merge"
     );
     assert_value_eq(
         raw_item_x.value(),
         x_val.as_bytes(),
-        "reader saw a moved/torn VALUE across the merge",
+        "pinned candidate's VALUE must be untouched by the halted merge",
     );
     #[cfg(feature = "integrity")]
     raw_item_x.check_magic();
@@ -248,10 +269,12 @@ fn readers_see_intact_bytes_across_merge() {
         "no leak: available + readable segments must account for the whole pool"
     );
 
-    // ── (7) Drop the pin; the cache stays consistent. X's segment was never
+    // ── (7) Release the pin; the cache stays consistent. The pin is held by
+    //    the SegmentGuard — `RawItem` is `Copy`, so dropping it does nothing;
+    //    dropping the guard is what decrements ref_count. X's segment was never
     //    condemned, so it simply becomes unpinned (ref_count -> 0) and remains
     //    readable; a follow-up lookup still works.
-    drop(raw_item_x);
+    let _ = raw_item_x;
     drop(guard_x);
     assert_eq!(
         cache.segments.header(x_seg).ref_count(),
