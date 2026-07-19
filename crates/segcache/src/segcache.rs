@@ -600,7 +600,7 @@ impl Segcache {
     /// them), pins the segment, and performs the seqlocked in-place
     /// update through the pinned item. The pin is the load-bearing
     /// safety argument for mutating in place: eviction\'s byte-copy
-    /// paths (merge prune/copy_into/compact) only proceed on segments
+    /// paths (merge prune/copy_into) only proceed on segments
     /// whose reader count is zero (the Sealed -> Draining CAS plus the
     /// SeqCst recheck-and-revert from the drain protocol), so segment
     /// memory cannot be moved or reused out from under the update.

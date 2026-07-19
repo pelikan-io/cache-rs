@@ -194,11 +194,6 @@ impl<'a> Segment<'a> {
     }
 
     #[inline]
-    pub fn mark_merged(&self) {
-        self.header.mark_merged();
-    }
-
-    #[inline]
     pub fn next_seg(&self) -> Option<NonZeroU32> {
         self.header.next_seg()
     }
@@ -243,81 +238,6 @@ impl<'a> Segment<'a> {
         Some(RawItem::from_ptr(
             (self.data.as_ptr() as *mut u8).wrapping_add(offset),
         ))
-    }
-
-    /// Compact the segment in-place, removing dead items and relinking
-    /// live items in the hashtable.
-    #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn compact(
-        &mut self,
-        hashtable: &MultiChoiceHashtable,
-    ) -> Result<(), SegmentsError> {
-        let max_offset = self.max_item_offset();
-        let mut read_offset = if cfg!(feature = "integrity") {
-            std::mem::size_of_val(&SEG_MAGIC)
-        } else {
-            0
-        };
-
-        let mut write_offset = read_offset;
-
-        #[cfg(feature = "metrics")]
-        let mut items_pruned = 0;
-        #[cfg(feature = "metrics")]
-        let mut bytes_pruned = 0;
-
-        while read_offset <= max_offset {
-            let item = self.get_item_at(read_offset).unwrap();
-            if item.klen() == 0 && self.live_items() == 0 {
-                break;
-            }
-
-            item.check_magic();
-            let item_size = item.size();
-
-            let old_loc = pack_location(self.id(), read_offset as u64);
-            let deleted =
-                item.is_deleted() || hashtable.get_item_frequency(item.key(), old_loc).is_none();
-            if deleted {
-                #[cfg(feature = "metrics")]
-                {
-                    items_pruned += 1;
-                    bytes_pruned += item.size();
-                    ITEM_COMPACTED.increment();
-                }
-
-                read_offset += item_size;
-                continue;
-            }
-
-            if read_offset != write_offset {
-                let src = unsafe { self.data.as_ptr().add(read_offset) };
-                let dst = unsafe { self.data.as_mut_ptr().add(write_offset) };
-
-                let new_loc = pack_location(self.id(), write_offset as u64);
-                if hashtable.cas_location(item.key(), old_loc, new_loc, true) {
-                    unsafe {
-                        std::ptr::copy(src, dst, item_size);
-                    }
-                } else {
-                    read_offset += item_size;
-                    write_offset = read_offset;
-                    continue;
-                }
-            }
-
-            read_offset += item_size;
-            write_offset += item_size;
-        }
-
-        #[cfg(feature = "metrics")]
-        {
-            ITEM_DEAD.sub(items_pruned as _);
-            ITEM_DEAD_BYTES.sub(bytes_pruned as _);
-        }
-
-        self.set_write_offset(write_offset as i32);
-        Ok(())
     }
 
     /// Copy live items from this segment into the target segment,

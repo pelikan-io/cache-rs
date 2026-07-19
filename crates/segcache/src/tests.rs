@@ -1227,6 +1227,198 @@ fn merge_evict_copies_survivors_into_spare() {
     );
 }
 
+// merge_compact is the maintenance counterpart of merge_evict, invoked from
+// `remove_at` when a segment drops below the compact-ratio low watermark
+// (no full-pool pressure). It must combine under-full segments into a
+// fresh spare WITHOUT frequency-based pruning: every survivor from every
+// combined candidate is preserved.
+//
+// Builds a 3-normal-segment (+1 held-back spare) Merge cache, fully fills
+// the first two segments (leaving the third as the Live write tail), then
+// deletes most items from each so both segments' occupancy lands well
+// below the compact ratio (n_compact: 5 => compact_ratio 0.2; each
+// candidate ends at 2/12 ≈ 0.167, comfortably clear of the 0.2 watermark
+// with margin to spare regardless of any fixed per-segment header
+// overhead under the `integrity` feature). The delete that finally drops
+// the first segment's ratio to the watermark drives `remove_at` into
+// `merge_compact`, which must:
+//   (a) reserve the held-back spare and head-insert it as the new Sealed
+//       bucket head;
+//   (b) copy every survivor from both under-full segments into the spare
+//       (no pruning — all survivors preserved, unlike merge_evict);
+//   (c) drain both source segments (Free, nothing leaked);
+//   (d) leave the untouched Live tail segment alone.
+#[test]
+#[cfg(not(feature = "loom"))]
+fn merge_compact_combines_under_full_segments_into_spare() {
+    const ITEMS_PER_SEGMENT: usize = 12;
+    const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
+    let value: &[u8] = b"v";
+    let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(value), 0);
+    let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+    // 1 held-back spare (Merge policy) + 3 normal free segments: two fill
+    // completely and seal, the third stays the Live write tail.
+    let free_segments = 3usize;
+    let total_segments = free_segments + 1;
+
+    let mut cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(segment_size as usize * total_segments)
+        .hash_power(16)
+        .eviction(Policy::Merge {
+            max: 8,
+            merge: 4,
+            compact: 5, // compact_ratio = 1 / 5 = 0.2
+        })
+        .build()
+        .expect("failed to create cache");
+
+    assert_eq!(cache.segments.free_only(), free_segments);
+    assert_eq!(cache.segments.spare_count(), 1);
+
+    // Long TTL: items never expire during the test.
+    let ttl = Duration::from_secs(3600);
+
+    // Fill exactly 2 segments' worth of items; the reserve() path only
+    // seals a segment once a successor is needed, so the 3rd segment
+    // stays Live (full, but still the write tail) — mirrors
+    // merge_evict_copies_survivors_into_spare's fill discipline.
+    let fill_count = ITEMS_PER_SEGMENT * free_segments;
+    let mut keys = Vec::with_capacity(fill_count);
+    for i in 0..fill_count {
+        let key = format!("k{i:06}");
+        assert_eq!(key.len(), KEY_LEN, "key width must stay fixed-size");
+        cache
+            .insert(key.as_bytes(), value, None, ttl)
+            .expect("fill inserts must succeed without needing eviction");
+        keys.push(key);
+    }
+    assert_eq!(
+        cache.segments.free_only(),
+        0,
+        "fill must exactly exhaust the free queue"
+    );
+
+    // Deterministic id assignment (same discipline as the merge_evict
+    // test): the held-back spare seeded at construction is id 1;
+    // reserve_free hands out ids 2.. in order for the fill.
+    let spare_id = NonZeroU32::new(1).unwrap();
+    let seg_a = NonZeroU32::new(2).unwrap(); // first filled: bucket head, Sealed
+    let seg_b = NonZeroU32::new(3).unwrap(); // second filled: Sealed
+    let seg_c = NonZeroU32::new(4).unwrap(); // third: Live write tail
+
+    {
+        let a = cache.segments.get_mut(seg_a).unwrap();
+        assert_eq!(a.state(), State::Sealed);
+        assert_eq!(a.live_items(), ITEMS_PER_SEGMENT as i32);
+    }
+    {
+        let b = cache.segments.get_mut(seg_b).unwrap();
+        assert_eq!(b.state(), State::Sealed);
+        assert_eq!(b.live_items(), ITEMS_PER_SEGMENT as i32);
+    }
+    {
+        let c = cache.segments.get_mut(seg_c).unwrap();
+        assert_eq!(c.state(), State::Live);
+        assert_eq!(c.live_items(), ITEMS_PER_SEGMENT as i32);
+    }
+
+    // Bring seg_b down to 2/12 occupancy FIRST. Its own compact check
+    // (`remove_at`) looks at its successor, seg_c — which is Live
+    // (can_evict() == false) — so this cannot trigger a merge yet; it's
+    // safe prep so that when seg_a's ratio drops, seg_b already qualifies
+    // as a compaction partner.
+    for k in &keys[12..22] {
+        assert!(cache.delete(k.as_bytes()), "delete must find the key");
+    }
+    assert_eq!(cache.segments.get_mut(seg_b).unwrap().live_items(), 2);
+
+    // Now bring seg_a down from 12 -> 2 items. Somewhere in this loop
+    // seg_a's ratio drops to <= compact_ratio (0.2) while seg_b (its chain
+    // successor) is already at 2/12 <= 0.2 and can_evict() == true, so
+    // one of these delete() calls drives `remove_at` into
+    // `merge_compact(seg_a, ..)`. Once that happens seg_a is drained, so
+    // any remaining keys in this batch are deleted from wherever the
+    // hashtable now points (harmless — `delete` doesn't care).
+    for k in &keys[0..10] {
+        assert!(cache.delete(k.as_bytes()), "delete must find the key");
+    }
+
+    // (a) The bucket head is now the spare segment, Sealed, and combines
+    // both under-full candidates' survivors (2 from seg_a + 2 from
+    // seg_b = 4), with none pruned.
+    let seg_ttl = cache.segments.header(spare_id).ttl();
+    let head = cache.ttl_buckets.get_mut_bucket(seg_ttl).head();
+    assert_eq!(
+        head,
+        Some(spare_id),
+        "merge_compact must head-insert the spare"
+    );
+    {
+        let spare = cache.segments.get_mut(spare_id).unwrap();
+        assert_eq!(spare.state(), State::Sealed);
+        assert_eq!(
+            spare.live_items(),
+            4,
+            "merge_compact must preserve every survivor from both candidates (no pruning)"
+        );
+    }
+
+    // (b) Both under-full source segments were drained (Free), and the
+    // untouched Live tail was left alone.
+    assert_eq!(cache.segments.get_mut(seg_a).unwrap().state(), State::Free);
+    assert_eq!(cache.segments.get_mut(seg_b).unwrap().state(), State::Free);
+    {
+        let c = cache.segments.get_mut(seg_c).unwrap();
+        assert_eq!(c.state(), State::Live);
+        assert_eq!(c.live_items(), ITEMS_PER_SEGMENT as i32);
+    }
+
+    // (c) No leak: available (free + spare) + readable segments accounts
+    // for the whole pool.
+    let free_after = cache.segments.free();
+    let readable = (1..=total_segments as u32)
+        .filter(|&id| {
+            cache
+                .segments
+                .get_mut(NonZeroU32::new(id).unwrap())
+                .unwrap()
+                .state()
+                .is_readable()
+        })
+        .count();
+    assert_eq!(
+        free_after + readable,
+        total_segments,
+        "no leak: available + readable segments must account for the whole pool"
+    );
+
+    // (d) Total item count is preserved exactly (4 in the spare + 12 in
+    // the untouched Live tail = 16 = 36 inserted - 10 deleted from seg_b's
+    // batch - 10 deleted from seg_a's batch).
+    assert_eq!(cache.items(), 16);
+
+    // (e) Every surviving key (the ones NOT explicitly deleted) is still
+    // reachable, served from wherever the hashtable now points (the
+    // relocated copy in the spare, or the untouched tail).
+    for k in keys[10..12].iter().chain(&keys[22..36]) {
+        let item = cache
+            .get(k.as_bytes())
+            .unwrap_or_else(|| panic!("surviving key {k} must remain reachable"));
+        assert_eq!(item.value(), b"v");
+    }
+
+    // (f) The explicitly-deleted keys are gone.
+    for k in keys[0..10].iter().chain(&keys[12..22]) {
+        assert!(
+            cache.get(k.as_bytes()).is_none(),
+            "deleted key {k} must not be found"
+        );
+    }
+}
+
 #[test]
 fn clear() {
     let ttl = Duration::ZERO;
