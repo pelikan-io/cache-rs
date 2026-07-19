@@ -297,11 +297,13 @@ impl Segments {
     /// (hot path); the debug-feature `check_integrity` scan covers it,
     /// the same idiom as `expiry_info`.
     ///
-    /// SCOPE(item-5): the reserve→define→publish window is not yet
-    /// protected against a concurrent drain of this segment. Safe today
-    /// because eviction and writers are serialized by `&mut Segcache`;
-    /// the writer-vs-drain protocol lands with the eviction drain
-    /// rework.
+    /// SCOPE(writer-vs-drain): the reserve→define→publish window is not
+    /// yet protected against a concurrent drain of this segment. Safe
+    /// today because eviction and writers are serialized by `&mut
+    /// Segcache`. Drain-safe merge (item 5b) made eviction itself
+    /// reader-safe (no more in-place compaction of readable segments) but
+    /// does not close this writer-vs-drain hazard; that protocol is
+    /// deferred past 5b to item 7.
     pub(crate) fn try_alloc_item(&self, seg_id: NonZeroU32, size: i32) -> Option<ReservedItem> {
         debug_assert!(seg_id.get() <= self.cap);
         let header = self.header(seg_id);
@@ -539,11 +541,9 @@ impl Segments {
 
     /// Reserve a segment for merge compaction. Prefers the held-back
     /// spare queue; falls back to the normal free queue when the spare is
-    /// empty. Returns a `Reserved` segment, like `reserve_free`.
-    ///
-    /// Unused until the Task-3 merge rework calls it; the accessors below
-    /// and this method are exercised today by `spare_tests` only.
-    #[allow(dead_code)]
+    /// empty. Returns a `Reserved` segment, like `reserve_free`. Called by
+    /// `merge_evict` and `merge_compact` to obtain their copy-to-spare
+    /// destination.
     pub(crate) fn reserve_spare(&self) -> Option<NonZeroU32> {
         loop {
             match self.spare_queue.steal() {

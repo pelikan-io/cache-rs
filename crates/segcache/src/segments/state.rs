@@ -18,12 +18,19 @@ use core::num::NonZeroU32;
 /// - **Live**: Active tail segment accepting writes and reads
 /// - **Sealed**: No more writes accepted, but data readable and chain
 ///   stable; the only evictable state
-/// - **Relinking**: DECLARED, UNUSED — reserved for the future concurrent
-///   merge path (chain pointers updated while data stays readable)
+/// - **Relinking**: DECLARED, UNUSED — the copy-to-spare merge rework
+///   (item 5b) and the s3fifo evict/admission paths reach a reader-safe
+///   chain-relink by copying survivors into a fresh Sealed segment instead
+///   of updating pointers on a live one in place, making an in-place
+///   relinking state unnecessary under today's serialized eviction. Kept
+///   reserved for a future concurrent-eviction design.
 /// - **Draining**: Being processed (eviction/expiration/clear). Exclusive:
 ///   exactly one thread holds a segment in Draining. New reads rejected.
-/// - **Locked**: DECLARED, UNUSED — reserved for a future exclusive drain
-///   protocol (all access rejected while clearing)
+/// - **Locked**: DECLARED, UNUSED — for the same reason as `Relinking`,
+///   drain-safe merge never needs to lock out all access to a segment
+///   being cleared (candidates are drained via the existing
+///   Sealed→Draining→AwaitingRelease path, not an exclusive in-place
+///   clear). Kept reserved for a future concurrent-eviction design.
 /// - **AwaitingRelease**: Condemned — removed from its chain and from the
 ///   hashtable; data remains valid for in-flight pinned readers. The last
 ///   reader's guard drop transitions it to Free and returns it to the
