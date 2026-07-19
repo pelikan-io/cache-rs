@@ -1192,13 +1192,20 @@ impl Segments {
         let meta = self.headers[start.get() as usize - 1].metadata(Ordering::Acquire);
         let next = meta.next;
         match self.clear_segment(start, hashtable, false) {
-            Ok(ClearOutcome::Freed) => {
+            // Freed OR Deferred: the segment left service and was spliced
+            // out of the chain either way (Deferred = drained + condemned to
+            // AwaitingRelease, freed by its last reader's guard drop). The
+            // bucket head must be advanced past it if it was the head —
+            // otherwise the head dangles into a condemned/soon-reused
+            // segment.
+            Ok(_outcome) => {
                 if meta.prev.is_none() {
                     ttl_bucket.set_head(next);
                 }
                 Ok(next)
             }
-            _ => Err(SegmentsError::NoEvictableSegments),
+            // CAS failed — nothing drained, no progress.
+            Err(()) => Err(SegmentsError::NoEvictableSegments),
         }
     }
 
@@ -1779,6 +1786,127 @@ mod spare_tests {
         assert_ne!(
             from_spare, from_free,
             "spare and fallback must be distinct segments"
+        );
+    }
+
+    // Roadmap item 5b: the no-spare merge fallback drops the chain head via
+    // clear_segment. When that head is pinned by a live reader, clear_segment
+    // condemns it (Deferred / AwaitingRelease) instead of freeing it — the
+    // segment still leaves its chain. The fallback MUST advance the bucket
+    // head past the condemned segment; leaving the head pointing at a
+    // condemned (and soon-reused) segment is the latent bug this guards.
+    //
+    // This branch is unreachable through the normal evict() path today (the
+    // chain-length guard requires an unpinned head and &mut-serialization
+    // keeps it unpinned through clear_segment), so the fallback is driven
+    // directly with a manually pinned head — like the item-4 concurrency
+    // tests. Uses test-only accessors, so it is gated with the module.
+    #[test]
+    fn merge_evict_fallback_drop_fixes_head_on_condemned_segment() {
+        use crate::sync::Ordering;
+        use crate::Segcache;
+        use core::num::NonZeroU32;
+        use std::time::Duration;
+
+        const ITEMS_PER_SEGMENT: usize = 4;
+        const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
+        let value: &[u8] = b"x";
+        let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(value), 0);
+        let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+        let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+
+        // 1 held-back spare (Merge policy) + 4 free.
+        let total_segments = 5usize;
+
+        let mut cache = Segcache::builder()
+            .segment_size(segment_size)
+            .heap_size(segment_size as usize * total_segments)
+            .hash_power(16)
+            .eviction(Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            })
+            .build()
+            .expect("failed to create cache");
+
+        // Long TTL so nothing expires; all items share one bucket.
+        let ttl = Duration::from_secs(3600);
+
+        // Fill enough to span at least two segments so the bucket head
+        // (segment id 2 — id 1 is the held-back spare) is Sealed with a
+        // next. Ten items across 4-item segments -> seg2, seg3, seg4.
+        for i in 0..10 {
+            let key = format!("k{i:06}");
+            assert_eq!(key.len(), KEY_LEN);
+            cache
+                .insert(key.as_bytes(), value, None, ttl)
+                .expect("fill inserts must succeed");
+        }
+
+        // The head of the chain is the oldest (first-reserved) segment, id 2.
+        let head = NonZeroU32::new(2).unwrap();
+        assert_eq!(cache.segments.header(head).state(), State::Sealed);
+        let next = cache.segments.header(head).metadata(Ordering::Acquire).next;
+        assert!(next.is_some(), "head must have a successor in the chain");
+        let seg_ttl = cache.segments.header(head).ttl();
+        assert_eq!(
+            cache.ttl_buckets.get_mut_bucket(seg_ttl).head(),
+            Some(head),
+            "precondition: bucket head is the segment we drop"
+        );
+
+        // Pin the head segment with a live reader: the first inserted key
+        // lives in seg 2. Holding the Item keeps its SegmentGuard alive.
+        let held = cache.get(b"k000000").expect("head item must resolve");
+        assert!(
+            cache.segments.header(head).ref_count() > 0,
+            "the held item must pin the head segment"
+        );
+
+        // Drive the no-spare fallback directly.
+        let res = {
+            let bucket = cache.ttl_buckets.get_mut_bucket(seg_ttl);
+            cache
+                .segments
+                .merge_evict_fallback_drop(head, bucket, &cache.hashtable)
+        };
+
+        // (a) The fallback made progress and returned the old head's next.
+        assert!(
+            matches!(res, Ok(n) if n == next),
+            "fallback must return Ok(next), got {res:?}"
+        );
+        // (b) The pinned head was condemned (drained + spliced out), not freed.
+        assert_eq!(
+            cache.segments.header(head).state(),
+            State::AwaitingRelease,
+            "a pinned head must be condemned, not freed"
+        );
+        // (c) The bucket head advanced past the condemned segment — the fix.
+        assert_eq!(
+            cache.ttl_buckets.get_mut_bucket(seg_ttl).head(),
+            next,
+            "bucket head must advance to the old head's next, never dangle \
+             into the condemned segment"
+        );
+
+        // The pinned reader still reads intact bytes while condemned.
+        assert_eq!(held.value(), b"x");
+
+        // Dropping the guard completes the AwaitingRelease handoff: the
+        // condemned segment returns to the pool (no leak).
+        let free_before = cache.segments.free();
+        drop(held);
+        assert_eq!(
+            cache.segments.header(head).state(),
+            State::Free,
+            "guard drop must free the condemned segment"
+        );
+        assert_eq!(
+            cache.segments.free(),
+            free_before + 1,
+            "no leak: the condemned segment returns to the pool"
         );
     }
 }

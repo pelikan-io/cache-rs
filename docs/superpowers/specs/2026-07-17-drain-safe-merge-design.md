@@ -70,8 +70,15 @@ recycled.
      bytes — reader-safe).
    - `copy_into(candidate, spare)` — append survivors past the spare's
      write-offset; each survivor is relinked by the hashtable's existing
-     Release-CAS (`cas_location`), which orders the copied bytes ahead of the
-     new location becoming visible.
+     Release-CAS (`cas_location`). NOTE: the current `copy_into` (and
+     `s3fifo_promote_from`) publishes the new location via `cas_location`
+     *before* copying the item's bytes into the spare. Under this PR's
+     `&mut`-serialized eviction that is safe — no concurrent reader can
+     observe the not-yet-written spare slot. Once reads become `&self`
+     (item 7), the publish-then-copy order is a torn-read hole: a racing
+     reader could follow the new location to bytes not yet written.
+     Reordering both call sites to **copy-then-publish** is therefore an
+     item-7 prerequisite, tracked out of this PR's serialized scope.
    - `clear_segment(candidate)` — drain it (`Sealed→Draining` + `ref_count`
      recheck + condemn-if-pinned). A candidate pinned by a reader is condemned
      to `AwaitingRelease`; the reader keeps reading valid bytes and the last
