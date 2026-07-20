@@ -1163,7 +1163,7 @@ mod tests {
 mod loom_tests {
     use super::*;
     use crate::hashtable::traits::Hashtable;
-    use crate::sync::AtomicU64;
+    use crate::sync::{AtomicU64, AtomicU8};
     use loom::sync::Arc;
     use loom::thread;
 
@@ -1475,6 +1475,61 @@ mod loom_tests {
             if r3.is_ok() {
                 assert!(ht.lookup(b"key3", &*verifier).is_some());
             }
+        });
+    }
+
+    // Copy-then-publish message-passing: the writer (mirroring copy_into /
+    // s3fifo_promote_from) writes the destination bytes, then publishes the new
+    // location via the Release-CAS cas_location. A reader that observes the new
+    // location (Acquire, via lookup) must see the written bytes. SC-independent
+    // message-passing (Release/Acquire), so loom can verify it -- no Dekker shape.
+    #[test]
+    fn loom_copy_then_publish_no_torn_read() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            let old_loc = Location::new(1);
+            let new_loc = Location::new(2);
+
+            // Seed the key at the OLD location.
+            ht.insert(b"key", old_loc, &*verifier).unwrap();
+
+            // Stand-in for the destination bytes at new_loc; 0 = "not yet written".
+            let payload = Arc::new(AtomicU8::new(0));
+            const SENTINEL: u8 = 0xAB;
+
+            let writer = {
+                let ht = ht.clone();
+                let payload = payload.clone();
+                thread::spawn(move || {
+                    // copy_into order: write bytes FIRST, then publish.
+                    payload.store(SENTINEL, Ordering::Relaxed);
+                    ht.cas_location(b"key", old_loc, new_loc, true);
+                })
+            };
+
+            let reader = {
+                let ht = ht.clone();
+                let verifier = verifier.clone();
+                let payload = payload.clone();
+                thread::spawn(move || {
+                    // Observe the published location (Acquire load inside lookup).
+                    if let Some((loc, _freq)) = ht.lookup_no_freq_update(b"key", &*verifier) {
+                        if loc == new_loc {
+                            // Published new_loc => bytes must already be written.
+                            assert_eq!(
+                                payload.load(Ordering::Acquire),
+                                SENTINEL,
+                                "reader observed the published location with unwritten payload"
+                            );
+                        }
+                    }
+                })
+            };
+
+            writer.join().unwrap();
+            reader.join().unwrap();
         });
     }
 }
