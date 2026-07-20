@@ -45,9 +45,11 @@ if cas_location(old, new) {         // Release-CAS publishes; orders bytes ahead
     remove_item_at; incr counters; advance write_offset;
 }
 // cas failed: bytes sit orphaned at dst[write_offset]; write_offset is NOT
-// advanced, so the next copy overwrites them. No reader hazard — nothing points
-// at dst[write_offset] until a successful publish, and readers reach an item
-// only via its hashtable location.
+// advanced. copy_into aborts the merge with Err (the bytes persist until the
+// destination is later reset/recycled); s3fifo_promote_from continues, and the
+// next copy reuses the same offset. Either way there is no reader hazard —
+// nothing points at dst[write_offset] until a successful publish, and readers
+// reach an item only via its hashtable location.
 ```
 
 `cas_location`'s success ordering is already `Release`, which orders the
