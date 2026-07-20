@@ -1480,22 +1480,27 @@ impl Segments {
 
             if freq > 0 {
                 let write_offset = dst.write_offset() as usize;
-                let new_loc = pack_location(dst.id(), write_offset as u64);
-                if write_offset + item_size < seg_size
-                    && hashtable.cas_location(item.key(), old_loc, new_loc, true)
-                {
+                if write_offset + item_size < seg_size {
+                    let new_loc = pack_location(dst.id(), write_offset as u64);
+                    // Copy-then-publish (see copy_into): write bytes before the
+                    // Release-CAS publishes new_loc. On CAS failure the bytes are
+                    // orphaned (write_offset not advanced) and the item stays in
+                    // src to be evicted — same outcome as before, minus the
+                    // torn-read window.
                     unsafe {
                         let s = src.data_ptr().add(offset);
                         let d = dst.data_ptr().add(write_offset);
                         std::ptr::copy_nonoverlapping(s, d, item_size);
                     }
-                    src.remove_item_at(offset);
-                    dst.incr_live_items();
-                    dst.incr_live_bytes(item_size as i32);
-                    dst.set_write_offset(write_offset as i32 + item_size as i32);
+                    if hashtable.cas_location(item.key(), old_loc, new_loc, true) {
+                        src.remove_item_at(offset);
+                        dst.incr_live_items();
+                        dst.incr_live_bytes(item_size as i32);
+                        dst.set_write_offset(write_offset as i32 + item_size as i32);
 
-                    #[cfg(feature = "metrics")]
-                    ITEM_COMPACTED.increment();
+                        #[cfg(feature = "metrics")]
+                        ITEM_COMPACTED.increment();
+                    }
                 }
                 // If no room in target, item stays in source and will be evicted.
             }

@@ -281,10 +281,16 @@ impl<'a> Segment<'a> {
             let dst = unsafe { target.data.as_mut_ptr().add(write_offset) };
 
             let new_loc = pack_location(target.id(), write_offset as u64);
+            // Copy-then-publish: write the bytes into the destination BEFORE the
+            // Release-CAS publishes the new location. The Release success ordering
+            // on cas_location orders these writes ahead of the publish, so a
+            // reader that observes new_loc (Acquire) always sees the copied bytes.
+            // On CAS failure the bytes are orphaned at dst (write_offset is not
+            // advanced, nothing points here), and we abort the copy.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src, dst, item_size);
+            }
             if hashtable.cas_location(item.key(), old_loc, new_loc, true) {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src, dst, item_size);
-                }
                 self.remove_item_at(read_offset);
                 target.header.incr_live_items();
                 target.header.incr_live_bytes(item_size as i32);
