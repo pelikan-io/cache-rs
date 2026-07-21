@@ -498,7 +498,7 @@ fn reader_pin_acquire_release() {
 
 #[test]
 fn init() {
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(4096)
         .heap_size(4096 * 64)
         .build()
@@ -512,7 +512,7 @@ fn get_free_seg() {
     let segments = 64;
     let heap_size = segments * segment_size as usize;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .segment_size(segment_size)
         .heap_size(heap_size)
         .build()

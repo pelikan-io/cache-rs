@@ -22,6 +22,17 @@ pub struct Segcache {
     pub(crate) time: Instant,
 }
 
+// Compile-time guard: Segcache must be Sync so &Segcache can be shared across
+// threads for concurrent reads (item 7b). This relies on auto-derive — the
+// hashtable carries its own `unsafe impl Send + Sync` for its raw-pointer
+// internals, and every other field is a Sync type (anonymous mmap, atomic
+// headers, lock-free Injector queues, Xoshiro RNG, atomic TTL-bucket links).
+// A future !Sync field breaks the build here rather than silently at 7e.
+const _: () = {
+    fn assert_sync<T: Sync>() {}
+    let _ = assert_sync::<Segcache>;
+};
+
 impl Segcache {
     /// Returns a new `Builder` which is used to configure and construct a
     /// `Segcache` instance.
@@ -59,7 +70,7 @@ impl Segcache {
     /// assert_eq!(cache.items(), 0);
     /// ```
     #[cfg(any(test, feature = "debug"))]
-    pub fn items(&mut self) -> usize {
+    pub fn items(&self) -> usize {
         trace!("getting segment item counts");
         self.segments.items()
     }
@@ -77,7 +88,7 @@ impl Segcache {
     /// let item = cache.get(b"coffee").expect("didn't get item back");
     /// assert_eq!(item.value(), b"strong");
     /// ```
-    pub fn get(&mut self, key: &[u8]) -> Option<Item> {
+    pub fn get(&self, key: &[u8]) -> Option<Item> {
         let verifier = self.verifier();
         let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
         let (seg_id, offset) = unpack_location(location);
@@ -111,7 +122,7 @@ impl Segcache {
     /// let mut cache = Segcache::builder().build().expect("failed to create cache");
     /// assert!(cache.get_no_freq_incr(b"coffee").is_none());
     /// ```
-    pub fn get_no_freq_incr(&mut self, key: &[u8]) -> Option<Item> {
+    pub fn get_no_freq_incr(&self, key: &[u8]) -> Option<Item> {
         let verifier = self.verifier();
         let (location, _freq) = self.hashtable.lookup_no_freq_update(key, &verifier)?;
         let (seg_id, offset) = unpack_location(location);
@@ -557,7 +568,7 @@ impl Segcache {
     /// Checks the integrity of all segments
     /// *NOTE*: this operation is relatively expensive
     #[cfg(feature = "debug")]
-    pub fn check_integrity(&mut self) -> Result<(), SegcacheError> {
+    pub fn check_integrity(&self) -> Result<(), SegcacheError> {
         if self.segments.check_integrity(&self.hashtable) {
             Ok(())
         } else {

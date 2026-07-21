@@ -25,7 +25,7 @@ fn get_benchmark(c: &mut Criterion) {
         let (keys, _values) = key_values(*key_size, 1_000_000, 0, 0);
 
         // launch the server
-        let mut cache = Segcache::builder()
+        let cache = Segcache::builder()
             .hash_power(16)
             .heap_size(64 * MB)
             .segment_size(MB as i32)

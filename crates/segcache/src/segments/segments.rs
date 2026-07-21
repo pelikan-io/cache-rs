@@ -1621,17 +1621,12 @@ impl Segments {
 
     /// Count the total number of live items across all segments.
     #[cfg(any(test, feature = "debug"))]
-    pub(crate) fn items(&mut self) -> usize {
+    pub(crate) fn items(&self) -> usize {
         let mut total = 0;
-        for id in 1..=self.cap {
-            // SAFETY: id starts at 1.
-            let segment = self
-                .get_mut(unsafe { NonZeroU32::new_unchecked(id) })
-                .unwrap();
-            segment.check_magic();
-            let count = segment.live_items();
-            debug!("{count} items in segment {id} segment: {segment:?}");
-            total += segment.live_items() as usize;
+        for idx in 0..self.cap as usize {
+            let count = self.headers[idx].live_items();
+            debug!("{count} items in segment {}", idx + 1);
+            total += count.max(0) as usize;
         }
         total
     }
