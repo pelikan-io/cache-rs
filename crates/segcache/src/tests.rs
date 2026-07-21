@@ -1847,6 +1847,19 @@ fn concurrent_readers_see_correct_values() {
         }
     });
 
+    // No reader pin leaked: every segment's ref_count is back to 0. Pins are
+    // only guaranteed released once all reader threads have joined above.
+    for id in 1..=segments as u32 {
+        assert_eq!(
+            cache
+                .segments
+                .header(NonZeroU32::new(id).unwrap())
+                .ref_count(),
+            0,
+            "segment {id} has a leaked reader pin",
+        );
+    }
+
     // After joining: cache still serves, and a write still works (exclusive &mut).
     for i in 0..KEYS {
         let item = cache
