@@ -2,30 +2,27 @@
 // Copyright 2023 Pelikan Cache contributors
 // Licensed under the MIT and Apache-2.0 licenses
 
-//! Random number generator initialization
+//! Random number generator initialization.
+//!
+//! A fast, non-cryptographic PRNG is sufficient here: it only drives
+//! eviction sampling, never anything security-sensitive.
 
-pub use inner::*;
+use ::rand::SeedableRng;
 
-#[cfg(test)]
-mod inner {
-    use ::rand::SeedableRng;
+/// The PRNG used for eviction sampling.
+pub type Random = rand_xoshiro::Xoshiro256PlusPlus;
 
-    pub type Random = rand_xoshiro::Xoshiro256PlusPlus;
-
-    // A very fast PRNG which is appropriate for testing
-    pub fn rng() -> Random {
-        rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(0)
+/// Creates a freshly-seeded [`Random`].
+///
+/// In `test` builds it is seeded from a fixed value so runs are
+/// reproducible; otherwise it is seeded from the system entropy source.
+pub fn rng() -> Random {
+    #[cfg(test)]
+    {
+        Random::seed_from_u64(0)
     }
-}
-
-#[cfg(not(test))]
-mod inner {
-    use ::rand::SeedableRng;
-
-    pub type Random = rand_xoshiro::Xoshiro256PlusPlus;
-
-    // A fast PRNG appropriate for cache eviction sampling.
-    pub fn rng() -> Random {
-        rand_xoshiro::Xoshiro256PlusPlus::from_rng(&mut ::rand::rng())
+    #[cfg(not(test))]
+    {
+        Random::from_rng(&mut ::rand::rng())
     }
 }
