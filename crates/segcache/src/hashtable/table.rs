@@ -170,6 +170,16 @@ impl MultiChoiceHashtable {
         ((hash >> 32) & 0xFFF) as u16
     }
 
+    /// Hash a key once and derive its tag and N-choice bucket indices.
+    ///
+    /// Every keyed operation starts here, so the single hash and its
+    /// expansion into candidate buckets live in one place.
+    #[inline]
+    fn probe(&self, key: &[u8]) -> (u16, [usize; MAX_CHOICES as usize]) {
+        let hash = self.hash_key(key);
+        (Self::tag_from_hash(hash), self.bucket_indices(hash))
+    }
+
     /// Count occupied (non-empty, non-ghost) slots in a bucket.
     #[inline]
     fn count_occupied(&self, bucket_index: usize) -> usize {
@@ -874,9 +884,7 @@ impl MultiChoiceHashtable {
         key: &[u8],
         verifier: &impl KeyVerifier,
     ) -> Option<(Location, SlotRef)> {
-        let hash = self.hash_key(key);
-        let tag = Self::tag_from_hash(hash);
-        let buckets = self.bucket_indices(hash);
+        let (tag, buckets) = self.probe(key);
         let num_choices = self.num_choices as usize;
 
         for &bucket_index in &buckets[..num_choices] {
@@ -991,9 +999,7 @@ impl MultiChoiceHashtable {
 
 impl Hashtable for MultiChoiceHashtable {
     fn lookup(&self, key: &[u8], verifier: &impl KeyVerifier) -> Option<(Location, u8)> {
-        let hash = self.hash_key(key);
-        let tag = Self::tag_from_hash(hash);
-        let buckets = self.bucket_indices(hash);
+        let (tag, buckets) = self.probe(key);
         let num_choices = self.num_choices as usize;
 
         for &bucket_index in &buckets[..num_choices] {
@@ -1019,9 +1025,7 @@ impl Hashtable for MultiChoiceHashtable {
         key: &[u8],
         verifier: &impl KeyVerifier,
     ) -> Option<(Location, u8)> {
-        let hash = self.hash_key(key);
-        let tag = Self::tag_from_hash(hash);
-        let buckets = self.bucket_indices(hash);
+        let (tag, buckets) = self.probe(key);
         let num_choices = self.num_choices as usize;
 
         for &bucket_index in &buckets[..num_choices] {
@@ -1038,9 +1042,7 @@ impl Hashtable for MultiChoiceHashtable {
     }
 
     fn contains(&self, key: &[u8], verifier: &impl KeyVerifier) -> bool {
-        let hash = self.hash_key(key);
-        let tag = Self::tag_from_hash(hash);
-        let buckets = self.bucket_indices(hash);
+        let (tag, buckets) = self.probe(key);
         let num_choices = self.num_choices as usize;
 
         for &bucket_index in &buckets[..num_choices] {
@@ -1062,9 +1064,7 @@ impl Hashtable for MultiChoiceHashtable {
         location: Location,
         verifier: &impl KeyVerifier,
     ) -> Result<Option<Location>, ()> {
-        let hash = self.hash_key(key);
-        let tag = Self::tag_from_hash(hash);
-        let buckets = self.bucket_indices(hash);
+        let (tag, buckets) = self.probe(key);
         let choices = &buckets[..self.num_choices as usize];
 
         let new_packed = Hashbucket::pack(tag, 1, location);
@@ -1105,9 +1105,7 @@ impl Hashtable for MultiChoiceHashtable {
     }
 
     fn remove(&self, key: &[u8], expected: Location) -> bool {
-        let hash = self.hash_key(key);
-        let tag = Self::tag_from_hash(hash);
-        let buckets = self.bucket_indices(hash);
+        let (tag, buckets) = self.probe(key);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
             if self.try_unlink_in_bucket(bucket_index, tag, expected) {
@@ -1119,9 +1117,7 @@ impl Hashtable for MultiChoiceHashtable {
     }
 
     fn convert_to_ghost(&self, key: &[u8], expected: Location) -> bool {
-        let hash = self.hash_key(key);
-        let tag = Self::tag_from_hash(hash);
-        let buckets = self.bucket_indices(hash);
+        let (tag, buckets) = self.probe(key);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
             if self.try_to_ghost_in_bucket(bucket_index, tag, expected) {
@@ -1139,9 +1135,7 @@ impl Hashtable for MultiChoiceHashtable {
         new_location: Location,
         preserve_freq: bool,
     ) -> bool {
-        let hash = self.hash_key(key);
-        let tag = Self::tag_from_hash(hash);
-        let buckets = self.bucket_indices(hash);
+        let (tag, buckets) = self.probe(key);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
             if self.try_cas_in_bucket(bucket_index, tag, old_location, new_location, preserve_freq)
@@ -1154,9 +1148,7 @@ impl Hashtable for MultiChoiceHashtable {
     }
 
     fn get_frequency(&self, key: &[u8], verifier: &impl KeyVerifier) -> Option<u8> {
-        let hash = self.hash_key(key);
-        let tag = Self::tag_from_hash(hash);
-        let buckets = self.bucket_indices(hash);
+        let (tag, buckets) = self.probe(key);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
             if let Some(freq) = self.search_bucket_for_freq(bucket_index, tag, key, verifier) {
@@ -1168,9 +1160,7 @@ impl Hashtable for MultiChoiceHashtable {
     }
 
     fn get_item_frequency(&self, key: &[u8], location: Location) -> Option<u8> {
-        let hash = self.hash_key(key);
-        let tag = Self::tag_from_hash(hash);
-        let buckets = self.bucket_indices(hash);
+        let (tag, buckets) = self.probe(key);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
             if let Some(freq) = self.search_bucket_for_item_freq(bucket_index, tag, location) {
@@ -1182,9 +1172,7 @@ impl Hashtable for MultiChoiceHashtable {
     }
 
     fn get_ghost_frequency(&self, key: &[u8]) -> Option<u8> {
-        let hash = self.hash_key(key);
-        let tag = Self::tag_from_hash(hash);
-        let buckets = self.bucket_indices(hash);
+        let (tag, buckets) = self.probe(key);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
             if let Some(freq) = self.search_bucket_for_ghost(bucket_index, tag) {
