@@ -114,13 +114,6 @@ pub static SEGMENT_CURRENT: Gauge = Gauge::new();
 
 // hash table related
 #[metric(
-    name = "hash_tag_collision",
-    description = "number of partial hash collisions",
-    metadata = { engine = "segcache" }
-)]
-pub static HASH_TAG_COLLISION: Counter = Counter::new();
-
-#[metric(
     name = "hash_insert",
     description = "number of inserts into the hash table",
     metadata = { engine = "segcache" }
@@ -140,13 +133,6 @@ pub static HASH_INSERT_EX: Counter = Counter::new();
     metadata = { engine = "segcache" }
 )]
 pub static HASH_REMOVE: Counter = Counter::new();
-
-#[metric(
-    name = "hash_lookup",
-    description = "total number of lookups against the hash table",
-    metadata = { engine = "segcache" }
-)]
-pub static HASH_LOOKUP: Counter = Counter::new();
 
 // item related
 #[metric(

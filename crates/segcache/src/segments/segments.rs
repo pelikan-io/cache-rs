@@ -1840,7 +1840,10 @@ impl Segments {
                         dst.set_write_offset(write_offset as i32 + item_size as i32);
 
                         #[cfg(feature = "metrics")]
-                        ITEM_COMPACTED.increment();
+                        {
+                            ITEM_RELINK.increment();
+                            ITEM_COMPACTED.increment();
+                        }
                     }
                 }
                 // If no room in target, item stays in source and will be evicted.

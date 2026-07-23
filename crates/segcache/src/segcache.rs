@@ -305,8 +305,14 @@ impl Segcache {
                         .hashtable
                         .insert(reserved.item().key(), new_location, &verifier)
                     {
-                        Ok(None) => return Ok(()),
+                        Ok(None) => {
+                            #[cfg(feature = "metrics")]
+                            HASH_INSERT.increment();
+                            return Ok(());
+                        }
                         Ok(Some(raced_old)) => {
+                            #[cfg(feature = "metrics")]
+                            HASH_INSERT.increment();
                             drop(reserved);
                             let (raced_seg, raced_offset) = unpack_location(raced_old);
                             if let Some(raced_seg) = NonZeroU32::new(raced_seg) {
@@ -325,6 +331,8 @@ impl Segcache {
                         Err(()) => {
                             // Hashtable full — roll back the (unpublished)
                             // reservation.
+                            #[cfg(feature = "metrics")]
+                            HASH_INSERT_EX.increment();
                             self.rollback_reservation(reserved, new_seg, new_offset);
                             return Err(SegcacheError::HashTableInsertEx);
                         }

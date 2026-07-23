@@ -293,6 +293,7 @@ impl<'a> Segment<'a> {
 
                 #[cfg(feature = "metrics")]
                 {
+                    ITEM_RELINK.increment();
                     items_copied += 1;
                     bytes_copied += item_size;
                 }
