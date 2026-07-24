@@ -7,6 +7,7 @@
 use crate::Value;
 use crate::*;
 use core::num::NonZeroU32;
+use crossbeam_utils::Backoff;
 use std::cmp::min;
 
 const RESERVE_RETRIES: usize = 3;
@@ -235,6 +236,7 @@ impl Segcache {
         // `cas_location` re-probing the key's candidate buckets from
         // scratch — the hashtable does one hash per op regardless, so this
         // only elides the redundant second bucket scan/verify.
+        let backoff = Backoff::new();
         loop {
             match self.hashtable.lookup_slot(key, &verifier) {
                 Some((old_location, slot)) => {
@@ -257,7 +259,7 @@ impl Segcache {
                     // 7f). If a drain has already claimed the segment, it
                     // owns the item's removal — bail and retry the lookup.
                     let Some(pin) = self.segments.try_pin_remover(old_seg_id) else {
-                        std::hint::spin_loop();
+                        backoff.snooze();
                         continue;
                     };
 
@@ -495,6 +497,7 @@ impl Segcache {
             return Err(SegcacheError::NotFound);
         };
 
+        let backoff = Backoff::new();
         loop {
             // Pin the OLD item's segment BEFORE unlinking it (item 7f): the
             // pin brackets both the `cas_location` unlink below and the
@@ -517,7 +520,7 @@ impl Segcache {
                         self.rollback_reservation(reserved, new_seg, new_offset);
                         return Err(SegcacheError::Exists);
                     }
-                    std::hint::spin_loop();
+                    backoff.snooze();
                     continue;
                 }
             };

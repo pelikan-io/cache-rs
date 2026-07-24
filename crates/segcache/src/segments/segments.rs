@@ -9,6 +9,7 @@ use crate::sync::Ordering;
 use crate::*;
 use core::hash::{BuildHasher, Hasher};
 use core::num::NonZeroU32;
+use crossbeam_utils::Backoff;
 use memmap2::MmapOptions;
 
 /// `Segments` contain all items within the cache. This struct is a collection
@@ -803,9 +804,12 @@ impl Segments {
             // observed Live before our CAS is counted here; any that increments
             // after sees Draining and bails. Wait for the counted ones to finish
             // define+publish before we parse the item stream (item 7d, H1/H2).
-            // Bounded: a pinned writer is straight-line define+publish.
+            // Bounded: a pinned writer is straight-line define+publish. The
+            // snooze yields after a short spin so a descheduled pin holder
+            // gets CPU on an oversubscribed host.
+            let backoff = Backoff::new();
             while self.headers[id_idx].active_writers() != 0 {
-                std::hint::spin_loop();
+                backoff.snooze();
             }
             // Item 7f: also wait for in-flight replace/delete removes of this
             // segment's items to finish decrementing before we parse/reclaim it
@@ -813,7 +817,7 @@ impl Segments {
             // after our claim CAS sees Draining (try_pin_remover recheck) and
             // bails, so this converges.
             while self.headers[id_idx].active_removers() != 0 {
-                std::hint::spin_loop();
+                backoff.snooze();
             }
         }
         won

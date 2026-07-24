@@ -17,6 +17,7 @@ ahash = "0.8.12"
 blake3 = "1.8.3"
 clocksource = "0.8.3"
 crossbeam-deque = "0.8.6"
+crossbeam-utils = "0.8.21"
 criterion = "0.8.2"
 datatier = { path = "crates/datatier", version = "0.1.1" }
 keyvalue = { path = "crates/keyvalue", version = "0.3.0" }

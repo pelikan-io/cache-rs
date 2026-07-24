@@ -966,6 +966,7 @@ dependencies = [
  "clocksource",
  "criterion",
  "crossbeam-deque",
+ "crossbeam-utils",
  "keyvalue",
  "log",
  "loom",

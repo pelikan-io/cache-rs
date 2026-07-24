@@ -28,6 +28,7 @@ use crate::segments::AllocOutcome;
 use crate::sync::{AtomicU32, Ordering};
 use crate::*;
 use core::num::NonZeroU32;
+use crossbeam_utils::Backoff;
 
 /// A TTL bucket holding a doubly-linked segment chain.
 ///
@@ -224,14 +225,17 @@ impl TtlBucket {
             // parse this segment's item stream (item 7d, H1/H2). Claimer half of
             // the Dekker pair: our SeqCst state CAS above precedes this SeqCst
             // load, so every writer that passed its recheck-Live is counted, and
-            // any later writer sees Draining and bails.
+            // any later writer sees Draining and bails. The snooze yields after
+            // a short spin so a descheduled pin holder gets CPU on an
+            // oversubscribed host.
+            let backoff = Backoff::new();
             while segments.header(seg_id).active_writers() != 0 {
-                std::hint::spin_loop();
+                backoff.snooze();
             }
             // Item 7f: wait for in-flight replace/delete removes of this
             // segment's items before parsing (see claim_for_drain).
             while segments.header(seg_id).active_removers() != 0 {
-                std::hint::spin_loop();
+                backoff.snooze();
             }
 
             segment.clear(hashtable, true);
@@ -355,6 +359,7 @@ impl TtlBucket {
         let won = match observed_tail {
             Some(tail_id) => {
                 let tail = segments.header(tail_id);
+                let backoff = Backoff::new();
                 loop {
                     // THE SEAL: the old tail stops accepting writes and
                     // becomes evictable at the exact moment its
@@ -386,7 +391,7 @@ impl TtlBucket {
                     // stays Live. Only a state change decides the
                     // election.
                     if tail.state() == State::Live {
-                        std::hint::spin_loop();
+                        backoff.snooze();
                         continue;
                     }
                     break false;
@@ -428,8 +433,9 @@ impl TtlBucket {
             // to advance — the winner's store is imminent — so the
             // caller's retry sees the fresh segment, then put our
             // reserved segment back.
+            let backoff = Backoff::new();
             while self.tail() == observed_tail {
-                std::hint::spin_loop();
+                backoff.snooze();
             }
             segments.release_unused(id);
         }
@@ -455,6 +461,7 @@ impl TtlBucket {
             return Err(TtlBucketsError::ItemOversized { size });
         }
 
+        let backoff = Backoff::new();
         loop {
             let tail = self.tail();
             match tail {
@@ -469,7 +476,7 @@ impl TtlBucket {
                             // chain is about to advance. Re-read the tail rather
                             // than expanding behind a transient state. Unreachable
                             // single-threaded (seal+publish happen inside try_expand).
-                            std::hint::spin_loop();
+                            backoff.snooze();
                             continue;
                         }
                         AllocOutcome::Full => {
