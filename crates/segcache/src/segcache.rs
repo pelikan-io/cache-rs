@@ -61,6 +61,12 @@ impl Segcache {
         self.segments.verifier()
     }
 
+    /// Clamp a caller-supplied TTL into the coarse-clock seconds range.
+    #[inline]
+    fn coarse_ttl(ttl: std::time::Duration) -> Duration {
+        Duration::from_secs(min(u32::MAX as u64, ttl.as_secs()) as u32)
+    }
+
     /// Gets a count of items in the `Segcache` instance. This is an expensive
     /// operation and is only enabled for tests and builds with the `debug`
     /// feature enabled.
@@ -91,10 +97,27 @@ impl Segcache {
     /// assert_eq!(item.value(), b"strong");
     /// ```
     pub fn get(&self, key: &[u8]) -> Option<Item> {
+        self.get_pinned(key, true)
+    }
+
+    /// Shared lookup for [`Self::get`]/[`Self::get_no_freq_incr`]: resolve
+    /// the key, pin the item's segment, re-validate, and hand out the item.
+    /// `update_freq` selects whether the initial lookup bumps the item's
+    /// frequency counter.
+    // inline(always) is measured, not cargo-cult (same story as
+    // reserve_and_define): the extraction from get() cost ~3ns on the 255b
+    // get benchmark until the call boundary was forced away. It also lets
+    // the constant `update_freq` fold at each call site.
+    #[inline(always)]
+    fn get_pinned(&self, key: &[u8], update_freq: bool) -> Option<Item> {
         let verifier = self.verifier();
         let mut attempts = 0;
         loop {
-            let (location, _freq) = self.hashtable.lookup(key, &verifier)?;
+            let (location, _freq) = if update_freq {
+                self.hashtable.lookup(key, &verifier)?
+            } else {
+                self.hashtable.lookup_no_freq_update(key, &verifier)?
+            };
             let (seg_id, offset) = unpack_location(location);
             let seg_id = NonZeroU32::new(seg_id)?;
             let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
@@ -149,32 +172,7 @@ impl Segcache {
     /// assert!(cache.get_no_freq_incr(b"coffee").is_none());
     /// ```
     pub fn get_no_freq_incr(&self, key: &[u8]) -> Option<Item> {
-        let verifier = self.verifier();
-        let mut attempts = 0;
-        loop {
-            let (location, _freq) = self.hashtable.lookup_no_freq_update(key, &verifier)?;
-            let (seg_id, offset) = unpack_location(location);
-            let seg_id = NonZeroU32::new(seg_id)?;
-            let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
-            // Re-validate after pinning (see `get`): a fresh lookup confirms the
-            // key still resolves to this exact location, so the pinned segment
-            // wasn't recycled+reused out from under us (item 7f reader safety).
-            if self
-                .hashtable
-                .lookup_no_freq_update(key, &verifier)
-                .map(|(l, _)| l)
-                == Some(location)
-            {
-                raw.check_magic();
-                let cas = Self::token_for(&raw, location, self.segments.generation(seg_id));
-                return Some(Item::new(raw, cas, guard));
-            }
-            drop(guard);
-            attempts += 1;
-            if attempts >= RESERVE_RETRIES {
-                return None;
-            }
-        }
+        self.get_pinned(key, false)
     }
 
     /// Insert a new item into the cache. May return an error indicating that
@@ -206,7 +204,7 @@ impl Segcache {
         // default optional data is empty
         let optional = optional.unwrap_or(&[]);
 
-        let ttl = Duration::from_secs(min(u32::MAX as u64, ttl.as_secs()) as u32);
+        let ttl = Self::coarse_ttl(ttl);
 
         let reserved = self.reserve_and_define(key, value, optional, ttl)?;
 
@@ -381,8 +379,12 @@ impl Segcache {
         // must agree, so both use keyvalue's item_size)
         let size = keyvalue::item_size(key.len(), &value, optional.len());
 
-        // For S3-FIFO: determine target pool based on ghost queue
-        let target_pool = if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. }) {
+        // For S3-FIFO: route the item by ghost-queue membership (a recently
+        // evicted key skips the admission pool), then ensure the target pool
+        // has room by evicting from it if it's at capacity — this enforces
+        // the small/main ratio computed at construction time.
+        let mut target_pool = SegmentPool::Main;
+        if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. }) {
             let hash = {
                 let mut hasher = self.hashtable.hash_builder().build_hasher();
                 hasher.write(key);
@@ -390,21 +392,13 @@ impl Segcache {
             };
             if self.segments.ghost_contains(hash) {
                 self.segments.ghost_remove(hash);
-                SegmentPool::Main
             } else {
-                SegmentPool::Admission
+                target_pool = SegmentPool::Admission;
             }
-        } else {
-            SegmentPool::Main
-        };
 
-        // For S3-FIFO: ensure the target pool has room by evicting from it
-        // if it's at capacity. This enforces the small/main ratio computed
-        // at construction time.
-        if matches!(self.segments.evict_policy(), Policy::S3Fifo { .. })
-            && !self.segments.pool_has_room(target_pool)
-        {
-            let _ = self.segments.evict(&self.ttl_buckets, &self.hashtable);
+            if !self.segments.pool_has_room(target_pool) {
+                let _ = self.segments.evict(&self.ttl_buckets, &self.hashtable);
+            }
         }
 
         let mut retries = RESERVE_RETRIES;
@@ -450,22 +444,21 @@ impl Segcache {
                         // the reserve without spending a retry.
                         continue;
                     }
+
                     retries -= 1;
+                    if retries == 0 {
+                        // couldn't make room: count the failed request and
+                        // return with an error
+                        #[cfg(feature = "metrics")]
+                        {
+                            SEGMENT_REQUEST.increment();
+                            SEGMENT_REQUEST_FAILURE.increment();
+                        }
+
+                        return Err(SegcacheError::NoFreeSegments);
+                    }
                 }
             }
-            if retries == 0 {
-                // segment acquire failed, increment the stats and return with
-                // an error
-
-                #[cfg(feature = "metrics")]
-                {
-                    SEGMENT_REQUEST.increment();
-                    SEGMENT_REQUEST_FAILURE.increment();
-                }
-
-                return Err(SegcacheError::NoFreeSegments);
-            }
-            retries -= 1;
         }
     }
 
@@ -667,7 +660,7 @@ impl Segcache {
 
         let value: Value = value.into();
         let optional = optional.unwrap_or(&[]);
-        let ttl = Duration::from_secs(min(u32::MAX as u64, ttl.as_secs()) as u32);
+        let ttl = Self::coarse_ttl(ttl);
 
         // Publish by swapping the hashtable slot only if it still holds
         // the token-checked location — the linearization point. A plain
@@ -857,10 +850,7 @@ impl Segcache {
             // Lazy expiry: a counter past its segment deadline is
             // treated as missing, matching memcached, even before
             // expire() reclaims the segment.
-            let (create_at, ttl) = self.segments.expiry_info(seg_id);
-            if ttl.as_secs() != 0 && create_at + ttl <= Instant::now() {
-                return Err(SegcacheError::NotFound);
-            }
+            self.remaining_ttl(seg_id)?;
 
             match self.segments.acquire_item_at(seg_id, offset) {
                 // Segment not readable (draining; a relocation is in
