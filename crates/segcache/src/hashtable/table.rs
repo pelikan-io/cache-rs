@@ -1705,6 +1705,16 @@ mod loom_tests {
             let ht = Arc::new(MultiChoiceHashtable::new(7));
             let verifier = Arc::new(AlwaysVerifier);
 
+            // Distinct stripes: a collision would serialize these keys and
+            // silently shrink the interleaving space loom explores (see
+            // NUM_STRIPES).
+            let s1 = ht.stripe(ht.hash_key(b"key1"));
+            let s2 = ht.stripe(ht.hash_key(b"key2"));
+            assert!(
+                !std::ptr::eq(s1, s2),
+                "key1/key2 share an insert stripe: choose different keys or raise NUM_STRIPES under loom"
+            );
+
             let ht1 = ht.clone();
             let v1 = verifier.clone();
             let t1 = thread::spawn(move || {
@@ -1955,6 +1965,25 @@ mod loom_tests {
             let ht = Arc::new(MultiChoiceHashtable::new(10));
             let verifier = Arc::new(AlwaysVerifier);
 
+            // Distinct stripes: a collision would serialize the colliding
+            // keys and silently shrink the interleaving space loom explores
+            // (see NUM_STRIPES).
+            let s1 = ht.stripe(ht.hash_key(b"key1"));
+            let s2 = ht.stripe(ht.hash_key(b"key2"));
+            let s3 = ht.stripe(ht.hash_key(b"key3"));
+            assert!(
+                !std::ptr::eq(s1, s2),
+                "key1/key2 share an insert stripe: choose different keys or raise NUM_STRIPES under loom"
+            );
+            assert!(
+                !std::ptr::eq(s1, s3),
+                "key1/key3 share an insert stripe: choose different keys or raise NUM_STRIPES under loom"
+            );
+            assert!(
+                !std::ptr::eq(s2, s3),
+                "key2/key3 share an insert stripe: choose different keys or raise NUM_STRIPES under loom"
+            );
+
             let ht1 = ht.clone();
             let v1 = verifier.clone();
             let ht2 = ht.clone();
@@ -2053,6 +2082,136 @@ mod loom_tests {
 
             writer.join().unwrap();
             reader.join().unwrap();
+        });
+    }
+
+    // Fresh-key insert de-dup: two threads race the very first insert of
+    // one key; the stripe lock (loom::sync::Mutex under this cfg)
+    // serializes entry creation, so exactly one live entry may exist
+    // post-join. A mutex-serialized invariant is SC-independent, so --
+    // unlike the SeqCst Dekker pairs -- loom genuinely verifies this one.
+    #[test]
+    fn loom_fresh_key_insert_single_entry() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            let ht1 = ht.clone();
+            let v1 = verifier.clone();
+            let t1 = thread::spawn(move || ht1.insert(b"key", Location::new(1), &*v1));
+
+            let ht2 = ht.clone();
+            let v2 = verifier.clone();
+            let t2 = thread::spawn(move || ht2.insert(b"key", Location::new(2), &*v2));
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Both succeed, and exactly one thread CREATES (Ok(None)) --
+            // the other must observe the winner under the stripe re-check
+            // and resolve to a replace (Ok(Some(_))).
+            assert!(r1.is_ok() && r2.is_ok());
+            assert_eq!(
+                [&r1, &r2].iter().filter(|r| matches!(r, Ok(None))).count(),
+                1,
+                "exactly one racer creates; the other must replace"
+            );
+
+            // Count live same-tag entries across the key's candidate
+            // buckets (AlwaysVerifier verifies anything, so tag-match
+            // suffices -- only this one key was ever inserted). Dedupe
+            // coincident bucket indices, like `count_live_entries`.
+            let hash = ht.hash_key(b"key");
+            let tag = MultiChoiceHashtable::tag_from_hash(hash);
+            let buckets = ht.bucket_indices(hash);
+            let mut scanned: Vec<usize> = Vec::new();
+            let mut live = 0;
+            for &bucket_index in &buckets[..ht.num_choices as usize] {
+                if scanned.contains(&bucket_index) {
+                    continue;
+                }
+                scanned.push(bucket_index);
+                let bucket = ht.bucket(bucket_index);
+                for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+                    let packed = bucket.items[slot_index].load(Ordering::Acquire);
+                    if packed != 0
+                        && !Hashbucket::is_ghost(packed)
+                        && Hashbucket::tag(packed) == tag
+                    {
+                        live += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                live, 1,
+                "fresh-key race must resolve to exactly one live entry"
+            );
+        });
+    }
+
+    // Ghost-takeover variant of the fresh-key race: the key's prior entry
+    // was converted to a ghost (S3-FIFO), so racing fresh inserts resolve
+    // through try_claim_new_slot's matching-tag ghost takeover -- the
+    // creation path where two racers could otherwise take over two
+    // DIFFERENT slots. Same single-entry invariant, same result shape:
+    // exactly one creator.
+    #[test]
+    fn loom_fresh_key_insert_after_ghost_single_entry() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            // Seed and ghost the key single-threaded, pre-race.
+            ht.insert(b"key", Location::new(1), &*verifier).unwrap();
+            assert!(ht.convert_to_ghost(b"key", Location::new(1)));
+
+            let ht1 = ht.clone();
+            let v1 = verifier.clone();
+            let t1 = thread::spawn(move || ht1.insert(b"key", Location::new(2), &*v1));
+
+            let ht2 = ht.clone();
+            let v2 = verifier.clone();
+            let t2 = thread::spawn(move || ht2.insert(b"key", Location::new(3), &*v2));
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            assert!(r1.is_ok() && r2.is_ok());
+            assert_eq!(
+                [&r1, &r2].iter().filter(|r| matches!(r, Ok(None))).count(),
+                1,
+                "exactly one racer creates; the other must replace"
+            );
+
+            // Count live same-tag entries across the key's candidate
+            // buckets (AlwaysVerifier verifies anything, so tag-match
+            // suffices -- only this one key was ever inserted). Dedupe
+            // coincident bucket indices, like `count_live_entries`.
+            let hash = ht.hash_key(b"key");
+            let tag = MultiChoiceHashtable::tag_from_hash(hash);
+            let buckets = ht.bucket_indices(hash);
+            let mut scanned: Vec<usize> = Vec::new();
+            let mut live = 0;
+            for &bucket_index in &buckets[..ht.num_choices as usize] {
+                if scanned.contains(&bucket_index) {
+                    continue;
+                }
+                scanned.push(bucket_index);
+                let bucket = ht.bucket(bucket_index);
+                for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+                    let packed = bucket.items[slot_index].load(Ordering::Acquire);
+                    if packed != 0
+                        && !Hashbucket::is_ghost(packed)
+                        && Hashbucket::tag(packed) == tag
+                    {
+                        live += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                live, 1,
+                "fresh-key race must resolve to exactly one live entry"
+            );
         });
     }
 }
