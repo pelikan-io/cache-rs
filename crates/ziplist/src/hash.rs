@@ -34,7 +34,7 @@ use crate::cursor::Cursor;
 use crate::entry::{canonical_uint, encoded_len, EntryVal};
 use crate::error::{DecodeError, Fit, NeedBytes};
 use crate::header::{BlockHeader, Type};
-use crate::map::{pair_seek, PairKey, SeekResult};
+use crate::map::{pair_seek, PairKey, SeekResult, Stride};
 
 /// Classifies raw field/value bytes the same way
 /// [`compare_raw`](crate::entry::compare_raw) does: a canonical decimal
@@ -124,7 +124,7 @@ impl<'a> HashView<'a> {
     /// Returns `field`'s value, or `None` if the field doesn't exist.
     pub fn hget(&self, field: &[u8]) -> Result<Option<EntryVal<'a>>, DecodeError> {
         let key = classify(field);
-        match pair_seek(self.buf, &self.hdr, &key, PairKey::First) {
+        match pair_seek(self.buf, &self.hdr, &key, PairKey::First, Stride::Pair) {
             SeekResult::Found { val_cur, .. } => Ok(Some(val_cur.value(self.buf)?)),
             _ => Ok(None),
         }
@@ -206,7 +206,13 @@ impl<'a> HashMut<'a> {
         // through `hget` as `EntryVal::Str(b"9")`, not `Uint(9)`) — see the
         // [module docs](self).
         let val = EntryVal::Str(value);
-        match pair_seek(self.blk.bytes(), self.blk.header(), &key, PairKey::First) {
+        match pair_seek(
+            self.blk.bytes(),
+            self.blk.header(),
+            &key,
+            PairKey::First,
+            Stride::Pair,
+        ) {
             SeekResult::Found { val_cur, .. } => {
                 self.blk.replace_at(val_cur, &val)?;
                 Ok(HSet::Updated)
@@ -226,7 +232,13 @@ impl<'a> HashMut<'a> {
     /// field didn't exist (nothing removed).
     pub fn hdel(&mut self, field: &[u8]) -> Option<Fit> {
         let key = classify(field);
-        match pair_seek(self.blk.bytes(), self.blk.header(), &key, PairKey::First) {
+        match pair_seek(
+            self.blk.bytes(),
+            self.blk.header(),
+            &key,
+            PairKey::First,
+            Stride::Pair,
+        ) {
             SeekResult::Found { key_cur, val_cur } => {
                 // val_cur always sits at a higher offset than key_cur
                 // (adjacent pair, value follows field): removing it first
@@ -252,7 +264,13 @@ impl<'a> HashMut<'a> {
         delta: i64,
     ) -> Result<Result<u64, IncrError>, NeedBytes> {
         let key = classify(field);
-        match pair_seek(self.blk.bytes(), self.blk.header(), &key, PairKey::First) {
+        match pair_seek(
+            self.blk.bytes(),
+            self.blk.header(),
+            &key,
+            PairKey::First,
+            Stride::Pair,
+        ) {
             SeekResult::Found { val_cur, .. } => {
                 let current = val_cur
                     .value(self.blk.bytes())
