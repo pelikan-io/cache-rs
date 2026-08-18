@@ -11,8 +11,10 @@ pub mod block;
 pub mod cursor;
 pub mod entry;
 pub mod error;
+pub mod hash;
 pub mod header;
 pub mod list;
+mod map;
 
 pub use block::{Block, BlockMut, InsertPos};
 pub use cursor::{locate, Cursor};
@@ -21,5 +23,6 @@ pub use entry::{
     render_uint, EntryVal,
 };
 pub use error::{DecodeError, Fit, NeedBytes};
+pub use hash::{HSet, HashMut, HashView, IncrError};
 pub use header::{BlockHeader, Type, FLAG_CHAIN_ROOT, HEADER_SIZE};
 pub use list::{ListMut, ListView};
