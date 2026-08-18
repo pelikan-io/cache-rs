@@ -10,9 +10,10 @@
 use crate::hashtable::bucket::Hashbucket;
 use crate::hashtable::location::Location;
 use crate::hashtable::traits::{Hashtable, KeyVerifier};
-use crate::sync::Ordering;
+use crate::sync::{Mutex, Ordering};
 use ahash::RandomState;
 use core::hash::{BuildHasher, Hasher};
+use crossbeam_utils::CachePadded;
 
 /// Maximum number of bucket choices supported.
 pub const MAX_CHOICES: u8 = 8;
@@ -46,14 +47,35 @@ pub struct MultiChoiceHashtable {
     num_buckets: usize,
     mask: u64,
     num_choices: u8,
+    /// Striped insert locks. Entry CREATION for a key (empty-slot claim,
+    /// ghost takeover) is serialized per key-hash stripe with an
+    /// under-lock absence re-check (see `insert`); entry MUTATION
+    /// (replace, relocate, remove, ghost-convert) stays lock-free.
+    ///
+    /// LOCK: leaf — the critical section is pure bucket-word CAS +
+    /// verifier reads; it is never held across any other lock, pin
+    /// acquisition, or wait.
+    insert_locks: Box<[CachePadded<Mutex<()>>]>,
 }
 
-// SAFETY: All mutable state is behind AtomicU64 with proper ordering.
+// SAFETY: All mutable state is behind AtomicU64 (bucket slots) or Mutex
+// (insert stripes), both Sync; the raw-pointer-free remainder is immutable
+// after construction.
 unsafe impl Send for MultiChoiceHashtable {}
 unsafe impl Sync for MultiChoiceHashtable {}
 
 #[allow(dead_code)]
 impl MultiChoiceHashtable {
+    /// Insert-lock stripe count (power of two). Contention needs two
+    /// concurrent FRESH inserts whose key hashes collide mod the stripe
+    /// count — rare, and a collision costs a short wait, not correctness.
+    /// Under loom the array shrinks (loom tracks every sync object) —
+    /// but a stripe COLLISION between two keys in a loom model silently
+    /// serializes them and shrinks the explored interleaving space, so
+    /// multi-key loom models must assert their keys map to distinct
+    /// stripes.
+    const NUM_STRIPES: usize = if cfg!(feature = "loom") { 16 } else { 1024 };
+
     /// Create a new hashtable with two-choice hashing (default).
     ///
     /// # Parameters
@@ -93,12 +115,18 @@ impl MultiChoiceHashtable {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
+        let insert_locks = (0..Self::NUM_STRIPES)
+            .map(|_| CachePadded::new(Mutex::new(())))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         Self {
             hash_builder: Box::new(hash_builder),
             buckets,
             num_buckets,
             mask,
             num_choices,
+            insert_locks,
         }
     }
 
@@ -111,6 +139,12 @@ impl MultiChoiceHashtable {
     fn bucket(&self, index: usize) -> &Hashbucket {
         debug_assert!(index < self.num_buckets);
         &self.buckets[index]
+    }
+
+    /// The insert stripe for a key hash (see `insert_locks`).
+    #[inline]
+    fn stripe(&self, hash: u64) -> &Mutex<()> {
+        &self.insert_locks[(hash as usize) & (Self::NUM_STRIPES - 1)]
     }
 
     /// Prefetch a bucket into cache.
@@ -692,7 +726,14 @@ impl MultiChoiceHashtable {
                 let location = Hashbucket::location(packed);
 
                 if !verifier.verify(key, location, true) {
-                    break; // a DIFFERENT key occupies this slot — next slot
+                    // `packed` may be stale: a racing same-key relocation
+                    // moved this entry and `location`'s bytes were recycled,
+                    // so verify falsely reports "different key". Re-validate
+                    // before concluding.
+                    if bucket.items[slot_index].load(Ordering::Acquire) == packed {
+                        break; // slot unchanged — genuinely a different key
+                    }
+                    continue; // slot changed under us — re-read THIS slot
                 }
 
                 let freq = Hashbucket::freq(packed);
@@ -719,8 +760,8 @@ impl MultiChoiceHashtable {
     /// any ghost. Returns true if a slot was claimed.
     ///
     /// Entry creation only — the caller (`insert`) has already established
-    /// that no live entry for the key exists, and (from Task 4 on) holds
-    /// the key's insert stripe lock while calling this.
+    /// that no live entry for the key exists and holds the key's insert
+    /// stripe lock while calling this.
     fn try_claim_new_slot(&self, bucket_index: usize, tag: u16, new_packed: u64) -> bool {
         let bucket = self.bucket(bucket_index);
 
@@ -1029,6 +1070,8 @@ impl MultiChoiceHashtable {
     }
 }
 
+const _: () = assert!(MultiChoiceHashtable::NUM_STRIPES.is_power_of_two());
+
 // ============================================================================
 // Hashtable trait implementation
 // ============================================================================
@@ -1100,7 +1143,7 @@ impl Hashtable for MultiChoiceHashtable {
         location: Location,
         verifier: &impl KeyVerifier,
     ) -> Result<Option<Location>, ()> {
-        let (_hash, tag, buckets) = self.probe_with_hash(key);
+        let (hash, tag, buckets) = self.probe_with_hash(key);
         let choices = &buckets[..self.num_choices as usize];
 
         let new_packed = Hashbucket::pack(tag, 1, location);
@@ -1109,6 +1152,28 @@ impl Hashtable for MultiChoiceHashtable {
         // the candidate buckets. Scanning ALL choices before any claim is
         // load-bearing: claiming a new slot in an earlier bucket while the
         // key's live entry sits in a later one would publish a duplicate.
+        for &bucket_index in choices {
+            if let Some(old) =
+                self.try_replace_existing(bucket_index, tag, key, new_packed, verifier)
+            {
+                return Ok(Some(old));
+            }
+        }
+
+        // Fresh key: entry CREATION is serialized per key-hash stripe.
+        // Two racing fresh inserters of one key both reach here; the
+        // loser of the lock sees the winner's entry in the re-check below
+        // and resolves to a replace. Mutation paths never make an
+        // existing key's entry vanish-and-reappear (replace/relocate are
+        // in-place slot CASes; a concurrent delete linearizes as
+        // delete-then-insert), so a re-check miss really means absent.
+        // The stripe lock is a LEAF: the critical section is pure
+        // bucket-word CAS + verifier reads — it never takes another lock,
+        // pin, or wait.
+        let _guard = self.stripe(hash).lock().unwrap();
+
+        // Re-check under the lock: a racing fresh insert may have
+        // published while we waited.
         for &bucket_index in choices {
             if let Some(old) =
                 self.try_replace_existing(bucket_index, tag, key, new_packed, verifier)
@@ -1128,9 +1193,11 @@ impl Hashtable for MultiChoiceHashtable {
         // All candidate buckets full of live entries: retry least-full
         // first (a racing remove may have freed a slot since the scan).
         if self.num_choices > 1 {
-            let mut sorted: Vec<_> = choices.to_vec();
-            sorted.sort_by_key(|&b| self.count_occupied(b));
-            for bucket_index in sorted {
+            let mut sorted = [0usize; MAX_CHOICES as usize];
+            sorted[..choices.len()].copy_from_slice(choices);
+            let sorted = &mut sorted[..choices.len()];
+            sorted.sort_unstable_by_key(|&b| self.count_occupied(b));
+            for &bucket_index in sorted.iter() {
                 if self.try_claim_new_slot(bucket_index, tag, new_packed) {
                     return Ok(None);
                 }
@@ -1269,7 +1336,15 @@ mod tests {
         let num_choices = ht.num_choices as usize;
 
         let mut live_count = 0;
+        let mut scanned: Vec<usize> = Vec::with_capacity(num_choices);
         for &bucket_index in &buckets[..num_choices] {
+            // A key's choices can alias (small tables); scanning the same
+            // bucket twice would count one entry as two.
+            if scanned.contains(&bucket_index) {
+                continue;
+            }
+            scanned.push(bucket_index);
+
             let bucket = ht.bucket(bucket_index);
             for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
                 let packed = bucket.items[slot_index].load(Ordering::Acquire);
@@ -1427,8 +1502,8 @@ mod tests {
     // then independently claim two *different* empty slots via
     // `compare_exchange(0, ..)`, producing a duplicate. That is a TOCTOU
     // race across the replace/claim boundary in `insert`, not the
-    // matching-slot CAS-retry bug this test/fix targets, and it is not
-    // fixed here — flagged for a follow-up item.
+    // matching-slot CAS-retry bug this test targets; it is covered by
+    // `test_concurrent_fresh_key_insert_no_duplicates` below.
     #[test]
     fn test_concurrent_same_key_insert_no_duplicates() {
         use std::sync::Arc;
@@ -1486,6 +1561,54 @@ mod tests {
             "expected exactly one live entry for the key after concurrent \
              same-key inserts, found {live_count}"
         );
+    }
+
+    // The fresh-key duplicate-publish race (item 7f's tracked follow-up):
+    // with NO seed entry, racing first inserts of one key could each pass
+    // the live-entry scan and then claim two DIFFERENT slots (same or
+    // different candidate bucket). The insert stripe lock serializes entry
+    // creation with an under-lock re-check, so exactly one live entry
+    // must survive every trial.
+    // NOTE: a fully serialized scheduling yields a vacuous green — this
+    // test's strength rests on the recorded red/green bite-check, not the
+    // assertion alone.
+    #[test]
+    fn test_concurrent_fresh_key_insert_no_duplicates() {
+        use std::sync::{Arc, Barrier};
+
+        const NUM_THREADS: usize = 4;
+        const TRIALS: usize = 2000;
+
+        for trial in 0..TRIALS {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let key = format!("fresh-{trial}").into_bytes();
+
+            let mut verifier = MockVerifier::new();
+            for t in 0..NUM_THREADS {
+                verifier.add(&key, Location::new((t + 1) as u64), false);
+            }
+            let verifier = Arc::new(verifier);
+            let barrier = Arc::new(Barrier::new(NUM_THREADS));
+
+            std::thread::scope(|scope| {
+                for t in 0..NUM_THREADS {
+                    let ht = ht.clone();
+                    let verifier = verifier.clone();
+                    let barrier = barrier.clone();
+                    let key = key.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let _ = ht.insert(&key, Location::new((t + 1) as u64), &*verifier);
+                    });
+                }
+            });
+
+            assert_eq!(
+                count_live_entries(&ht, &key, &*verifier),
+                1,
+                "trial {trial}: fresh-key race published a duplicate"
+            );
+        }
     }
 
     // A live entry must be REPLACED wherever it lives among the candidate
