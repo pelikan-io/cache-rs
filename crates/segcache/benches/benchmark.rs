@@ -109,6 +109,38 @@ fn set_benchmark(c: &mut Criterion) {
     }
 }
 
+fn set_fresh_benchmark(c: &mut Criterion) {
+    let ttl = Duration::ZERO;
+    let mut group = c.benchmark_group("set_fresh");
+    group.measurement_time(Duration::from_secs(30));
+    group.throughput(Throughput::Elements(1));
+
+    // Monotonically unique keys: every op is a genuine FRESH-key insert.
+    // The `set` bench cycles a fixed 1M-key set and is mostly overwrites
+    // after warmup, diluting exactly the fresh-key claim path this bench
+    // isolates. hash_power 20 (1M slots) comfortably exceeds what the
+    // 64MB heap holds live, so inserts exercise the claim path rather
+    // than the table-full error path; eviction churn is part of the
+    // steady-state miss-fill cost being measured.
+    let cache = Segcache::builder()
+        .hash_power(20)
+        .heap_size(64 * MB)
+        .segment_size(MB as i32)
+        .build()
+        .expect("failed to create cache");
+
+    let value = [0u8; 64];
+    let mut counter: u64 = 0;
+
+    group.bench_function("8b/64b", |b| {
+        b.iter(|| {
+            let key = counter.to_be_bytes();
+            counter += 1;
+            let _ = cache.insert(&key, &value[..], None, ttl);
+        })
+    });
+}
+
 fn incr_benchmark(c: &mut Criterion) {
     let ttl = Duration::ZERO;
     let mut group = c.benchmark_group("incr");
@@ -167,6 +199,7 @@ criterion_group!(
     benches,
     get_benchmark,
     set_benchmark,
+    set_fresh_benchmark,
     incr_benchmark,
     cas_benchmark,
 );
