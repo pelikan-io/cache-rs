@@ -46,7 +46,12 @@ fn classify(bytes: &[u8]) -> EntryVal<'_> {
 /// In the `u64` domain, applies `delta` to `current`: a result below `0`
 /// (including a negative `delta` applied on top of `0`) is `Underflow`; a
 /// result past `u64::MAX` is `Overflow`.
-fn apply_delta(current: u64, delta: i64) -> Result<u64, IncrError> {
+///
+/// `pub(crate)`: also used by `zset.rs`'s `zincrby`, which needs the exact
+/// same `u64`-domain over/underflow rules (`HINCRBY`/`ZINCRBY` share this
+/// arithmetic; only `hincrby`'s extra "not an integer" read differs, which
+/// zset's always-`Uint` scores never need).
+pub(crate) fn apply_delta(current: u64, delta: i64) -> Result<u64, IncrError> {
     if delta >= 0 {
         current.checked_add(delta as u64).ok_or(IncrError::Overflow)
     } else {

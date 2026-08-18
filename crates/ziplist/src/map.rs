@@ -1,7 +1,7 @@
 //! Sorted-pair scan: linear seek over adjacent-entry pairs (field/value for
-//! hashes; member/score for sorted sets, Task 8) or single entries (set
-//! members), used by `hash.rs` and `set.rs` (and later `zset.rs`) to locate
-//! a key's pair/entry or the sorted insertion point for a new one.
+//! hashes; member/score for sorted sets) or single entries (set members),
+//! used by `hash.rs` and `set.rs` to locate a key's pair/entry or the
+//! sorted insertion point for a new one.
 //!
 //! Bodies are sorted by the pair's *key* entry via [`compare`].
 //! [`PairKey::First`] is the hash layout: the key is the even-indexed entry
@@ -12,6 +12,22 @@
 //! stops as soon as the current unit's key compares greater than the
 //! target — since the body is sorted, everything after that point is
 //! guaranteed greater too, so there is no need to keep scanning.
+//!
+//! # Zsets need a different seek: [`zset_seek`]
+//!
+//! `zset.rs`'s body is also `(member, score)` adjacent pairs, but its sort
+//! key is `(score, member)` — a 2-tuple spanning *both* entries of the
+//! pair, score primary, member the tiebreaker — not a single entry the way
+//! [`PairKey::First`] assumes. `pair_seek`'s shape (its parameters,
+//! [`PairKey`], [`Stride`]) is fixed by `hash.rs`/`set.rs`'s existing use,
+//! so rather than bend it to fit a two-entry sort key, [`zset_seek`] is a
+//! standalone sibling that walks pairs directly, comparing `(score,
+//! member)` each step. It reuses [`SeekResult`]'s shape (see that
+//! function's docs for how the fields map onto member/score cursors) so
+//! `zset.rs`'s callers pattern-match it exactly like `pair_seek`'s result.
+//! A zset's *member* lookups (score isn't known in advance) can't use
+//! either seek — the body isn't member-sorted — and instead linear-scan
+//! directly in `zset.rs`.
 
 use crate::cursor::Cursor;
 use crate::entry::{compare, EntryVal};
@@ -117,6 +133,64 @@ pub(crate) fn pair_seek(
                     None => return SeekResult::Tail,
                 }
             }
+        }
+    }
+}
+
+/// Linear-scans a zset body — `(member, score)` adjacent-entry pairs,
+/// member first then score — for the pair sorting at `(score, member)`,
+/// per the sort order `zset.rs` specifies: score ascending, ties broken by
+/// `member` via [`compare`]. See the [module docs](self) for why this is a
+/// standalone sibling of [`pair_seek`] rather than another `pair_seek`
+/// call: the sort key here spans both entries of the pair, not just the
+/// first.
+///
+/// Reuses [`SeekResult`]'s shape: on `Found`, `key_cur`/`val_cur` are the
+/// matching pair's member/score cursors (the same mapping `pair_seek` uses
+/// for [`Stride::Pair`]); `InsertBefore`/`Tail` mean exactly what they do
+/// in `pair_seek`. Same never-panics contract too: a decode failure, a
+/// score entry that isn't `EntryVal::Uint` (every zset score is written as
+/// `Uint` by `zset.rs`; this is defensive, not expected), or a truncated
+/// trailing unit all read as [`SeekResult::Tail`] rather than panicking.
+pub(crate) fn zset_seek(
+    buf: &[u8],
+    hdr: &BlockHeader,
+    score: u64,
+    member: &EntryVal,
+) -> SeekResult {
+    let mut cur = match Cursor::first(buf, hdr) {
+        Some(c) => c,
+        None => return SeekResult::Tail,
+    };
+    loop {
+        let member_cur = cur;
+        let cur_member = match cur.value(buf) {
+            Ok(v) => v,
+            Err(_) => return SeekResult::Tail,
+        };
+        let score_cur = match cur.next(buf) {
+            Some(c) => c,
+            None => return SeekResult::Tail,
+        };
+        let cur_score = match score_cur.value(buf) {
+            Ok(EntryVal::Uint(v)) => v,
+            _ => return SeekResult::Tail,
+        };
+        match cur_score
+            .cmp(&score)
+            .then_with(|| compare(&cur_member, member))
+        {
+            Ordering::Equal => {
+                return SeekResult::Found {
+                    key_cur: member_cur,
+                    val_cur: score_cur,
+                };
+            }
+            Ordering::Greater => return SeekResult::InsertBefore(member_cur),
+            Ordering::Less => match score_cur.next(buf) {
+                Some(c) => cur = c,
+                None => return SeekResult::Tail,
+            },
         }
     }
 }

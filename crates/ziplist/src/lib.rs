@@ -16,6 +16,7 @@ pub mod header;
 pub mod list;
 mod map;
 pub mod set;
+pub mod zset;
 
 pub use block::{Block, BlockMut, InsertPos};
 pub use cursor::{locate, Cursor};
@@ -28,3 +29,4 @@ pub use hash::{HSet, HashMut, HashView, IncrError};
 pub use header::{BlockHeader, Type, FLAG_CHAIN_ROOT, HEADER_SIZE};
 pub use list::{ListMut, ListView};
 pub use set::{SAdd, SetMut, SetView};
+pub use zset::{Bound, ZAdd, ZsetMut, ZsetView};
