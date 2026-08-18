@@ -5,11 +5,26 @@
 //! lookups) after *every* op. A capacity refusal (`NeedBytes`) is a legal
 //! outcome: the model is left unchanged and the loop continues.
 //!
+//! Each type's op-application logic lives in a `run_*_case` function so it
+//! can be driven two ways: the main `*_matches_*_model` property (large
+//! 8192-byte buffer, 512 cases, exercising ordinary op sequences) and a
+//! `*_needbytes_refusals_fire_and_leave_model_unchanged` test (a small
+//! buffer sized so capacity refusals actually happen). The large buffer is
+//! big enough relative to average entry size (~5-13 bytes) and op count
+//! (<=199) that `NeedBytes` essentially never fires there -- the
+//! model-unchanged-on-refusal property would otherwise go completely
+//! unexercised. The small-buffer tests use `TestRunner` directly (rather
+//! than the `proptest!` macro) so a `Cell<u32>` refusal counter can be
+//! threaded through every case and asserted `> 0` once the whole batch
+//! completes, giving positive evidence the refusal path actually ran (not
+//! just that it's legal if it happens to).
+//!
 //! Any divergence here is a genuine bug in the Task 5-8 op implementations
 //! (`hash.rs`/`list.rs`/`set.rs`/`zset.rs`), not in the model.
 
 use proptest::prelude::*;
-use proptest::test_runner::TestCaseError;
+use proptest::test_runner::{TestCaseError, TestRunner};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use ziplist::{canonical_uint, render_uint, EntryVal, HSet, IncrError, SAdd, ZAdd};
@@ -18,6 +33,21 @@ use ziplist::{canonical_uint, render_uint, EntryVal, HSet, IncrError, SAdd, ZAdd
 /// `Uint(v)`, `(1, 0, bytes)` for a `Str`. Its derived `Ord` mirrors
 /// `ziplist::compare`'s total order (see [`cmp_key`]).
 type Key = (u8, u64, Vec<u8>);
+
+/// Total buffer size (including the 12-byte header) for the
+/// `*_needbytes_refusals_fire_and_leave_model_unchanged` tests: 128 usable
+/// bytes holds only a handful of entries (a single non-canonical 20-digit
+/// numeric string alone is ~24 bytes; a hash/zset pair is two entries), so
+/// with up to 199 ops per case, capacity refusals are the norm rather than
+/// an edge case.
+const SMALL_BUF: usize = 140;
+
+/// Number of cases for the small-buffer refusal tests. Smaller than the
+/// main properties' 512: refusals need to fire at least once across the
+/// whole batch, not on every single case, and 256 short-buffer cases is
+/// already overwhelming evidence (see the fix-report evidence in
+/// task-9-report.md for actual observed counts).
+const SMALL_BUF_CASES: u32 = 256;
 
 // ---------------------------------------------------------------------
 // Shared strategies and helpers
@@ -95,6 +125,20 @@ fn model_apply_delta(current: u64, delta: i64) -> Option<u64> {
     }
 }
 
+/// Runs `runner` over `strategy` with `body`, panicking with the failing
+/// (already-shrunk) case on any property failure. Shared by every
+/// small-buffer refusal test below.
+fn run_small_buffer_property<S: Strategy>(
+    strategy: &S,
+    cases: u32,
+    body: impl Fn(S::Value) -> Result<(), TestCaseError>,
+) {
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(cases));
+    if let Err(e) = runner.run(strategy, body) {
+        panic!("{e}");
+    }
+}
+
 // ---------------------------------------------------------------------
 // Hash model
 // ---------------------------------------------------------------------
@@ -133,12 +177,13 @@ fn model_pairs(model: &BTreeMap<Key, Vec<u8>>) -> Vec<(Key, Vec<u8>)> {
 /// `Overflow`. Per the module docs, neither error path can ever hit
 /// `NeedBytes` (nothing is written before the arithmetic is known to
 /// succeed) -- only the success path can, and there the model is left
-/// unchanged on a capacity refusal.
+/// unchanged (and `refusals` incremented) on a capacity refusal.
 fn check_hincrby(
     h: &mut ziplist::HashMut,
     model: &mut BTreeMap<Key, Vec<u8>>,
     field: &[u8],
     delta: i64,
+    refusals: &Cell<u32>,
 ) -> Result<(), TestCaseError> {
     let key = cmp_key(field);
     let base = match model.get(&key) {
@@ -170,9 +215,53 @@ fn check_hincrby(
                     model.insert(key, render_uint_vec(new_val));
                 }
                 Ok(Err(e)) => prop_assert!(false, "unexpected IncrError {e:?} on success path"),
-                Err(_need) => { /* capacity refusal: model stays as-is */ }
+                Err(_need) => {
+                    refusals.set(refusals.get() + 1); // capacity refusal: model stays as-is
+                }
             },
         },
+    }
+    Ok(())
+}
+
+/// Applies `ops` to a fresh `HashMut` over `buf` and a fresh model in
+/// lockstep, asserting full-state equality after every op. `refusals` is
+/// incremented on every `NeedBytes` capacity refusal encountered (both
+/// `hset`'s and `hincrby`'s), so callers with a deliberately small `buf`
+/// can confirm the refusal path actually ran.
+fn run_hash_case(
+    buf: &mut [u8],
+    ops: Vec<HashOp>,
+    refusals: &Cell<u32>,
+) -> Result<(), TestCaseError> {
+    let mut h = ziplist::HashMut::init(buf).unwrap();
+    let mut model: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
+    for op in ops {
+        match op {
+            HashOp::Set(f, v) => match h.hset(&f, &v) {
+                Ok(res) => {
+                    let existed = model.contains_key(&cmp_key(&f));
+                    prop_assert_eq!(matches!(res, HSet::Updated), existed);
+                    model.insert(cmp_key(&f), v);
+                }
+                Err(_need) => {
+                    refusals.set(refusals.get() + 1); // capacity refusal is legal; model unchanged
+                }
+            },
+            HashOp::Del(f) => {
+                prop_assert_eq!(h.hdel(&f).is_some(), model.remove(&cmp_key(&f)).is_some());
+            }
+            HashOp::Get(f) => {
+                let got = h.view().hget(&f).unwrap().map(entry_to_bytes);
+                prop_assert_eq!(got, model.get(&cmp_key(&f)).cloned());
+            }
+            HashOp::IncrBy(f, delta) => {
+                check_hincrby(&mut h, &mut model, &f, delta, refusals)?;
+            }
+        }
+        // full-state check every op: same length, same iteration order
+        prop_assert_eq!(h.view().hlen() as usize, model.len());
+        prop_assert_eq!(pairs_as_bytes(&h.view()), model_pairs(&model));
     }
     Ok(())
 }
@@ -182,36 +271,28 @@ proptest! {
     #[test]
     fn hash_matches_btreemap_model(ops in proptest::collection::vec(hash_op_strategy(), 1..200)) {
         let mut buf = vec![0u8; 8192];
-        let mut h = ziplist::HashMut::init(&mut buf).unwrap();
-        let mut model: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
-        for op in ops {
-            match op {
-                HashOp::Set(f, v) => {
-                    match h.hset(&f, &v) {
-                        Ok(res) => {
-                            let existed = model.contains_key(&cmp_key(&f));
-                            prop_assert_eq!(matches!(res, HSet::Updated), existed);
-                            model.insert(cmp_key(&f), v);
-                        }
-                        Err(_need) => { /* capacity refusal is legal; model unchanged */ }
-                    }
-                }
-                HashOp::Del(f) => {
-                    prop_assert_eq!(h.hdel(&f).is_some(), model.remove(&cmp_key(&f)).is_some());
-                }
-                HashOp::Get(f) => {
-                    let got = h.view().hget(&f).unwrap().map(entry_to_bytes);
-                    prop_assert_eq!(got, model.get(&cmp_key(&f)).cloned());
-                }
-                HashOp::IncrBy(f, delta) => {
-                    check_hincrby(&mut h, &mut model, &f, delta)?;
-                }
-            }
-            // full-state check every op: same length, same iteration order
-            prop_assert_eq!(h.view().hlen() as usize, model.len());
-            prop_assert_eq!(pairs_as_bytes(&h.view()), model_pairs(&model));
-        }
+        let refusals = Cell::new(0u32);
+        run_hash_case(&mut buf, ops, &refusals)?;
     }
+}
+
+#[test]
+fn hash_needbytes_refusals_fire_and_leave_model_unchanged() {
+    let refusals = Cell::new(0u32);
+    run_small_buffer_property(
+        &proptest::collection::vec(hash_op_strategy(), 1..200),
+        SMALL_BUF_CASES,
+        |ops| {
+            let mut buf = vec![0u8; SMALL_BUF];
+            run_hash_case(&mut buf, ops, &refusals)
+        },
+    );
+    assert!(
+        refusals.get() > 0,
+        "expected at least one hash NeedBytes refusal to fire across {SMALL_BUF_CASES} cases \
+         with a {SMALL_BUF}-byte buffer; got 0 -- the model-unchanged-on-refusal property was \
+         never actually exercised"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -233,41 +314,75 @@ fn set_op_strategy() -> impl Strategy<Value = SetOp> {
     ]
 }
 
+/// Applies `ops` to a fresh `SetMut` over `buf` and a fresh model in
+/// lockstep, asserting full-state equality after every op. `refusals` is
+/// incremented on every `sadd` `NeedBytes` capacity refusal.
+fn run_set_case(
+    buf: &mut [u8],
+    ops: Vec<SetOp>,
+    refusals: &Cell<u32>,
+) -> Result<(), TestCaseError> {
+    let mut s = ziplist::SetMut::init(buf).unwrap();
+    let mut model: BTreeSet<Key> = BTreeSet::new();
+    for op in ops {
+        match op {
+            SetOp::Add(m) => {
+                let already = model.contains(&cmp_key(&m));
+                match s.sadd(&m) {
+                    Ok(res) => {
+                        prop_assert_eq!(matches!(res, SAdd::Added), !already);
+                        model.insert(cmp_key(&m));
+                    }
+                    Err(_need) => {
+                        refusals.set(refusals.get() + 1); // capacity refusal is legal; model unchanged
+                    }
+                }
+            }
+            SetOp::Rem(m) => {
+                prop_assert_eq!(s.srem(&m).is_some(), model.remove(&cmp_key(&m)));
+            }
+            SetOp::IsMember(m) => {
+                let real = s.view().sismember(&m).unwrap();
+                prop_assert_eq!(real, model.contains(&cmp_key(&m)));
+            }
+        }
+        // full-state check every op: same length, same iteration order
+        prop_assert_eq!(s.view().scard() as usize, model.len());
+        let mut got = Vec::new();
+        s.view().iter_members(|m| got.push(key_from_entry(m)));
+        let expect: Vec<_> = model.iter().cloned().collect();
+        prop_assert_eq!(got, expect);
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
     #[test]
     fn set_matches_btreeset_model(ops in proptest::collection::vec(set_op_strategy(), 1..200)) {
         let mut buf = vec![0u8; 8192];
-        let mut s = ziplist::SetMut::init(&mut buf).unwrap();
-        let mut model: BTreeSet<Key> = BTreeSet::new();
-        for op in ops {
-            match op {
-                SetOp::Add(m) => {
-                    let already = model.contains(&cmp_key(&m));
-                    match s.sadd(&m) {
-                        Ok(res) => {
-                            prop_assert_eq!(matches!(res, SAdd::Added), !already);
-                            model.insert(cmp_key(&m));
-                        }
-                        Err(_need) => { /* capacity refusal is legal; model unchanged */ }
-                    }
-                }
-                SetOp::Rem(m) => {
-                    prop_assert_eq!(s.srem(&m).is_some(), model.remove(&cmp_key(&m)));
-                }
-                SetOp::IsMember(m) => {
-                    let real = s.view().sismember(&m).unwrap();
-                    prop_assert_eq!(real, model.contains(&cmp_key(&m)));
-                }
-            }
-            // full-state check every op: same length, same iteration order
-            prop_assert_eq!(s.view().scard() as usize, model.len());
-            let mut got = Vec::new();
-            s.view().iter_members(|m| got.push(key_from_entry(m)));
-            let expect: Vec<_> = model.iter().cloned().collect();
-            prop_assert_eq!(got, expect);
-        }
+        let refusals = Cell::new(0u32);
+        run_set_case(&mut buf, ops, &refusals)?;
     }
+}
+
+#[test]
+fn set_needbytes_refusals_fire_and_leave_model_unchanged() {
+    let refusals = Cell::new(0u32);
+    run_small_buffer_property(
+        &proptest::collection::vec(set_op_strategy(), 1..200),
+        SMALL_BUF_CASES,
+        |ops| {
+            let mut buf = vec![0u8; SMALL_BUF];
+            run_set_case(&mut buf, ops, &refusals)
+        },
+    );
+    assert!(
+        refusals.get() > 0,
+        "expected at least one set NeedBytes refusal to fire across {SMALL_BUF_CASES} cases \
+         with a {SMALL_BUF}-byte buffer; got 0 -- the model-unchanged-on-refusal property was \
+         never actually exercised"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -312,12 +427,14 @@ fn zset_op_strategy() -> impl Strategy<Value = ZsetOp> {
 /// Applies `ZINCRBY member delta` to both the real zset and the model. A
 /// missing member auto-vivifies at `0`; there's no `NotAnInteger` case
 /// (scores are always stored as `Uint`), so this is a strict subset of
-/// `check_hincrby`'s logic.
+/// `check_hincrby`'s logic. `refusals` is incremented on a `NeedBytes`
+/// capacity refusal.
 fn check_zincrby(
     z: &mut ziplist::ZsetMut,
     scores: &mut HashMap<Vec<u8>, u64>,
     member: &[u8],
     delta: i64,
+    refusals: &Cell<u32>,
 ) -> Result<(), TestCaseError> {
     let cur = scores.get(member).copied().unwrap_or(0);
     match model_apply_delta(cur, delta) {
@@ -338,8 +455,63 @@ fn check_zincrby(
                 scores.insert(member.to_vec(), new_val);
             }
             Ok(Err(e)) => prop_assert!(false, "unexpected IncrError {e:?} on success path"),
-            Err(_need) => { /* capacity refusal: model stays as-is */ }
+            Err(_need) => {
+                refusals.set(refusals.get() + 1); // capacity refusal: model stays as-is
+            }
         },
+    }
+    Ok(())
+}
+
+/// Applies `ops` to a fresh `ZsetMut` over `buf` and a fresh model in
+/// lockstep, asserting full-state equality after every op. `refusals` is
+/// incremented on every `NeedBytes` capacity refusal encountered (both
+/// `zadd`'s and `zincrby`'s).
+fn run_zset_case(
+    buf: &mut [u8],
+    ops: Vec<ZsetOp>,
+    refusals: &Cell<u32>,
+) -> Result<(), TestCaseError> {
+    let mut z = ziplist::ZsetMut::init(buf).unwrap();
+    let mut scores: HashMap<Vec<u8>, u64> = HashMap::new();
+    for op in ops {
+        match op {
+            ZsetOp::Add(m, sc) => {
+                let prior = scores.get(&m).copied();
+                match z.zadd(&m, sc) {
+                    Ok(res) => {
+                        match prior {
+                            None => prop_assert!(matches!(res, ZAdd::New)),
+                            Some(old) if old == sc => prop_assert!(matches!(res, ZAdd::Unchanged)),
+                            Some(_) => prop_assert!(matches!(res, ZAdd::ScoreChanged)),
+                        }
+                        scores.insert(m.clone(), sc);
+                    }
+                    Err(_need) => {
+                        refusals.set(refusals.get() + 1); // capacity refusal is legal; model unchanged
+                    }
+                }
+            }
+            ZsetOp::Rem(m) => {
+                prop_assert_eq!(z.zrem(&m).is_some(), scores.remove(&m).is_some());
+            }
+            ZsetOp::IncrBy(m, delta) => {
+                check_zincrby(&mut z, &mut scores, &m, delta, refusals)?;
+            }
+            ZsetOp::Score(m) => {
+                let real = z.view().zscore(&m).unwrap();
+                prop_assert_eq!(real, scores.get(&m).copied());
+            }
+        }
+        // full-state check every op: same length, same iteration order,
+        // and (member, score) pairs matching zscore for every member.
+        prop_assert_eq!(z.view().zcard() as usize, scores.len());
+        let mut got = Vec::new();
+        z.view()
+            .zrange_by_rank(0, -1, false, |m, sc| got.push((key_from_entry(m), sc)));
+        let mut expect: Vec<_> = scores.iter().map(|(m, &sc)| (cmp_key(m), sc)).collect();
+        expect.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+        prop_assert_eq!(got, expect);
     }
     Ok(())
 }
@@ -349,46 +521,28 @@ proptest! {
     #[test]
     fn zset_matches_model(ops in proptest::collection::vec(zset_op_strategy(), 1..200)) {
         let mut buf = vec![0u8; 8192];
-        let mut z = ziplist::ZsetMut::init(&mut buf).unwrap();
-        let mut scores: HashMap<Vec<u8>, u64> = HashMap::new();
-        for op in ops {
-            match op {
-                ZsetOp::Add(m, sc) => {
-                    let prior = scores.get(&m).copied();
-                    match z.zadd(&m, sc) {
-                        Ok(res) => {
-                            match prior {
-                                None => prop_assert!(matches!(res, ZAdd::New)),
-                                Some(old) if old == sc => prop_assert!(matches!(res, ZAdd::Unchanged)),
-                                Some(_) => prop_assert!(matches!(res, ZAdd::ScoreChanged)),
-                            }
-                            scores.insert(m.clone(), sc);
-                        }
-                        Err(_need) => { /* capacity refusal is legal; model unchanged */ }
-                    }
-                }
-                ZsetOp::Rem(m) => {
-                    prop_assert_eq!(z.zrem(&m).is_some(), scores.remove(&m).is_some());
-                }
-                ZsetOp::IncrBy(m, delta) => {
-                    check_zincrby(&mut z, &mut scores, &m, delta)?;
-                }
-                ZsetOp::Score(m) => {
-                    let real = z.view().zscore(&m).unwrap();
-                    prop_assert_eq!(real, scores.get(&m).copied());
-                }
-            }
-            // full-state check every op: same length, same iteration order,
-            // and (member, score) pairs matching zscore for every member.
-            prop_assert_eq!(z.view().zcard() as usize, scores.len());
-            let mut got = Vec::new();
-            z.view()
-                .zrange_by_rank(0, -1, false, |m, sc| got.push((key_from_entry(m), sc)));
-            let mut expect: Vec<_> = scores.iter().map(|(m, &sc)| (cmp_key(m), sc)).collect();
-            expect.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
-            prop_assert_eq!(got, expect);
-        }
+        let refusals = Cell::new(0u32);
+        run_zset_case(&mut buf, ops, &refusals)?;
     }
+}
+
+#[test]
+fn zset_needbytes_refusals_fire_and_leave_model_unchanged() {
+    let refusals = Cell::new(0u32);
+    run_small_buffer_property(
+        &proptest::collection::vec(zset_op_strategy(), 1..200),
+        SMALL_BUF_CASES,
+        |ops| {
+            let mut buf = vec![0u8; SMALL_BUF];
+            run_zset_case(&mut buf, ops, &refusals)
+        },
+    );
+    assert!(
+        refusals.get() > 0,
+        "expected at least one zset NeedBytes refusal to fire across {SMALL_BUF_CASES} cases \
+         with a {SMALL_BUF}-byte buffer; got 0 -- the model-unchanged-on-refusal property was \
+         never actually exercised"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -473,6 +627,28 @@ fn list_op_strategy() -> impl Strategy<Value = ListOp> {
     ]
 }
 
+/// Push-heavy variant of [`list_op_strategy`], used only by the small-buffer
+/// refusal test below. `list_op_strategy`'s balanced push/pop weights make a
+/// roughly driftless random walk of the list's length: measured empirically
+/// (see task-9-report.md), it never once exceeded a 128-byte-usable buffer's
+/// capacity across 256 small-buffer cases. Pushes outnumbering pops 4:1
+/// gives positive drift, so the list's length grows past any fixed capacity
+/// within the first few dozen ops of nearly every case, and (thanks to the
+/// occasional pop) also keeps freeing space so `push_front`/`push_back` see
+/// both a fit and a refusal repeatedly within a single case, not just one
+/// then never again.
+fn list_push_heavy_op_strategy() -> impl Strategy<Value = ListOp> {
+    prop_oneof![
+        4 => list_elem_strategy().prop_map(ListOp::PushFront),
+        4 => list_elem_strategy().prop_map(ListOp::PushBack),
+        1 => Just(ListOp::PopFront),
+        1 => Just(ListOp::PopBack),
+        1 => (index_strategy(), index_strategy()).prop_map(|(a, b)| ListOp::Trim(a, b)),
+        1 => index_strategy().prop_map(ListOp::Index),
+        1 => (index_strategy(), index_strategy()).prop_map(|(a, b)| ListOp::Range(a, b)),
+    ]
+}
+
 /// Redis-style index normalization: negative indices count from the tail.
 /// Mirrors `ListView::normalize` exactly (no clamping here; callers do
 /// their own bounds checks, same as the real op).
@@ -528,65 +704,105 @@ fn model_trim(model: &mut VecDeque<Elem>, start: i64, stop: i64) {
     }
 }
 
+/// Applies `ops` to a fresh `ListMut` over `buf` and a fresh model in
+/// lockstep, asserting full-state equality after every op. `refusals` is
+/// incremented on every `push_front`/`push_back` `NeedBytes` capacity
+/// refusal.
+fn run_list_case(
+    buf: &mut [u8],
+    ops: Vec<ListOp>,
+    refusals: &Cell<u32>,
+) -> Result<(), TestCaseError> {
+    let mut l = ziplist::ListMut::init(buf).unwrap();
+    let mut model: VecDeque<Elem> = VecDeque::new();
+    for op in ops {
+        match op {
+            ListOp::PushFront(e) => {
+                let ev = e.as_entryval();
+                match l.push_front(&ev) {
+                    Ok(_) => model.push_front(e),
+                    Err(_need) => {
+                        refusals.set(refusals.get() + 1); // capacity refusal is legal; model unchanged
+                    }
+                }
+            }
+            ListOp::PushBack(e) => {
+                let ev = e.as_entryval();
+                match l.push_back(&ev) {
+                    Ok(_) => model.push_back(e),
+                    Err(_need) => {
+                        refusals.set(refusals.get() + 1); // capacity refusal is legal; model unchanged
+                    }
+                }
+            }
+            ListOp::PopFront => {
+                let got = l.pop_front(Elem::from_entryval);
+                match got {
+                    Some(elem) => prop_assert_eq!(Some(elem), model.pop_front()),
+                    None => prop_assert!(model.is_empty()),
+                }
+            }
+            ListOp::PopBack => {
+                let got = l.pop_back(Elem::from_entryval);
+                match got {
+                    Some(elem) => prop_assert_eq!(Some(elem), model.pop_back()),
+                    None => prop_assert!(model.is_empty()),
+                }
+            }
+            ListOp::Trim(start, stop) => {
+                l.trim(start, stop);
+                model_trim(&mut model, start, stop);
+            }
+            ListOp::Index(i) => {
+                let real = l.view().index(i).unwrap().map(|v| Elem::from_entryval(v));
+                prop_assert_eq!(real, model_index(&model, i));
+            }
+            ListOp::Range(start, stop) => {
+                let mut real = Vec::new();
+                l.view()
+                    .range(start, stop, |v| real.push(Elem::from_entryval(*v)));
+                prop_assert_eq!(real, model_range(&model, start, stop));
+            }
+        }
+        // full-state check every op: same length, same iteration order
+        prop_assert_eq!(l.view().len() as usize, model.len());
+        let mut real_all = Vec::new();
+        for i in 0..l.view().len() {
+            real_all.push(Elem::from_entryval(
+                l.view().index(i as i64).unwrap().unwrap(),
+            ));
+        }
+        let expect_all: Vec<Elem> = model.iter().cloned().collect();
+        prop_assert_eq!(real_all, expect_all);
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
     #[test]
     fn list_matches_vecdeque_model(ops in proptest::collection::vec(list_op_strategy(), 1..200)) {
         let mut buf = vec![0u8; 8192];
-        let mut l = ziplist::ListMut::init(&mut buf).unwrap();
-        let mut model: VecDeque<Elem> = VecDeque::new();
-        for op in ops {
-            match op {
-                ListOp::PushFront(e) => {
-                    let ev = e.as_entryval();
-                    match l.push_front(&ev) {
-                        Ok(_) => model.push_front(e),
-                        Err(_need) => { /* capacity refusal is legal; model unchanged */ }
-                    }
-                }
-                ListOp::PushBack(e) => {
-                    let ev = e.as_entryval();
-                    match l.push_back(&ev) {
-                        Ok(_) => model.push_back(e),
-                        Err(_need) => { /* capacity refusal is legal; model unchanged */ }
-                    }
-                }
-                ListOp::PopFront => {
-                    let got = l.pop_front(Elem::from_entryval);
-                    match got {
-                        Some(elem) => prop_assert_eq!(Some(elem), model.pop_front()),
-                        None => prop_assert!(model.is_empty()),
-                    }
-                }
-                ListOp::PopBack => {
-                    let got = l.pop_back(Elem::from_entryval);
-                    match got {
-                        Some(elem) => prop_assert_eq!(Some(elem), model.pop_back()),
-                        None => prop_assert!(model.is_empty()),
-                    }
-                }
-                ListOp::Trim(start, stop) => {
-                    l.trim(start, stop);
-                    model_trim(&mut model, start, stop);
-                }
-                ListOp::Index(i) => {
-                    let real = l.view().index(i).unwrap().map(|v| Elem::from_entryval(v));
-                    prop_assert_eq!(real, model_index(&model, i));
-                }
-                ListOp::Range(start, stop) => {
-                    let mut real = Vec::new();
-                    l.view().range(start, stop, |v| real.push(Elem::from_entryval(*v)));
-                    prop_assert_eq!(real, model_range(&model, start, stop));
-                }
-            }
-            // full-state check every op: same length, same iteration order
-            prop_assert_eq!(l.view().len() as usize, model.len());
-            let mut real_all = Vec::new();
-            for i in 0..l.view().len() {
-                real_all.push(Elem::from_entryval(l.view().index(i as i64).unwrap().unwrap()));
-            }
-            let expect_all: Vec<Elem> = model.iter().cloned().collect();
-            prop_assert_eq!(real_all, expect_all);
-        }
+        let refusals = Cell::new(0u32);
+        run_list_case(&mut buf, ops, &refusals)?;
     }
+}
+
+#[test]
+fn list_needbytes_refusals_fire_and_leave_model_unchanged() {
+    let refusals = Cell::new(0u32);
+    run_small_buffer_property(
+        &proptest::collection::vec(list_push_heavy_op_strategy(), 1..200),
+        SMALL_BUF_CASES,
+        |ops| {
+            let mut buf = vec![0u8; SMALL_BUF];
+            run_list_case(&mut buf, ops, &refusals)
+        },
+    );
+    assert!(
+        refusals.get() > 0,
+        "expected at least one list NeedBytes refusal to fire across {SMALL_BUF_CASES} cases \
+         with a {SMALL_BUF}-byte buffer; got 0 -- the model-unchanged-on-refusal property was \
+         never actually exercised"
+    );
 }
