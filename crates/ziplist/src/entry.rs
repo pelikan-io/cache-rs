@@ -12,6 +12,7 @@
 //!   from the tail without a separate offset index.
 
 use crate::error::DecodeError;
+use core::cmp::Ordering;
 
 /// A decoded entry value: either an unsigned integer or a string of bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +322,27 @@ pub fn decode_backward(buf: &[u8], end: usize) -> Result<usize, DecodeError> {
     after_backlen
         .checked_sub(tag_plus_data)
         .ok_or(DecodeError::Corrupt)
+}
+
+/// Total order over entry values: `Uint` always sorts before `Str`; two
+/// `Uint`s compare by value; two `Str`s compare byte-lexicographically.
+pub fn compare(a: &EntryVal<'_>, b: &EntryVal<'_>) -> Ordering {
+    match (a, b) {
+        (EntryVal::Uint(x), EntryVal::Uint(y)) => x.cmp(y),
+        (EntryVal::Str(x), EntryVal::Str(y)) => x.cmp(y),
+        (EntryVal::Uint(_), EntryVal::Str(_)) => Ordering::Less,
+        (EntryVal::Str(_), EntryVal::Uint(_)) => Ordering::Greater,
+    }
+}
+
+/// Convenience wrapper over [`compare`] for raw client bytes: each side is
+/// classified via [`canonical_uint`] first (so callers can pass client
+/// bytes directly), so a canonical decimal rendering compares as `Uint`
+/// and anything else compares as `Str`.
+pub fn compare_raw(a: &[u8], b: &[u8]) -> Ordering {
+    let av = canonical_uint(a).map_or(EntryVal::Str(a), EntryVal::Uint);
+    let bv = canonical_uint(b).map_or(EntryVal::Str(b), EntryVal::Uint);
+    compare(&av, &bv)
 }
 
 #[cfg(test)]
