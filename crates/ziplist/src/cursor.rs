@@ -4,6 +4,26 @@
 //! forward or backward one entry at a time. [`locate`] jumps directly to
 //! the `idx`-th entry by walking from whichever end of the block is
 //! nearer, so index lookups cost at most `nentry / 2` steps.
+//!
+//! # `buf` MUST be sliced to the block's used length
+//!
+//! Every function here (`Cursor::first`, `Cursor::last`, `Cursor::next`,
+//! `Cursor::prev`, `locate`) takes `buf: &[u8]` and trusts it to end
+//! exactly at the block's used length: header plus entries, through the
+//! last byte of the entry at `hdr.tail_off`. None of them are told the
+//! backing buffer's full capacity, so none can distinguish "ran off the
+//! end of the real entries" from "kept reading into leftover bytes beyond
+//! the tail that happen to still decode as a plausible entry" (e.g. a
+//! `BlockMut`'s backing storage after a shrinking splice leaves stale
+//! bytes past the new tail). Passing an over-long `buf` — the full
+//! capacity of a larger allocation instead of a slice trimmed to the used
+//! length — can make `Cursor::next` (and therefore `locate`) walk past the
+//! real tail and return a stale, garbage entry instead of `None`. This is
+//! a correctness precondition, not a memory-safety one: out-of-bounds
+//! reads are still impossible (`decode`/`decode_backward` are
+//! `.get()`-based with checked arithmetic throughout), but the "one past
+//! the tail is `None`" contract only holds when the caller slices `buf` to
+//! the used length first.
 
 use crate::entry::{decode, decode_backward, EntryVal};
 use crate::error::DecodeError;
@@ -21,6 +41,15 @@ pub struct Cursor {
 impl Cursor {
     /// Returns a cursor to the first entry in the block, or `None` if the
     /// block is empty.
+    ///
+    /// # Preconditions
+    ///
+    /// `buf` MUST be sliced to the block's *used* length — header plus
+    /// entries, ending exactly at the end of the entry at `hdr.tail_off` —
+    /// never the full capacity of a larger backing buffer. Bytes beyond
+    /// the used length are not part of this walk's contract; see the
+    /// [module docs](self) for why passing an over-long `buf` is unsafe
+    /// for correctness (though not memory-unsafe).
     pub fn first(buf: &[u8], hdr: &BlockHeader) -> Option<Cursor> {
         if hdr.nentry == 0 {
             return None;
@@ -30,6 +59,11 @@ impl Cursor {
 
     /// Returns a cursor to the last entry in the block, or `None` if the
     /// block is empty.
+    ///
+    /// # Preconditions
+    ///
+    /// Same as [`Cursor::first`]: `buf` MUST be sliced to the block's used
+    /// length, not the backing buffer's full capacity.
     pub fn last(buf: &[u8], hdr: &BlockHeader) -> Option<Cursor> {
         if hdr.nentry == 0 {
             return None;
@@ -46,8 +80,23 @@ impl Cursor {
     }
 
     /// Returns a cursor to the entry following this one, or `None` if this
-    /// is the last entry (walking off the end of the block, or of the
-    /// buffer, both surface as a decode failure at the next offset).
+    /// is the last entry.
+    ///
+    /// # Preconditions
+    ///
+    /// `buf` MUST be sliced to the block's used length (through the end of
+    /// the entry at `hdr.tail_off`), never a larger backing capacity. This
+    /// method has no `hdr` parameter, so it cannot compare against
+    /// `tail_off` itself: "no next entry" is detected only by `decode`
+    /// failing at `off + len`, which happens when that offset runs past
+    /// `buf`'s end, or lands on bytes that don't decode as a valid entry
+    /// (e.g. zero padding). If `buf` extends past the block's real content
+    /// and happens to contain bytes there that decode successfully (stale
+    /// or planted entry bytes, as a `BlockMut`'s backing buffer may have
+    /// after a shrinking op), `next` cannot tell the difference and will
+    /// return that stale entry instead of `None`. Callers MUST slice `buf`
+    /// to the block's used length before walking, to keep this
+    /// method's "one past the tail" contract truthful.
     pub fn next(&self, buf: &[u8]) -> Option<Cursor> {
         let next_off = self.off.checked_add(self.len)?;
         Self::at(buf, next_off)
@@ -55,6 +104,15 @@ impl Cursor {
 
     /// Returns a cursor to the entry preceding this one, or `None` if this
     /// is the first entry.
+    ///
+    /// # Preconditions
+    ///
+    /// `buf` MUST be sliced to the block's used length, same as
+    /// [`Cursor::first`]/[`Cursor::next`]. Unlike `next`, `prev` does take
+    /// `hdr` and defensively checks `self.off` against `hdr.tail_off`, but
+    /// that only guards against a cursor positioned past the declared
+    /// tail — it does not, and cannot, validate that `buf` itself was
+    /// sliced correctly.
     pub fn prev(&self, buf: &[u8], hdr: &BlockHeader) -> Option<Cursor> {
         if self.off <= HEADER_SIZE || self.off as u32 > hdr.tail_off {
             return None;
@@ -76,6 +134,14 @@ impl Cursor {
 ///
 /// Returns an error if `idx >= hdr.nentry`, or if the walk encounters a
 /// corrupt or truncated entry along the way.
+///
+/// # Preconditions
+///
+/// `buf` MUST be sliced to the block's used length, same as
+/// [`Cursor::first`]/[`Cursor::next`]/[`Cursor::prev`] — see the
+/// [module docs](self). Because `locate` may walk forward via
+/// `Cursor::next`, an over-long `buf` can make it return a cursor onto
+/// stale bytes past the real tail instead of an error.
 pub fn locate(buf: &[u8], hdr: &BlockHeader, idx: u32) -> Result<Cursor, DecodeError> {
     if idx >= hdr.nentry {
         return Err(DecodeError::Corrupt);
@@ -165,6 +231,46 @@ mod tests {
             assert_eq!(locate(&buf, &hdr, i).unwrap().off, by_walk.off, "i={i}");
         }
         assert!(locate(&buf, &hdr, 5).is_err());
+    }
+
+    #[test]
+    fn next_none_past_tail_requires_buf_sliced_to_used_length() {
+        // A single-entry block in an oversized buffer, with a second,
+        // independently valid entry's bytes planted immediately after the
+        // real tail -- simulating stale bytes left in a backing buffer's
+        // spare capacity (e.g. after a shrinking BlockMut splice that
+        // doesn't zero the vacated bytes).
+        let val = EntryVal::Uint(42);
+        let len = encoded_len(&val);
+        let used_len = HEADER_SIZE + len;
+
+        let mut buf = [0u8; 64];
+        encode_into(&val, &mut buf[HEADER_SIZE..used_len]);
+        let hdr = BlockHeader {
+            type_: Type::List,
+            format: 0,
+            flags: 0,
+            nentry: 1,
+            tail_off: HEADER_SIZE as u32,
+        };
+        hdr.write_to(&mut buf[..HEADER_SIZE]);
+
+        // Plant a second, independently-decodable entry right after the
+        // real tail -- valid bytes, but not part of this block.
+        let planted = EntryVal::Uint(99);
+        let planted_len = encoded_len(&planted);
+        encode_into(&planted, &mut buf[used_len..used_len + planted_len]);
+
+        let tail = Cursor::last(&buf[..used_len], &hdr).unwrap();
+        assert_eq!(tail.off, HEADER_SIZE);
+
+        // Contract: buf sliced to the block's used length -> no next entry.
+        assert_eq!(tail.next(&buf[..used_len]), None);
+
+        // Pin the failure mode the contract guards against: an over-long
+        // buf (here, the full oversized capacity) lets next() walk into
+        // the planted bytes and return a bogus "next" entry instead.
+        assert!(tail.next(&buf[..]).is_some());
     }
 
     #[test]
