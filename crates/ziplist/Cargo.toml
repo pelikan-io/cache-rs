@@ -6,3 +6,6 @@ description = "Compact byte-format collections codec for cache storage"
 edition = { workspace = true }
 repository = { workspace = true }
 license = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
