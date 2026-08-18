@@ -216,11 +216,17 @@ decode error, never silently reinterpreted. Concretely:
   `SetMut::init`, `ZsetMut::init` (and `BlockMut::parse` underneath them)
   each write or validate a *fresh* empty block of their type; there is no
   `HashMut::parse`-style constructor that re-wraps an already-populated
-  buffer as a specific typed mutator. A caller that needs to mutate an
-  existing block re-derives type-appropriate access by parsing it as a
-  `Block`/`BlockMut` first and dispatching on `header().type_`. This keeps
-  every `*Mut` op free to assume its type's pairing/sort invariant already
-  holds by construction, rather than re-checking it on every call.
+  buffer as a specific typed mutator. `BlockMut` itself only exposes raw
+  splice primitives on top of the generic header -- there is currently **no
+  path** from a populated buffer to a typed `HashMut`/`ListMut`/`SetMut`/
+  `ZsetMut` view; parsing as `Block`/`BlockMut` and dispatching on
+  `header().type_` does not produce one. Typed wrap-existing-buffer
+  constructors do not exist yet; they are **required** for the pelikan
+  entrystore integration (Plan C), which needs to mutate blocks it did not
+  just create. When they land, what to re-validate on re-entry (the type
+  tag, even-`nentry` parity for hash/zset, and whether pairing/sortedness is
+  trusted from the stored bytes or re-checked) is a Plan C design decision,
+  not something this crate has settled yet.
 - **Callback pops.** `ListMut::pop_front`/`pop_back` take `f: impl
   FnOnce(EntryVal) -> R` instead of returning `Option<EntryVal>` directly.
   An `EntryVal::Str` borrows the block's backing bytes, but removing the

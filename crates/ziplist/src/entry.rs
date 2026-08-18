@@ -164,7 +164,13 @@ fn decode_varint_len(buf: &[u8], off: usize) -> Result<(usize, usize), DecodeErr
 /// except the leftmost (first written) has bit7 set. Returns the number of
 /// bytes written.
 pub(crate) fn encode_backlen(len: usize, out: &mut [u8]) -> usize {
-    debug_assert!(len > 0 && len <= 0x0000_FFFF_FFFF); // 35 bits max (5 groups)
+    // `len` is a `tag_plus_data` span, which never exceeds a block's
+    // `tail_off` and is therefore u32-bounded by the header format
+    // (`header.rs`); 0x0000_FFFF_FFFF is 2^32 - 1, i.e. u32::MAX, which is
+    // comfortably inside the 35-bit (5-group) ceiling this encoding can
+    // express and is the true maximum this crate can ever be asked to
+    // encode.
+    debug_assert!(len > 0 && len <= 0x0000_FFFF_FFFF);
     let mut groups = [0u8; 5];
     let mut n = 0;
     let mut v = len;
