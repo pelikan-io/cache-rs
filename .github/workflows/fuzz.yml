@@ -5,9 +5,10 @@ on:
     branches: [main]
   pull_request:
 
-# A run-count-bounded smoke check, not a time-bounded fuzz campaign: both
-# ziplist targets complete 100k runs in well under a second locally, so a
-# fixed run count keeps this job fast and its wall-clock cost predictable.
+# A run-count-bounded smoke check, not a time-bounded fuzz campaign: all
+# three ziplist targets complete 100k runs in well under a few seconds
+# locally, so a fixed run count keeps this job fast and its wall-clock cost
+# predictable.
 # Mirrors pelikan's protocol/*/fuzz workflow hardening (fail-fast off,
 # cached cargo-fuzz install immune to release-CDN flakiness) adapted to
 # cache-rs's single fuzzed crate. A deeper, time-bounded run belongs in a
@@ -28,7 +29,7 @@ jobs:
       # not cancel the other target's coverage
       fail-fast: false
       matrix:
-        target: [decode, ops]
+        target: [decode, ops, typed_ops]
     name: fuzz-${{ matrix.target }}
     runs-on: ubuntu-latest
     timeout-minutes: 15

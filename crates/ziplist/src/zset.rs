@@ -369,6 +369,17 @@ impl<'a> ZsetMut<'a> {
         }
     }
 
+    /// The zset's used bytes: header plus entries, through the end of the
+    /// last entry. Same contract as
+    /// [`BlockMut::bytes`](crate::block::BlockMut::bytes) (never the full
+    /// backing capacity) -- exposed here so external callers (fuzzing,
+    /// differential testing) can independently re-validate the block via
+    /// [`Block::parse`](crate::block::Block::parse) without needing access
+    /// to the private `BlockMut` this type wraps.
+    pub fn bytes(&self) -> &[u8] {
+        self.blk.bytes()
+    }
+
     /// Adds `member` with `score`, or updates its score if it already
     /// exists (Redis `ZADD`). A new member is inserted at its score-sorted
     /// position ([`ZAdd::New`]); an existing member with a different score

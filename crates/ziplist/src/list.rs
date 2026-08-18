@@ -174,6 +174,17 @@ impl<'a> ListMut<'a> {
         }
     }
 
+    /// The list's used bytes: header plus entries, through the end of the
+    /// last entry. Same contract as
+    /// [`BlockMut::bytes`](crate::block::BlockMut::bytes) (never the full
+    /// backing capacity) -- exposed here so external callers (fuzzing,
+    /// differential testing) can independently re-validate the block via
+    /// [`Block::parse`](crate::block::Block::parse) without needing access
+    /// to the private `BlockMut` this type wraps.
+    pub fn bytes(&self) -> &[u8] {
+        self.blk.bytes()
+    }
+
     /// Prepends `val` to the front of the list (Redis `LPUSH`).
     pub fn push_front(&mut self, val: &EntryVal) -> Result<Fit, NeedBytes> {
         match Cursor::first(self.blk.bytes(), self.blk.header()) {

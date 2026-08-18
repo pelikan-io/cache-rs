@@ -243,6 +243,13 @@ decode error, never silently reinterpreted. Concretely:
   impossible either way. `bytes_full()` exists only to snapshot/inspect raw
   storage (e.g. asserting a failed op left it byte-for-byte unchanged in a
   test), never to feed a cursor.
+- **`*Mut::bytes()`.** `HashMut`/`ListMut`/`SetMut`/`ZsetMut` each expose a
+  `bytes()` method with the same used-length contract as
+  `BlockMut::bytes()` (a thin delegation to the private `BlockMut` each
+  wraps). It exists for external callers -- the `typed_ops` fuzz target,
+  differential testing -- that need to independently re-validate the block
+  via `Block::parse` without reaching into the crate's internals; ordinary
+  callers driving a collection through its typed ops don't need it.
 - **Write ops report exact capacity needs.** Every mutator that can grow
   the block (`insert_at`, `replace_at`, and everything built on them:
   `hset`, `sadd`, `push_front`/`push_back`, `zadd`, ...) returns
@@ -269,13 +276,26 @@ plan:
    `BTreeSet`/`HashMap` with the crate's own comparator), asserting full
    observable-state equality after every op, including the
    capacity-refusal-leaves-model-unchanged path.
-3. **cargo-fuzz** (`fuzz/`, targets `decode` and `ops`): `decode` throws
-   arbitrary bytes at `BlockHeader::parse`/`Block::parse`, asserting no
-   panic and no OOB read (the latter caught by the sanitizer); `ops` drives
-   a structured, `arbitrary`-derived stream of `insert_at`/`remove_at`/
-   `replace_at` calls directly against `BlockMut` (independent of any
-   type's pairing convention -- that's proptest's job), asserting the block
-   re-parses cleanly via `Block::parse` after every single op.
+3. **cargo-fuzz** (`fuzz/`, targets `decode`, `ops`, `typed_ops`): `decode`
+   throws arbitrary bytes at `BlockHeader::parse`/`Block::parse`, asserting
+   no panic and no OOB read (the latter caught by the sanitizer); `ops`
+   drives a structured, `arbitrary`-derived stream of `insert_at`/
+   `remove_at`/`replace_at` calls directly against `BlockMut` (independent
+   of any type's pairing convention), asserting the block re-parses
+   cleanly via `Block::parse` after every single op; `typed_ops` drives the
+   same kind of structured, coverage-guided op stream through the typed
+   `HashMut`/`ListMut`/`SetMut`/`ZsetMut` wrappers instead -- `hset`/
+   `hget`/`hdel`/`hincrby`, `sadd`/`srem`/`sismember`, `zadd`/`zrem`/
+   `zscore`/`zincrby`/`zcount`/`zrange_by_rank`/`zrange_by_score`,
+   `push_front`/`push_back`/`pop_front`/`pop_back`/`index`/`trim`/`range`,
+   with a fuzzer-controlled buffer size (64..=4096 bytes, so `NeedBytes`
+   refusals fire routinely) -- reaching the pairing/sort/delta-arithmetic
+   layer (`pair_seek`, the zset's linear `find_member` scan, `hincrby`/
+   `zincrby`'s over/underflow handling) that `ops` deliberately skips and
+   that the model-based proptests above exercise only with a narrow, fixed
+   byte-string strategy. Every op asserts the block re-parses via
+   `Block::parse` on the type's own `bytes()`, and for the two pair types
+   (hash, zset) that `nentry` stayed even.
 4. **Golden bytes** (`tests/golden.rs`): one fixed, fully-worked input per
    type, asserting the exact encoded bytes -- freezing `(type, 0x00)`; any
    future diff there is a format break. The hash case is reproduced byte by
@@ -294,6 +314,7 @@ plan:
 cd crates/ziplist/fuzz
 cargo +nightly fuzz run decode -- -runs=100000
 cargo +nightly fuzz run ops -- -runs=100000
+cargo +nightly fuzz run typed_ops -- -runs=100000
 
 # kani (needs the kani-verifier tool: `cargo install --locked kani-verifier`
 # followed by a one-time `cargo kani setup`)

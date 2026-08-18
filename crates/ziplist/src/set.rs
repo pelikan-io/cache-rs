@@ -136,6 +136,17 @@ impl<'a> SetMut<'a> {
         }
     }
 
+    /// The set's used bytes: header plus entries, through the end of the
+    /// last entry. Same contract as
+    /// [`BlockMut::bytes`](crate::block::BlockMut::bytes) (never the full
+    /// backing capacity) -- exposed here so external callers (fuzzing,
+    /// differential testing) can independently re-validate the block via
+    /// [`Block::parse`](crate::block::Block::parse) without needing access
+    /// to the private `BlockMut` this type wraps.
+    pub fn bytes(&self) -> &[u8] {
+        self.blk.bytes()
+    }
+
     /// Adds `member` to the set (Redis `SADD`), returning whether it was
     /// newly added or already present. A single `insert_at` (no pairing to
     /// splice), so on `NeedBytes` the buffer is left untouched per

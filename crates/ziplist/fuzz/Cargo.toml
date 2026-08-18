@@ -30,3 +30,9 @@ name = "ops"
 path = "fuzz_targets/ops.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "typed_ops"
+path = "fuzz_targets/typed_ops.rs"
+test = false
+doc = false
