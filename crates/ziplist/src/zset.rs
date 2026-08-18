@@ -246,9 +246,19 @@ impl<'a> ZsetView<'a> {
     /// negative indices normalize from the tail, out-of-range bounds clamp
     /// into `[0, zcard - 1]`, and an empty or fully out-of-range window
     /// (including `start > stop` after normalizing) yields no calls at
-    /// all. `rev` walks the window high-to-low instead of low-to-high;
-    /// either way `start`/`stop` keep their normal (non-reversed) meaning,
-    /// matching Redis's `ZREVRANGE start stop` (not swapped) convention.
+    /// all.
+    ///
+    /// `rev` does more than reverse the walk direction: per Redis
+    /// `ZREVRANGE`, `start`/`stop` address the *reversed* (descending-score)
+    /// list, not the ascending one — reversed index `i` is ascending index
+    /// `npairs - 1 - i`. So after normalizing/clamping `start`/`stop` in
+    /// reversed-index space, the window is re-expressed in ascending-index
+    /// space as `[npairs - 1 - stop, npairs - 1 - start]` (the endpoints
+    /// swap because the mapping is order-reversing) before walking
+    /// high-to-low. Only the symmetric full window (`0, -1`) leaves the
+    /// window unchanged by this transform, which is why testing solely that
+    /// case would miss the transform being skipped entirely.
+    ///
     /// Mirrors [`ListView::range`](crate::list::ListView::range)'s
     /// normalize/clamp rules, adapted to walk two-entry pairs instead of
     /// single entries.
@@ -269,8 +279,16 @@ impl<'a> ZsetView<'a> {
         if start > stop {
             return;
         }
-        let lo = start as u32;
-        let hi = stop as u32;
+        // For `rev`, re-express the [start, stop] window (given in
+        // reversed/descending-index space) in ascending-index space: the
+        // mapping `i -> npairs - 1 - i` is order-reversing, so the window's
+        // low/high endpoints swap. For the non-`rev` case, the window is
+        // already ascending-index space.
+        let (lo, hi) = if rev {
+            ((npairs - 1 - stop) as u32, (npairs - 1 - start) as u32)
+        } else {
+            (start as u32, stop as u32)
+        };
         let first = if rev { hi } else { lo };
 
         // 0 <= first <= hi < npairs, so locate cannot fail here; treat an
@@ -683,5 +701,39 @@ mod tests {
         z.view()
             .zrange_by_rank(2, 0, false, |m, _s| empty.push(ev_bytes(m)));
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn zrange_by_rank_rev_partial_window_matches_redis_zrevrange_docs_example() {
+        // The Redis ZREVRANGE docs example: ZADD key 1 "one" 2 "two" 3
+        // "three"; ZREVRANGE key 0 -1 => ["three","two","one"];
+        // ZREVRANGE key 2 3 => ["one"]; ZREVRANGE key -2 -1 =>
+        // ["two","one"]. `start`/`stop` address the *reversed* list, not
+        // the ascending one, so a partial/asymmetric window must map
+        // through that transform -- only the full (0, -1) window happens
+        // to look the same either way.
+        let mut buf = [0u8; 512];
+        let mut z = ZsetMut::init(&mut buf).unwrap();
+        z.zadd(b"one", 1).unwrap();
+        z.zadd(b"two", 2).unwrap();
+        z.zadd(b"three", 3).unwrap();
+
+        let mut full = Vec::new();
+        z.view()
+            .zrange_by_rank(0, -1, true, |m, _s| full.push(ev_bytes(m)));
+        assert_eq!(
+            full,
+            vec![b"three".to_vec(), b"two".to_vec(), b"one".to_vec()]
+        );
+
+        let mut partial = Vec::new();
+        z.view()
+            .zrange_by_rank(2, 3, true, |m, _s| partial.push(ev_bytes(m)));
+        assert_eq!(partial, vec![b"one".to_vec()]);
+
+        let mut neg = Vec::new();
+        z.view()
+            .zrange_by_rank(-2, -1, true, |m, _s| neg.push(ev_bytes(m)));
+        assert_eq!(neg, vec![b"two".to_vec(), b"one".to_vec()]);
     }
 }
