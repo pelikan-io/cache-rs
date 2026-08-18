@@ -1,0 +1,68 @@
+name: cargo-fuzz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A run-count-bounded smoke check, not a time-bounded fuzz campaign: both
+# ziplist targets complete 100k runs in well under a second locally, so a
+# fixed run count keeps this job fast and its wall-clock cost predictable.
+# Mirrors pelikan's protocol/*/fuzz workflow hardening (fail-fast off,
+# cached cargo-fuzz install immune to release-CDN flakiness) adapted to
+# cache-rs's single fuzzed crate. A deeper, time-bounded run belongs in a
+# scheduled/manual job if this crate's fuzz surface grows; not needed yet.
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+  FUZZ_RUNS: 100000
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    strategy:
+      # one target's failure (a real crash or a transient runner error) must
+      # not cancel the other target's coverage
+      fail-fast: false
+      matrix:
+        target: [decode, ops]
+    name: fuzz-${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz
+          prefix-key: v1-rust
+      # cargo-install builds once and caches the binary, immune to the
+      # release-CDN 503s that dtolnay/install (prebuilt download) can hit
+      - uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-fuzz
+
+      # Persist the libFuzzer corpus across runs so each run starts from
+      # accumulated coverage instead of rediscovering it from scratch.
+      - name: restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: crates/ziplist/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: fuzz ${{ matrix.target }}
+        working-directory: crates/ziplist/fuzz
+        run: cargo fuzz run ${{ matrix.target }} -- -runs=${{ env.FUZZ_RUNS }}
+
+  check-success:
+    name: verify all fuzz targets pass
+    runs-on: ubuntu-latest
+    needs: [fuzz]
+    steps:
+      - name: no-op
+        run: echo "All fuzz smoke checks passed!"

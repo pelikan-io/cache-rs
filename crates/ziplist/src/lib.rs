@@ -13,6 +13,8 @@ pub mod entry;
 pub mod error;
 pub mod hash;
 pub mod header;
+#[cfg(kani)]
+mod kani;
 pub mod list;
 mod map;
 pub mod set;
