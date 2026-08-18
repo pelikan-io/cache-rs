@@ -7,11 +7,13 @@
 //! a compact binary format for storing collections (lists, hashes, sets,
 //! sorted sets) with minimal memory overhead.
 
+pub mod block;
 pub mod cursor;
 pub mod entry;
 pub mod error;
 pub mod header;
 
+pub use block::{Block, BlockMut, InsertPos};
 pub use cursor::{locate, Cursor};
 pub use entry::{
     canonical_uint, compare, compare_raw, decode, decode_backward, encode_into, encoded_len,
