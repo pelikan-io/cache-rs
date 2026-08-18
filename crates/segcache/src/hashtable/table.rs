@@ -170,14 +170,22 @@ impl MultiChoiceHashtable {
         ((hash >> 32) & 0xFFF) as u16
     }
 
+    /// Hash a key once and derive its raw hash, tag, and N-choice bucket
+    /// indices. The raw hash also selects the insert stripe (see `insert`).
+    #[inline]
+    fn probe_with_hash(&self, key: &[u8]) -> (u64, u16, [usize; MAX_CHOICES as usize]) {
+        let hash = self.hash_key(key);
+        (hash, Self::tag_from_hash(hash), self.bucket_indices(hash))
+    }
+
     /// Hash a key once and derive its tag and N-choice bucket indices.
     ///
     /// Every keyed operation starts here, so the single hash and its
     /// expansion into candidate buckets live in one place.
     #[inline]
     fn probe(&self, key: &[u8]) -> (u16, [usize; MAX_CHOICES as usize]) {
-        let hash = self.hash_key(key);
-        (Self::tag_from_hash(hash), self.bucket_indices(hash))
+        let (_hash, tag, buckets) = self.probe_with_hash(key);
+        (tag, buckets)
     }
 
     /// Count occupied (non-empty, non-ghost) slots in a bucket.
@@ -644,75 +652,103 @@ impl MultiChoiceHashtable {
     // Insert / remove helpers
     // =========================================================================
 
-    /// Try to link in a bucket, handling existing entries and ghosts.
+    /// Replace the key's existing LIVE entry in this bucket, if present,
+    /// via a same-slot CAS retry loop (item 7f, F4: on a matching-slot CAS
+    /// failure, re-read the SAME slot — a racing same-key writer's update
+    /// must be seen, never skipped).
     ///
-    /// Every `compare_exchange` below publishes `new_packed` with
-    /// `Ordering::Release` on success: this is the linearization point
-    /// that exposes a location to readers, and Release orders the item
-    /// bytes written into segment memory by reserve/define ahead of it —
-    /// the ordering the concurrent reserve path relies on (spec §4).
-    fn try_link_in_bucket(
+    /// Ghost slots are deliberately NOT taken here: taking over a ghost
+    /// CREATES a live entry for the key, and all entry creation is
+    /// serialized under the insert stripe lock (`try_claim_new_slot`).
+    /// Without that split, two racing fresh inserters could each take over
+    /// a different same-tag ghost (one per candidate bucket) and publish a
+    /// duplicate on the lock-free path.
+    ///
+    /// Every successful `compare_exchange` publishes with `Release`: it is
+    /// the linearization point exposing a location to readers, ordering
+    /// the item bytes written by reserve/define ahead of it (concurrent-
+    /// reserve spec §4).
+    ///
+    /// Returns `Some(old_location)` if this call replaced a live entry,
+    /// `None` if this bucket holds no live entry for the key.
+    fn try_replace_existing(
         &self,
         bucket_index: usize,
         tag: u16,
         key: &[u8],
         new_packed: u64,
         verifier: &impl KeyVerifier,
-    ) -> Option<Result<Option<Location>, ()>> {
+    ) -> Option<Location> {
         let bucket = self.bucket(bucket_index);
 
-        // First pass: existing entry or matching ghost — retry the SAME slot
-        // on a CAS race so a concurrent same-key writer's update is seen
-        // (item 7f, F4). Advancing to the next slot on a matching-slot CAS
-        // failure would let a losing writer miss that the slot now holds a
-        // racing writer's new location and fall through to the second pass,
-        // publishing a second live entry for the same key.
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
             loop {
                 let packed = bucket.items[slot_index].load(Ordering::Acquire);
 
-                if Hashbucket::tag(packed) != tag {
-                    break; // slot doesn't match our key (any more) — next slot
-                }
-
-                if Hashbucket::is_ghost(packed) {
-                    let freq = Hashbucket::freq(packed);
-                    let new_with_freq = Hashbucket::with_freq(new_packed, freq);
-
-                    match bucket.items[slot_index].compare_exchange(
-                        packed,
-                        new_with_freq,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => return Some(Ok(None)),
-                        Err(_) => continue, // re-read THIS slot
-                    }
+                if packed == 0 || Hashbucket::tag(packed) != tag || Hashbucket::is_ghost(packed) {
+                    break; // empty, or not a live entry with our tag — next slot
                 }
 
                 let location = Hashbucket::location(packed);
 
-                if verifier.verify(key, location, true) {
-                    let freq = Hashbucket::freq(packed);
-                    let new_with_freq = Hashbucket::with_freq(new_packed, freq);
-
-                    match bucket.items[slot_index].compare_exchange(
-                        packed,
-                        new_with_freq,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => return Some(Ok(Some(location))),
-                        // Re-read THIS slot — a racing same-key writer changed it.
-                        Err(_) => continue,
-                    }
-                } else {
+                if !verifier.verify(key, location, true) {
                     break; // a DIFFERENT key occupies this slot — next slot
+                }
+
+                let freq = Hashbucket::freq(packed);
+                let new_with_freq = Hashbucket::with_freq(new_packed, freq);
+
+                match bucket.items[slot_index].compare_exchange(
+                    packed,
+                    new_with_freq,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return Some(location),
+                    // Re-read THIS slot — a racing same-key writer changed it.
+                    Err(_) => continue,
                 }
             }
         }
 
-        // Second pass: look for empty slot
+        None
+    }
+
+    /// Claim a NEW live entry for the key in this bucket: a matching-tag
+    /// ghost first (freq-preserving takeover), then an empty slot, then
+    /// any ghost. Returns true if a slot was claimed.
+    ///
+    /// Entry creation only — the caller (`insert`) has already established
+    /// that no live entry for the key exists, and (from Task 4 on) holds
+    /// the key's insert stripe lock while calling this.
+    fn try_claim_new_slot(&self, bucket_index: usize, tag: u16, new_packed: u64) -> bool {
+        let bucket = self.bucket(bucket_index);
+
+        // Matching-tag ghost: take it over, preserving its frequency.
+        for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+            loop {
+                let packed = bucket.items[slot_index].load(Ordering::Acquire);
+
+                if Hashbucket::tag(packed) != tag || !Hashbucket::is_ghost(packed) {
+                    break; // next slot
+                }
+
+                let freq = Hashbucket::freq(packed);
+                let new_with_freq = Hashbucket::with_freq(new_packed, freq);
+
+                match bucket.items[slot_index].compare_exchange(
+                    packed,
+                    new_with_freq,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(_) => continue, // re-read THIS slot
+                }
+            }
+        }
+
+        // Empty slot.
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
             let packed = bucket.items[slot_index].load(Ordering::Relaxed);
 
@@ -723,13 +759,13 @@ impl MultiChoiceHashtable {
                     Ordering::Release,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => return Some(Ok(None)),
+                    Ok(_) => return true,
                     Err(_) => continue,
                 }
             }
         }
 
-        // Third pass: look for any ghost to evict
+        // Any ghost (evict it).
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
             let speculative = bucket.items[slot_index].load(Ordering::Relaxed);
 
@@ -743,14 +779,14 @@ impl MultiChoiceHashtable {
                         Ordering::Release,
                         Ordering::Relaxed,
                     ) {
-                        Ok(_) => return Some(Ok(None)),
+                        Ok(_) => return true,
                         Err(_) => continue,
                     }
                 }
             }
         }
 
-        None // Bucket full, try another
+        false // bucket full of live entries
     }
 
     /// Try to unlink an item from a bucket.
@@ -823,7 +859,7 @@ impl MultiChoiceHashtable {
     }
 
     /// Try to CAS update location in a bucket. Same publish reasoning as
-    /// `try_link_in_bucket`: the success ordering below is Release, which
+    /// `try_replace_existing`: the success ordering below is Release, which
     /// orders the new item's reserve/define byte writes ahead of the
     /// location becoming visible to readers.
     fn try_cas_in_bucket(
@@ -1064,39 +1100,39 @@ impl Hashtable for MultiChoiceHashtable {
         location: Location,
         verifier: &impl KeyVerifier,
     ) -> Result<Option<Location>, ()> {
-        let (tag, buckets) = self.probe(key);
+        let (_hash, tag, buckets) = self.probe_with_hash(key);
         let choices = &buckets[..self.num_choices as usize];
 
         let new_packed = Hashbucket::pack(tag, 1, location);
 
-        // First pass: try to find existing key or ghost in any bucket
+        // Replace the key's existing LIVE entry, wherever it lives among
+        // the candidate buckets. Scanning ALL choices before any claim is
+        // load-bearing: claiming a new slot in an earlier bucket while the
+        // key's live entry sits in a later one would publish a duplicate.
         for &bucket_index in choices {
-            if let Some(result) =
-                self.try_link_in_bucket(bucket_index, tag, key, new_packed, verifier)
+            if let Some(old) =
+                self.try_replace_existing(bucket_index, tag, key, new_packed, verifier)
             {
-                return result;
+                return Ok(Some(old));
             }
         }
 
-        // Second pass: find least-full bucket and try to insert there
-        if self.num_choices > 1 {
-            let target = choices
-                .iter()
-                .copied()
-                .min_by_key(|&b| self.count_occupied(b))
-                .unwrap();
-
-            if let Some(result) = self.try_link_in_bucket(target, tag, key, new_packed, verifier) {
-                return result;
+        // Fresh key: claim a new slot (matching ghost, then empty, then
+        // any ghost — per bucket, in choice order).
+        for &bucket_index in choices {
+            if self.try_claim_new_slot(bucket_index, tag, new_packed) {
+                return Ok(None);
             }
+        }
 
+        // All candidate buckets full of live entries: retry least-full
+        // first (a racing remove may have freed a slot since the scan).
+        if self.num_choices > 1 {
             let mut sorted: Vec<_> = choices.to_vec();
             sorted.sort_by_key(|&b| self.count_occupied(b));
             for bucket_index in sorted {
-                if let Some(result) =
-                    self.try_link_in_bucket(bucket_index, tag, key, new_packed, verifier)
-                {
-                    return result;
+                if self.try_claim_new_slot(bucket_index, tag, new_packed) {
+                    return Ok(None);
                 }
             }
         }
@@ -1220,6 +1256,37 @@ mod tests {
         }
     }
 
+    /// Count live (non-empty, non-ghost) entries across `key`'s candidate
+    /// buckets whose tag matches and whose location verifies for `key`.
+    fn count_live_entries(
+        ht: &MultiChoiceHashtable,
+        key: &[u8],
+        verifier: &impl KeyVerifier,
+    ) -> usize {
+        let hash = ht.hash_key(key);
+        let tag = MultiChoiceHashtable::tag_from_hash(hash);
+        let buckets = ht.bucket_indices(hash);
+        let num_choices = ht.num_choices as usize;
+
+        let mut live_count = 0;
+        for &bucket_index in &buckets[..num_choices] {
+            let bucket = ht.bucket(bucket_index);
+            for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
+                let packed = bucket.items[slot_index].load(Ordering::Acquire);
+                if packed == 0 || Hashbucket::is_ghost(packed) {
+                    continue;
+                }
+                if Hashbucket::tag(packed) != tag {
+                    continue;
+                }
+                if verifier.verify(key, Hashbucket::location(packed), true) {
+                    live_count += 1;
+                }
+            }
+        }
+        live_count
+    }
+
     #[test]
     fn test_hashtable_creation() {
         // power=10 → 2^10 = 1024 slots → 128 buckets (8 slots each)
@@ -1335,10 +1402,11 @@ mod tests {
     }
 
     // F4: concurrent same-key inserts must never leave two live entries for
-    // the same key. `try_link_in_bucket`'s first pass previously advanced to
-    // the NEXT slot on a matching-slot CAS failure instead of re-reading the
-    // SAME slot; a losing writer could then fall through to the empty-slot
-    // pass and publish a second, distinct live entry for the same key.
+    // the same key. The replace pass (now `try_replace_existing`) previously
+    // advanced to the NEXT slot on a matching-slot CAS failure instead of
+    // re-reading the SAME slot; a losing writer could then fall through to
+    // the empty-slot pass and publish a second, distinct live entry for the
+    // same key.
     //
     // The key is seeded with an initial entry BEFORE the threads start, so
     // every concurrent insert below is a genuine *overwrite* race (the F4
@@ -1355,12 +1423,11 @@ mod tests {
     //
     // NOTE: a separate, pre-existing race was observed while developing this
     // test: if the key has NO seed entry and multiple threads race the very
-    // first insert, each can pass `try_link_in_bucket`'s first pass (no
-    // match found yet) and then independently win the second pass by
-    // claiming two *different* empty slots via `compare_exchange(0, ..)`,
-    // producing a duplicate. That is a TOCTOU race across the first-pass /
-    // second-pass boundary within a single `try_link_in_bucket` call, not
-    // the matching-slot CAS-retry bug this test/fix targets, and it is not
+    // first insert, each can pass the replace scan (no match found yet) and
+    // then independently claim two *different* empty slots via
+    // `compare_exchange(0, ..)`, producing a duplicate. That is a TOCTOU
+    // race across the replace/claim boundary in `insert`, not the
+    // matching-slot CAS-retry bug this test/fix targets, and it is not
     // fixed here — flagged for a follow-up item.
     #[test]
     fn test_concurrent_same_key_insert_no_duplicates() {
@@ -1412,33 +1479,82 @@ mod tests {
 
         // Count live (non-empty, non-ghost) slots across the key's candidate
         // buckets whose tag matches AND whose location verifies for KEY.
-        let hash = ht.hash_key(KEY);
-        let tag = MultiChoiceHashtable::tag_from_hash(hash);
-        let buckets = ht.bucket_indices(hash);
-        let num_choices = ht.num_choices as usize;
-
-        let mut live_count = 0;
-        for &bucket_index in &buckets[..num_choices] {
-            let bucket = ht.bucket(bucket_index);
-            for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
-                let packed = bucket.items[slot_index].load(Ordering::Acquire);
-                if packed == 0 || Hashbucket::is_ghost(packed) {
-                    continue;
-                }
-                if Hashbucket::tag(packed) != tag {
-                    continue;
-                }
-                let location = Hashbucket::location(packed);
-                if verifier.verify(KEY, location, true) {
-                    live_count += 1;
-                }
-            }
-        }
+        let live_count = count_live_entries(&ht, KEY, &*verifier);
 
         assert_eq!(
             live_count, 1,
             "expected exactly one live entry for the key after concurrent \
              same-key inserts, found {live_count}"
+        );
+    }
+
+    // A live entry must be REPLACED wherever it lives among the candidate
+    // buckets — never shadowed by a fresh claim in an earlier bucket.
+    // Setup: fill the key's first-choice bucket so its first insert lands
+    // in the second-choice bucket, then free a first-bucket slot and
+    // insert the key again. The old per-bucket pass order (match/empty/
+    // ghost fully in bucket 0 before looking at bucket 1) claimed the
+    // freed first-bucket slot and left TWO live entries — single-threaded,
+    // no race required.
+    #[test]
+    fn test_replace_across_buckets_no_duplicate() {
+        let ht = MultiChoiceHashtable::new(7); // 16 buckets
+        let mut verifier = MockVerifier::new();
+
+        // Find a key whose two candidate buckets differ.
+        let mut key: Vec<u8> = Vec::new();
+        for i in 0u64..100_000 {
+            let cand = format!("xbucket-{i}").into_bytes();
+            let ch = ht.bucket_indices(ht.hash_key(&cand));
+            if ch[0] != ch[1] {
+                key = cand;
+                break;
+            }
+        }
+        assert!(!key.is_empty(), "no candidate key found");
+        let buckets = ht.bucket_indices(ht.hash_key(&key));
+        let b0 = buckets[0];
+
+        // Brute-force 8 filler keys whose FIRST choice is b0; inserting
+        // them fills b0 with live entries of OTHER keys.
+        let mut fillers: Vec<Vec<u8>> = Vec::new();
+        for i in 0u64..100_000 {
+            if fillers.len() == Hashbucket::NUM_ITEM_SLOTS {
+                break;
+            }
+            let cand = format!("filler-{i}").into_bytes();
+            if ht.bucket_indices(ht.hash_key(&cand))[0] == b0 {
+                fillers.push(cand);
+            }
+        }
+        assert_eq!(
+            fillers.len(),
+            Hashbucket::NUM_ITEM_SLOTS,
+            "not enough filler keys found"
+        );
+        for (n, f) in fillers.iter().enumerate() {
+            let loc = Location::new(100 + n as u64);
+            verifier.add(f, loc, false);
+            assert_eq!(ht.insert(f, loc, &verifier), Ok(None));
+        }
+
+        // b0 is full -> the key's first insert lands in its second choice.
+        let loc_a = Location::new(1);
+        verifier.add(&key, loc_a, false);
+        assert_eq!(ht.insert(&key, loc_a, &verifier), Ok(None));
+
+        // Free one b0 slot, then insert the key again: it MUST replace
+        // the second-choice entry (returning loc_a), not claim the freed
+        // b0 slot alongside it.
+        assert!(ht.remove(&fillers[0], Location::new(100)));
+        let loc_b = Location::new(2);
+        verifier.add(&key, loc_b, false);
+        assert_eq!(ht.insert(&key, loc_b, &verifier), Ok(Some(loc_a)));
+
+        assert_eq!(
+            count_live_entries(&ht, &key, &verifier),
+            1,
+            "cross-bucket replace must not leave a duplicate"
         );
     }
 }
