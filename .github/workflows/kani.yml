@@ -5,10 +5,10 @@ on:
     branches: [main]
   pull_request:
 
-# Model-checks the proof harnesses in crates/ziplist/src/kani.rs
+# Model-checks the proof harnesses in crates/data-structure/ziplist/src/kani.rs
 # (#[cfg(kani)]-gated, so they only ever run under this job or a local
 # `cargo kani`). Each harness documents its own bound at the definition
-# (crates/ziplist/src/kani.rs); none take more than a couple of minutes
+# (crates/data-structure/ziplist/src/kani.rs); none take more than a couple of minutes
 # locally, so no smoke-vs-full split is needed here the way fuzz.yml needs
 # one -- this job runs every harness, every time.
 concurrency:
@@ -24,4 +24,4 @@ jobs:
       - name: Run Kani on ziplist
         uses: model-checking/kani-github-action@v1.1
         with:
-          working-directory: crates/ziplist
+          working-directory: crates/data-structure/ziplist

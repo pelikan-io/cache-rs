@@ -51,13 +51,13 @@ jobs:
       - name: restore fuzz corpus
         uses: actions/cache@v4
         with:
-          path: crates/ziplist/fuzz/corpus/${{ matrix.target }}
+          path: crates/data-structure/ziplist/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
 
       - name: fuzz ${{ matrix.target }}
-        working-directory: crates/ziplist/fuzz
+        working-directory: crates/data-structure/ziplist/fuzz
         run: cargo fuzz run ${{ matrix.target }} -- -runs=${{ env.FUZZ_RUNS }}
 
   check-success:

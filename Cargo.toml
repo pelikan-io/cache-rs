@@ -5,7 +5,7 @@ members = [
     "crates/datatier",
     "crates/keyvalue",
     "crates/segcache",
-    "crates/ziplist",
+    "crates/data-structure/ziplist",
 ]
 
 [workspace.package]

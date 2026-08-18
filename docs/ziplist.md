@@ -317,7 +317,7 @@ plan:
 
 ```bash
 # fuzz (needs a nightly toolchain + cargo-fuzz: `cargo install cargo-fuzz`)
-cd crates/ziplist/fuzz
+cd crates/data-structure/ziplist/fuzz
 cargo +nightly fuzz run decode -- -runs=100000
 cargo +nightly fuzz run ops -- -runs=100000
 cargo +nightly fuzz run typed_ops -- -runs=100000
