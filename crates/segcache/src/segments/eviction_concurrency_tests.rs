@@ -1577,15 +1577,13 @@ fn concurrent_reader_vs_eviction_pin_safety() {
 // hard, over the shared `&self` PUBLIC API (`Segcache::insert` / `delete` /
 // `get`), under real eviction/merge pressure from a deliberately tiny pool.
 //
-// Every test SEEDS its shared key(s) single-threaded before spawning any
-// thread, so every concurrent op in the storm is an OVERWRITE (or a delete)
-// of an ALREADY-PUBLISHED key — never a fresh insert of a not-yet-existing
-// key. This is a deliberate scope boundary, not an oversight: concurrent
-// FRESH-key inserts (and the hashtable-full rollback path) have a separate,
-// already-tracked, narrow TRANSIENT-LEAK window (an item unlinked-but-not-
-// decremented, self-healing on recycle) that is NOT corruption and NOT the
-// crash 7f fixed. Pre-seeding keeps these tests deterministic and focused
-// on the overwrite/replace path that was actually broken.
+// Every test below still SEEDS its shared key(s) single-threaded before
+// spawning any thread, so every concurrent op in the storm is an
+// OVERWRITE (or a delete) of an ALREADY-PUBLISHED key. The seeding is
+// kept for determinism (freq > 0 merge survival, exact-count asserts),
+// not out of necessity: concurrent FRESH-key inserts are de-duplicated
+// by the hashtable's striped insert locks (see `table.rs::insert` and
+// `concurrent_fresh_insert_no_resurrection` below).
 
 /// Test 7 — Concurrent same-key INSERT accounting (Task 6, Step 2).
 ///
@@ -1610,8 +1608,8 @@ fn concurrent_reader_vs_eviction_pin_safety() {
 /// above) so a resolved value can be checked for legal SHAPE without any
 /// shared bookkeeping. Post-join, asserts: no leak, no corruption, every
 /// pin type (writer / remover / reader) unwound to zero, every hammered key
-/// still resolves to a legal value, `items()` equals exactly `KEYS` (F4: no
-/// duplicate-publish explosion), and (`debug`) `check_integrity` passes.
+/// still resolves to a legal value, and (`debug`) `check_integrity` passes.
+/// (No exact `items()` count — see the NOTE at the end of the test body.)
 ///
 /// Each writer thread also `get`s its just-written key once per iteration:
 /// without any reads, a key's hashtable frequency stays at 0 and the
@@ -1754,12 +1752,14 @@ fn concurrent_same_key_insert_accounting() {
 
     // NOTE: we deliberately do NOT assert `cache.items() == KEYS` here. Under
     // eviction a pre-seeded key can be fully evicted (its whole segment
-    // recycled) and then re-inserted concurrently as a FRESH key — which hits
-    // the tracked fresh-key duplicate-publish follow-up (out of 7f's crash-fix
-    // scope), inflating the count. That is a lookup-nondeterminism leak, not the
-    // corruption 7f fixes (no double-decrement, no `live_bytes < 0`). The
-    // overwrite path's duplicate-freedom is verified crash-free, without
-    // eviction, by the hashtable-layer test `test_concurrent_same_key_insert_no_duplicates`.
+    // recycled) and then re-inserted concurrently as a FRESH key; that fresh
+    // insert is now de-duplicated by the hashtable's striped insert locks
+    // (`table.rs::insert` — see `concurrent_fresh_insert_no_resurrection`),
+    // so it no longer inflates the count the way the pre-fix duplicate-publish
+    // race did — but a key can also simply be ABSENT at join time (evicted and
+    // not yet re-inserted), so an exact count is still not a valid assertion.
+    // The overwrite path's duplicate-freedom is verified crash-free,
+    // without eviction, by the hashtable-layer test `test_concurrent_same_key_insert_no_duplicates`.
     // What 7f guarantees here — no crash, no leaked pins, legal values, integrity
     // — is asserted above and below.
 
@@ -1926,9 +1926,10 @@ fn concurrent_insert_delete_evict() {
 /// hashtable entry for the same key (instead of the CAS-losing thread
 /// retrying against the winner's fresh location), `items()` would read
 /// `>= 2` and stay there once the storm settles. Pre-seeding keeps this on
-/// the overwrite path — the fresh-key duplicate-publish race is the
-/// separate, tracked, non-corrupting transient-leak window described in the
-/// module note above and is intentionally out of scope here.
+/// the overwrite path — the fresh-key path is a separate, already-covered
+/// scenario (now de-duplicated by the hashtable's striped insert locks; see
+/// `concurrent_fresh_insert_no_resurrection`) and is intentionally out of
+/// scope here.
 ///
 /// Each writer thread also `get`s the hot key once per iteration (mirroring
 /// `concurrent_evictors_merge_policy` / `concurrent_reader_vs_eviction_pin_safety`
@@ -1937,9 +1938,11 @@ fn concurrent_insert_delete_evict() {
 /// `prune` (see `Segments::merge_evict`) can delete it from the hashtable
 /// entirely during an eviction pass. Once pruned, the NEXT insert of "hot"
 /// is a FRESH insert (the key is genuinely absent), silently sliding the
-/// whole rest of the storm into the tracked fresh-key race window this test
-/// is explicitly not targeting — observed directly as a flaky `items() ==
-/// 2..3` failure before this fix. The periodic `get` keeps freq > 0, which
+/// whole rest of the storm into the fresh-key path this test is explicitly
+/// not targeting (now de-duplicated by the hashtable's striped insert
+/// locks, but still a different code path than the F4 overwrite fix under
+/// test here) — observed directly as a flaky `items() == 2..3` failure
+/// before this fix. The periodic `get` keeps freq > 0, which
 /// keeps the sole live item a merge survivor (copied forward, never
 /// pruned), so every subsequent insert stays a genuine overwrite.
 #[test]
@@ -2051,16 +2054,78 @@ fn concurrent_overwrite_uniqueness_single_key() {
 
     // NOTE: we do NOT assert `cache.items() == 1`. Under eviction the single
     // hammered key can be fully evicted and then re-inserted concurrently as a
-    // FRESH key, hitting the tracked fresh-key duplicate-publish follow-up (out
-    // of 7f's crash-fix scope) and inflating the count — a lookup-nondeterminism
-    // leak, not corruption. The overwrite path's duplicate-freedom is verified
-    // crash-free (no eviction) by the hashtable-layer
-    // `test_concurrent_same_key_insert_no_duplicates`. Here we assert only what
-    // 7f guarantees: the key resolves to a legal value (above), no leaked pins,
-    // and integrity (below).
+    // FRESH key; that fresh insert is now de-duplicated by the hashtable's
+    // striped insert locks (`table.rs::insert` — see
+    // `concurrent_fresh_insert_no_resurrection`), so it no longer inflates the
+    // count the way the pre-fix duplicate-publish race did. The overwrite
+    // path's duplicate-freedom is verified crash-free (no eviction) by the
+    // hashtable-layer `test_concurrent_same_key_insert_no_duplicates`. Here we
+    // assert only what 7f guarantees: the key resolves to a legal value
+    // (above), no leaked pins, and integrity (below).
 
     #[cfg(feature = "debug")]
     cache
         .check_integrity()
         .expect("cache must pass integrity check after the single-key overwrite storm");
+}
+
+/// Test 10 — fresh-key insert de-dup (the follow-up the module note above
+/// used to scope OUT — now fixed by the hashtable's striped insert locks):
+/// threads race the FIRST insert of a brand-new key — deliberately NO
+/// seeding — then the key is deleted once. Before the fix, racing fresh
+/// inserts could publish TWO live hashtable entries; `delete` unlinked
+/// only the first, so the key RESURRECTED with the losing insert's value.
+/// Post-fix: after one delete the key must be gone, every trial.
+#[test]
+fn concurrent_fresh_insert_no_resurrection() {
+    use std::sync::{Arc, Barrier};
+
+    const THREADS: usize = 4;
+    const TRIALS: usize = 1000;
+
+    let cache = Segcache::builder()
+        .segment_size(64 * 1024)
+        .heap_size(8 * 1024 * 1024)
+        .hash_power(13)
+        .build()
+        .expect("failed to build cache");
+    let cache = Arc::new(cache);
+
+    for trial in 0..TRIALS {
+        let key = format!("fresh-{trial:06}");
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                let key = key.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let value = format!("V{t:02}{trial:06}");
+                    let _ = cache.insert(
+                        key.as_bytes(),
+                        value.as_bytes(),
+                        None,
+                        std::time::Duration::ZERO,
+                    );
+                });
+            }
+        });
+
+        // Exactly one live entry means ONE delete fully removes the key.
+        // Generously sized (no eviction pressure is possible at ~40B/trial
+        // vs an 8MiB heap): this test isolates the hashtable claim race
+        // from eviction, unlike the deliberately-tiny-pool tests above, so
+        // the racing inserts' key must still be present — one delete must
+        // fully remove it.
+        assert!(
+            cache.delete(key.as_bytes()),
+            "trial {trial}: key missing before delete"
+        );
+        assert!(
+            cache.get(key.as_bytes()).is_none(),
+            "trial {trial}: key resurrected after delete — duplicate entry"
+        );
+    }
 }

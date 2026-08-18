@@ -52,7 +52,7 @@ pub struct MultiChoiceHashtable {
     /// under-lock absence re-check (see `insert`); entry MUTATION
     /// (replace, relocate, remove, ghost-convert) stays lock-free.
     ///
-    /// LOCK: leaf — the critical section is pure bucket-word CAS +
+    /// LOCK: insert-stripe — leaf; the critical section is pure bucket-word CAS +
     /// verifier reads; it is never held across any other lock, pin
     /// acquisition, or wait.
     insert_locks: Box<[CachePadded<Mutex<()>>]>,
@@ -1152,6 +1152,7 @@ impl Hashtable for MultiChoiceHashtable {
         // the candidate buckets. Scanning ALL choices before any claim is
         // load-bearing: claiming a new slot in an earlier bucket while the
         // key's live entry sits in a later one would publish a duplicate.
+        // NB: kept identical to the under-lock re-check below — change both together.
         for &bucket_index in choices {
             if let Some(old) =
                 self.try_replace_existing(bucket_index, tag, key, new_packed, verifier)
@@ -1170,10 +1171,12 @@ impl Hashtable for MultiChoiceHashtable {
         // The stripe lock is a LEAF: the critical section is pure
         // bucket-word CAS + verifier reads — it never takes another lock,
         // pin, or wait.
+        // LOCK: insert-stripe
         let _guard = self.stripe(hash).lock().unwrap();
 
         // Re-check under the lock: a racing fresh insert may have
         // published while we waited.
+        // NB: kept identical to the phase-A scan above — change both together.
         for &bucket_index in choices {
             if let Some(old) =
                 self.try_replace_existing(bucket_index, tag, key, new_packed, verifier)
@@ -1502,8 +1505,11 @@ mod tests {
     // then independently claim two *different* empty slots via
     // `compare_exchange(0, ..)`, producing a duplicate. That is a TOCTOU
     // race across the replace/claim boundary in `insert`, not the
-    // matching-slot CAS-retry bug this test targets; it is covered by
-    // `test_concurrent_fresh_key_insert_no_duplicates` below.
+    // matching-slot CAS-retry bug this test targets. It is now CLOSED: entry
+    // creation is serialized per key-hash stripe with an under-lock
+    // absence re-check (see the stripe lock in `insert` below), and
+    // coverage lives in `test_concurrent_fresh_key_insert_no_duplicates`
+    // below.
     #[test]
     fn test_concurrent_same_key_insert_no_duplicates() {
         use std::sync::Arc;

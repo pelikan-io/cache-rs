@@ -285,22 +285,21 @@ impl Segcache {
                     drop(pin);
                 }
                 None => {
-                    // Fresh key: insert. `hashtable.insert()` is itself an
-                    // atomic upsert, so if a racing writer's insert of this
-                    // same previously-absent key beat us here, our call
-                    // unlinks THEIRS (not ours) as a side effect and returns
-                    // it as `Ok(Some(raced_old))`. F4's matching-slot retry
-                    // means this always resolves to exactly one hashtable
-                    // entry (ours), but that racer's segment accounting is
-                    // now our responsibility to decrement — same as any
-                    // other replace, just with the unlink already done by
-                    // the call above rather than by a pin-first
-                    // `cas_location` (a narrow, accepted gap: if a drain
-                    // claims that segment in the instant between the unlink
-                    // above and the pin attempt below, the pin fails and
-                    // that decrement is missed — concurrent fresh-insert
-                    // de-dup racing a same-instant drain is a known separate
-                    // follow-up).
+                    // Fresh key: `hashtable.insert()` is an atomic upsert
+                    // whose entry CREATION is serialized per key-hash
+                    // stripe (table.rs), so concurrent fresh inserts of
+                    // one key can never publish duplicate entries. If a
+                    // racing writer published this key between our
+                    // `lookup_slot` miss and here, our call resolves to a
+                    // replace under the stripe's re-check and returns the
+                    // racer's location as `Ok(Some(raced_old))` — that
+                    // racer's segment accounting is then ours to
+                    // decrement, with the unlink already done by the call
+                    // above rather than by a pin-first `cas_location` (a
+                    // narrow, accepted gap: if a drain claims that
+                    // segment between the unlink and the pin attempt
+                    // below, the pin fails and the drain owns the
+                    // segment's accounting wholesale).
                     match self
                         .hashtable
                         .insert(reserved.item().key(), new_location, &verifier)
