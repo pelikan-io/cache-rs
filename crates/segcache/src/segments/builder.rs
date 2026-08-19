@@ -48,8 +48,10 @@ impl SegmentsBuilder {
     /// Returns an error if:
     /// - `segment_size` is not larger than the per-item header overhead
     /// - `heap_size` is zero or not a multiple of `segment_size`
-    /// - the resulting segment count exceeds `Location::MAX_SEGMENT_ID`, the
-    ///   largest id a location's 20-bit segment field can address
+    /// - the resulting segment count exceeds `Location::MAX_SEGMENTS`, the
+    ///   largest id a heap may issue — one below what a location's 20-bit
+    ///   segment field could address, the top value being reserved so no
+    ///   location aliases the ghost sentinel
     ///   (`SegmentsError::TooManySegments`, raised by `Segments::from_builder`)
     pub fn build(self) -> Result<Segments, SegmentsError> {
         let min_size = crate::ITEM_HDR_SIZE as i32 + 1;

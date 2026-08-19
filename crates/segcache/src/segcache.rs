@@ -213,11 +213,25 @@ impl Segcache {
         let mut attempts = 0;
         let mut location = self.lookup_location(key, &verifier, update_freq)?;
         loop {
-            let (seg_id, offset) = unpack_location(location);
+            let (seg_id, _offset) = unpack_location(location);
             let seg_id = NonZeroU32::new(seg_id)?;
-            let Some((raw, guard)) = self.segments.acquire_item_at(seg_id, offset) else {
-                location =
-                    self.relookup_after_pin_failure(key, &verifier, update_freq, &backoff)?;
+            // The incarnation check lives INSIDE the pin, not in front of it:
+            // `acquire_item_at` takes the whole `Location` and compares its tag
+            // against the segment's generation under the reader guard, which is
+            // what freezes the generation while it is read. A stale incarnation
+            // therefore fails the pin, and the triage of *why* a pin failed is
+            // `relookup_after_pin_failure`'s job — off the hot path, behind a
+            // cold edge, so the fast path pays for exactly one generation load
+            // (the one inside the pin) and no `resolve` of its own.
+            let Some((raw, guard)) = self.segments.acquire_item_at(location) else {
+                location = self.relookup_after_pin_failure(
+                    key,
+                    &verifier,
+                    update_freq,
+                    &backoff,
+                    location,
+                    &mut attempts,
+                )?;
                 continue;
             };
             #[cfg(feature = "fault-injection")]
@@ -309,9 +323,13 @@ impl Segcache {
         current
     }
 
-    /// The reader pin failed: the segment is in a transient non-readable state
-    /// — a drain owns it (Draining) or it is mid linking.
+    /// The reader pin failed. Both answers are a fresh lookup; they differ only
+    /// in whether the retry is bounded, and the incarnation tag is what tells
+    /// them apart. `acquire_item_at` refuses a pin for exactly two reasons, and
+    /// this is the one place that has to distinguish them:
     ///
+    /// **Transient (`resolve` still says `Some`)** — the segment is in a
+    /// non-readable state: a drain owns it (Draining) or it is mid linking.
     /// Under merge eviction a drain RETAINS live items (they are relocated into
     /// the copy destination and republished), so an unreadable segment does NOT
     /// mean the key is gone: returning `None` here is a false miss — the key
@@ -320,13 +338,35 @@ impl Segcache {
     /// key up again instead (the same protocol as `numeric_update`): the owning
     /// drain is bounded, straight-line work that either republishes the item at
     /// a new location (the fresh lookup resolves there, in a readable segment)
-    /// or removes the entry (the lookup returns `None` and we exit).
+    /// or removes the entry (the lookup returns `None` and we exit). This retry
+    /// is deliberately NOT counted against the revalidation budget: a drain
+    /// window is far longer than a few spins, so a bounded retry would still
+    /// report false misses. Termination relies on writers/drains never wedging
+    /// — see the replace-vs-drain rollback in `insert`/`replace_at`, which
+    /// guarantees drains cannot block forever on a writer pin.
     ///
-    /// This retry is deliberately NOT counted against the revalidation budget:
-    /// a drain window is far longer than a few spins, so a bounded retry would
-    /// still report false misses. Termination relies on writers/drains never
-    /// wedging — see the replace-vs-drain rollback in `insert`/`replace_at`,
-    /// which guarantees drains cannot block forever on a writer pin.
+    /// **Stale incarnation (`resolve` says `None`)** — the segment is perfectly
+    /// readable; it is `location` that is dead. Its tag no longer matches the
+    /// segment's generation, so it names an item that was reclaimed, and a hit
+    /// on whatever occupies those bytes now would be another key's value. That
+    /// is a MISS, and nothing about it is transient: no drain is going to finish
+    /// and fix it. Retrying is still right — the entry is stale by definition,
+    /// so either a writer has already published a fresh location or the key is
+    /// gone — but it MUST be bounded, or a hashtable entry that somehow stays
+    /// stale (nothing left to republish it, nothing left to unlink it) spins the
+    /// unbounded arm above forever. Bounding it is the whole reason the tag is
+    /// consulted here rather than left to the post-pin revalidation, which would
+    /// also reject the location but only after routing it through this arm.
+    ///
+    /// It shares `attempts` — and therefore `REVALIDATE_RETRIES` — with
+    /// `follow_republished` rather than carrying `RESERVE_RETRIES`. The two
+    /// bound the same thing (how many times ONE `get` re-attempts because the
+    /// world moved under it, one pin apiece), so a single counter is what caps
+    /// a `get` at `REVALIDATE_RETRIES` pins no matter how an adversary mixes the
+    /// arms. `RESERVE_RETRIES` bounds reservation attempts on the write path;
+    /// #68 split the read path's budget out of it precisely because 3 is far too
+    /// tight for a live key, and re-coupling this arm to it would re-introduce
+    /// the false miss on the other face of the same window.
     #[cold]
     #[inline(never)]
     fn relookup_after_pin_failure(
@@ -335,7 +375,15 @@ impl Segcache {
         verifier: &SegmentsVerifier<'_>,
         update_freq: bool,
         backoff: &Backoff,
+        location: Location,
+        attempts: &mut usize,
     ) -> Option<Location> {
+        if self.segments.resolve(location).is_none() {
+            *attempts += 1;
+            if *attempts >= REVALIDATE_RETRIES {
+                return None;
+            }
+        }
         backoff.snooze();
         self.lookup_location(key, verifier, update_freq)
     }
@@ -416,7 +464,7 @@ impl Segcache {
                 reserved.generation(),
                 reserved.offset() as u64,
             );
-            let (new_seg, new_offset) = (reserved.seg(), reserved.offset());
+            let new_seg = reserved.seg();
             let verifier = self.verifier();
 
             // Publish under the pin: `reserved` (and its WriterPin) is held across
@@ -453,7 +501,10 @@ impl Segcache {
                             return Ok(());
                         }
 
-                        let (old_seg_raw, old_offset) = unpack_location(old_location);
+                        // Address only — the incarnation check happens inside
+                        // `remove_at`, under the remover pin taken below (an
+                        // unpinned check here could go stale before the pin).
+                        let (old_seg_raw, _old_offset) = unpack_location(old_location);
                         let Some(old_seg_id) = NonZeroU32::new(old_seg_raw) else {
                             // Not expected — `lookup_slot` only returns real
                             // (non-ghost) entries — but stay defensive and fall
@@ -492,7 +543,7 @@ impl Segcache {
                         //   here too — releasing our pin breaks any such cycle.
                         let Some(pin) = self.segments.try_pin_remover(old_seg_id) else {
                             if old_seg_id == new_seg || backoff.is_completed() {
-                                self.rollback_reservation(reserved, new_seg, new_offset);
+                                self.rollback_reservation(reserved, new_location);
                                 continue 'operation;
                             }
                             backoff.snooze();
@@ -507,9 +558,12 @@ impl Segcache {
                             ITEM_REPLACE.increment();
 
                             drop(reserved);
+                            // `remove_at` re-validates `old_location`'s
+                            // incarnation under `pin` and skips the decrement
+                            // if the entry we just replaced was published by an
+                            // incarnation that is already gone.
                             let _ = self.segments.remove_at(
-                                old_seg_id,
-                                old_offset,
+                                old_location,
                                 &self.ttl_buckets,
                                 &self.hashtable,
                                 pin,
@@ -535,13 +589,13 @@ impl Segcache {
                         // narrow, accepted gap: if a drain claims that
                         // segment between the unlink and the pin attempt
                         // below, the pin fails and the drain owns the
-                        // segment's accounting wholesale). The same gap has a
-                        // second face: the pin can also SUCCEED on a
-                        // recycled-and-reused incarnation of that segment id,
-                        // because a `Location` carries no generation — the
-                        // decrement then lands on the wrong incarnation.
-                        // Same accepted class, tracked as a follow-up
-                        // (generation-tagged locations).
+                        // segment's accounting wholesale). The gap's second
+                        // face — the pin SUCCEEDING on a recycled-and-reused
+                        // incarnation of that segment id, landing the
+                        // decrement on the wrong incarnation — is now closed:
+                        // `raced_old` carries its incarnation tag, and
+                        // `remove_at` re-checks it under the pin and skips the
+                        // decrement on a mismatch.
                         match self
                             .hashtable
                             .insert(reserved.item().key(), new_location, &verifier)
@@ -555,12 +609,11 @@ impl Segcache {
                                 #[cfg(feature = "metrics")]
                                 HASH_INSERT.increment();
                                 drop(reserved);
-                                let (raced_seg, raced_offset) = unpack_location(raced_old);
+                                let (raced_seg, _raced_offset) = unpack_location(raced_old);
                                 if let Some(raced_seg) = NonZeroU32::new(raced_seg) {
                                     if let Some(pin) = self.segments.try_pin_remover(raced_seg) {
                                         let _ = self.segments.remove_at(
-                                            raced_seg,
-                                            raced_offset,
+                                            raced_old,
                                             &self.ttl_buckets,
                                             &self.hashtable,
                                             pin,
@@ -574,7 +627,7 @@ impl Segcache {
                                 // reservation.
                                 #[cfg(feature = "metrics")]
                                 HASH_INSERT_EX.increment();
-                                self.rollback_reservation(reserved, new_seg, new_offset);
+                                self.rollback_reservation(reserved, new_location);
                                 return Err(SegcacheError::HashTableInsertEx);
                             }
                         }
@@ -583,7 +636,7 @@ impl Segcache {
             }
 
             // Defensive fallback for the "invalid old location" break above.
-            self.rollback_reservation(reserved, new_seg, new_offset);
+            self.rollback_reservation(reserved, new_location);
             return Err(SegcacheError::HashTableInsertEx);
         }
     }
@@ -595,12 +648,22 @@ impl Segcache {
     /// a reserved-but-never-published item. If the pin fails (the segment is
     /// concurrently being drained), the drain owns the item's accounting —
     /// nothing further to do.
-    fn rollback_reservation(&self, reserved: ReservedItem, seg: NonZeroU32, offset: usize) {
+    ///
+    /// `location` is the reservation's own location, built under the
+    /// `WriterPin` that is dropped on the first line here. Dropping it opens a
+    /// window in which the segment can be drained and recycled before the
+    /// remover pin below succeeds — on a DIFFERENT incarnation. `remove_at`
+    /// re-checks the tag under that pin and skips the decrement if so.
+    fn rollback_reservation(&self, reserved: ReservedItem, location: Location) {
         drop(reserved);
+        let (seg, _offset) = unpack_location(location);
+        let Some(seg) = NonZeroU32::new(seg) else {
+            return;
+        };
         if let Some(pin) = self.segments.try_pin_remover(seg) {
             let _ = self
                 .segments
-                .remove_at(seg, offset, &self.ttl_buckets, &self.hashtable, pin);
+                .remove_at(location, &self.ttl_buckets, &self.hashtable, pin);
         }
     }
 
@@ -748,14 +811,14 @@ impl Segcache {
             reserved.generation(),
             reserved.offset() as u64,
         );
-        // Capture the reservation's own location up front so the rollback paths
+        // Capture the reservation's own segment up front so the rollback paths
         // can reclaim it AFTER the pin is released (see the drop-before-remove_at
         // invariant below), without borrowing `reserved`.
-        let (new_seg, new_offset) = (reserved.seg(), reserved.offset());
+        let new_seg = reserved.seg();
         let (old_seg_id, old_offset) = unpack_location(old_location);
         let Some(old_seg_id) = NonZeroU32::new(old_seg_id) else {
             // invalid old location: roll back the (unpublished) reservation.
-            self.rollback_reservation(reserved, new_seg, new_offset);
+            self.rollback_reservation(reserved, new_location);
             return Err(SegcacheError::NotFound);
         };
 
@@ -808,7 +871,7 @@ impl Segcache {
                         || old_seg_id == new_seg
                         || backoff.is_completed()
                     {
-                        self.rollback_reservation(reserved, new_seg, new_offset);
+                        self.rollback_reservation(reserved, new_location);
                         return Err(SegcacheError::Exists);
                     }
                     backoff.snooze();
@@ -859,7 +922,7 @@ impl Segcache {
                     .is_none()
                 {
                     drop(pin);
-                    self.rollback_reservation(reserved, new_seg, new_offset);
+                    self.rollback_reservation(reserved, new_location);
                     return Err(SegcacheError::Exists);
                 }
                 old_raw = self.segments.get_item_at(Some(old_seg_id), old_offset);
@@ -871,7 +934,7 @@ impl Segcache {
                         if crate::cas::mix_version(base, guard.version()) != expected {
                             drop(guard);
                             drop(pin);
-                            self.rollback_reservation(reserved, new_seg, new_offset);
+                            self.rollback_reservation(reserved, new_location);
                             return Err(SegcacheError::Exists);
                         }
                         Some(guard)
@@ -881,7 +944,7 @@ impl Segcache {
                         // location + generation.
                         if base != expected {
                             drop(pin);
-                            self.rollback_reservation(reserved, new_seg, new_offset);
+                            self.rollback_reservation(reserved, new_location);
                             return Err(SegcacheError::Exists);
                         }
                         None
@@ -914,13 +977,11 @@ impl Segcache {
                 // the unlink just performed and the decrement below (item
                 // 7f); `remove_at` releases it, also before any `chain_lock`.
                 drop(reserved);
-                let _ = self.segments.remove_at(
-                    old_seg_id,
-                    old_offset,
-                    &self.ttl_buckets,
-                    &self.hashtable,
-                    pin,
-                );
+                // `remove_at` re-validates `old_location`'s incarnation under
+                // `pin` before decrementing (see `Segments::resolve`).
+                let _ =
+                    self.segments
+                        .remove_at(old_location, &self.ttl_buckets, &self.hashtable, pin);
                 return Ok(());
             }
 
@@ -937,7 +998,7 @@ impl Segcache {
                 // The entry genuinely no longer maps to old_location
                 // (replaced, relocated, or removed) — roll back the
                 // (unpublished) reservation.
-                self.rollback_reservation(reserved, new_seg, new_offset);
+                self.rollback_reservation(reserved, new_location);
                 return Err(SegcacheError::Exists);
             }
 
@@ -1035,7 +1096,7 @@ impl Segcache {
                 .lookup_slot(key, &verifier)
                 .ok_or(SegcacheError::NotFound)?;
 
-            let (seg_id, offset) = unpack_location(location);
+            let (seg_id, _offset) = unpack_location(location);
             let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
 
             // Lazy expiry: memcached returns NOT_FOUND for a cas on an expired
@@ -1048,9 +1109,12 @@ impl Segcache {
             // Pin briefly to read the item's seqlock version (numeric
             // items fold it into the token); the pin drops before the
             // reservation below — pinned segments are unevictable.
-            let Some((raw, guard)) = self.segments.acquire_item_at(seg_id, offset) else {
-                // Transient drain window — retry from the lookup (not
-                // counted against `attempts`, same as `get_pinned`).
+            let Some((raw, guard)) = self.segments.acquire_item_at(location) else {
+                // Transient drain window, or a location whose incarnation is
+                // gone (`acquire_item_at` refuses the pin — see
+                // `Segments::resolve`); either way the fresh lookup on retry
+                // resolves the live location or reports the key gone. Not
+                // counted against `attempts`, same as `get_pinned`.
                 backoff.snooze();
                 continue;
             };
@@ -1246,13 +1310,20 @@ impl Segcache {
                 ITEM_DELETE.increment();
             }
 
-            // Remove from segment
-            if let Some(mut item) = self.segments.get_item_at(Some(seg_id), offset) {
-                item.set_deleted(true);
+            // Remove from segment. Both steps are incarnation-gated: under the
+            // remover pin the generation is frozen, so a tag mismatch here
+            // means the entry we just unlinked was published by an incarnation
+            // that is already gone — its bytes belong to a different
+            // incarnation now, and marking THEM deleted would destroy a live
+            // item. `remove_at` re-checks the same way before decrementing.
+            if self.segments.resolve(location).is_some() {
+                if let Some(mut item) = self.segments.get_item_at(Some(seg_id), offset) {
+                    item.set_deleted(true);
+                }
             }
-            let _ =
-                self.segments
-                    .remove_at(seg_id, offset, &self.ttl_buckets, &self.hashtable, pin);
+            let _ = self
+                .segments
+                .remove_at(location, &self.ttl_buckets, &self.hashtable, pin);
 
             return true;
         }
@@ -1366,7 +1437,7 @@ impl Segcache {
                 .hashtable
                 .lookup(key, &verifier)
                 .ok_or(SegcacheError::NotFound)?;
-            let (seg_id, offset) = unpack_location(location);
+            let (seg_id, _offset) = unpack_location(location);
             let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
 
             // Lazy expiry: a counter past its segment deadline is
@@ -1374,11 +1445,12 @@ impl Segcache {
             // expire() reclaims the segment.
             self.remaining_ttl(seg_id)?;
 
-            match self.segments.acquire_item_at(seg_id, offset) {
+            match self.segments.acquire_item_at(location) {
                 // Segment not readable (draining; a relocation is in
-                // flight) — back off and retry from the lookup, giving
-                // the drain a chance to finish instead of busy-waiting
-                // through its whole window.
+                // flight), or the location's incarnation is gone (the pin
+                // is refused — see `Segments::resolve`) — back off and retry
+                // from the lookup, giving the drain a chance to finish
+                // instead of busy-waiting through its whole window.
                 None => {
                     backoff.snooze();
                     continue;
@@ -1484,11 +1556,12 @@ impl Segcache {
                 return self.insert(key, initial, None, ttl);
             };
 
-            let (seg_id, offset) = unpack_location(location);
+            let (seg_id, _offset) = unpack_location(location);
             let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
 
-            let Some((raw, guard)) = self.segments.acquire_item_at(seg_id, offset) else {
-                // Transient drain window — retry from the lookup.
+            let Some((raw, guard)) = self.segments.acquire_item_at(location) else {
+                // Transient drain window, or a stale incarnation whose pin is
+                // refused (`Segments::resolve`) — retry from the lookup.
                 backoff.snooze();
                 continue;
             };

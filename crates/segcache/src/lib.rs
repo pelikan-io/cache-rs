@@ -64,6 +64,9 @@ mod numeric_relocation_tests;
 #[cfg(all(test, feature = "fault-injection", not(feature = "loom")))]
 mod revalidation_tests;
 
+#[cfg(all(test, not(feature = "loom")))]
+mod incarnation_tests;
+
 // publicly exported items from submodules
 pub use crate::segcache::Segcache;
 pub use builder::Builder;

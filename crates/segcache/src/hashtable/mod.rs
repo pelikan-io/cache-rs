@@ -61,14 +61,14 @@ use keyvalue::RawItem;
 #[inline]
 pub(crate) fn pack_location(seg_id: NonZeroU32, generation: u16, offset: u64) -> Location {
     debug_assert!(
-        seg_id.get() <= Location::MAX_SEGMENT_ID,
-        "segment id exceeds the 20-bit location field"
+        seg_id.get() <= Location::MAX_SEGMENTS,
+        "segment id exceeds the largest issuable id"
     );
     debug_assert!(
         (offset >> 3) <= location::OFFSET_MASK,
         "offset exceeds the 20-bit location field"
     );
-    let tag = (generation as u64) & location::TAG_MASK;
+    let tag = location::tag_for_generation(generation) as u64;
     Location::new(
         ((seg_id.get() as u64) << location::SEG_ID_SHIFT)
             | (tag << location::TAG_SHIFT)
@@ -173,7 +173,11 @@ unsafe impl Sync for SegmentsVerifier<'_> {}
 mod tests {
     use super::*;
 
-    const MAX_ID: u32 = Location::MAX_SEGMENT_ID;
+    /// The largest id a heap can actually issue. Deliberately NOT
+    /// `MAX_SEGMENT_ID` (the field's capacity): that value is reserved so no
+    /// real location can alias `Location::GHOST` — see
+    /// `test_ghost_is_unreachable_by_construction`.
+    const MAX_ID: u32 = Location::MAX_SEGMENTS;
     const MAX_OFFSET: u64 = location::OFFSET_MASK << 3;
 
     #[test]
@@ -226,7 +230,10 @@ mod tests {
         assert_eq!(unpacked_seg, MAX_ID);
         assert_eq!(unpacked_offset, MAX_OFFSET as usize);
         assert_eq!(loc.tag(), 0xF);
-        assert_eq!(loc.as_raw(), Location::MAX_RAW);
+        // Even with every issuable field maxed, the raw word falls short of
+        // all-ones: the reserved id keeps the ghost sentinel out of reach.
+        assert_ne!(loc.as_raw(), Location::MAX_RAW);
+        assert!(!loc.is_ghost());
     }
 
     /// The three fields are independent: walking each boundary while the
@@ -281,20 +288,22 @@ mod tests {
         assert_eq!(unpack_location(before), unpack_location(after));
     }
 
-    /// `Location::GHOST` is all 44 bits set. It stays distinguishable from
-    /// every location a real deployment can publish.
+    /// `Location::GHOST` is all 44 bits set, and no real location can equal it
+    /// — not "implausibly", but by construction.
     ///
-    /// The one packing that would equal it needs ALL of: the maximum segment
-    /// id (a heap of exactly `MAX_SEGMENT_ID` segments), tag 15, and an item at
-    /// the very last encodable offset — i.e. an 8 MiB segment whose final 8
-    /// bytes hold an item. That corner predates this change (the 24-bit layout
-    /// had the same "max id + max offset" alias) and is unreachable at any
-    /// plausible heap size; it is asserted here so the corner is recorded
-    /// rather than assumed away.
+    /// The only packing that would alias it needs ALL of: the id field at
+    /// `MAX_SEGMENT_ID`, tag 15, and an item at the very last encodable offset.
+    /// The id field's maximum is deliberately NOT issuable (`MAX_SEGMENTS` is
+    /// one lower, and `Segments::from_builder` refuses a heap that would need
+    /// it — see `segments::capacity_tests`), so the first conjunct is
+    /// unsatisfiable and the alias cannot arise however extreme the other two
+    /// get.
     #[test]
-    fn test_ghost_is_distinct_from_real_locations() {
+    fn test_ghost_is_unreachable_by_construction() {
         assert!(Location::GHOST.is_ghost());
 
+        // Every extreme an issuable id can reach, including all three fields
+        // simultaneously maximal.
         let corners = [
             (1u32, 0u16, 0u64),
             (1, 0xF, MAX_OFFSET),
@@ -303,6 +312,7 @@ mod tests {
             (MAX_ID - 1, 0xF, MAX_OFFSET),
             (MAX_ID, 0xE, MAX_OFFSET),
             (MAX_ID, 0xF, MAX_OFFSET - 8),
+            (MAX_ID, 0xF, MAX_OFFSET),
         ];
         for (id, generation, offset) in corners {
             let loc = pack_location(NonZeroU32::new(id).unwrap(), generation, offset);
@@ -312,10 +322,18 @@ mod tests {
             );
         }
 
-        // The documented single alias, stated explicitly.
+        // Why the sweep above is exhaustive rather than lucky: the sentinel's
+        // id field is one value, and that value is not issuable.
         assert_eq!(
-            pack_location(NonZeroU32::new(MAX_ID).unwrap(), 0xF, MAX_OFFSET).as_raw(),
-            Location::GHOST.as_raw()
+            Location::GHOST.as_raw() >> location::SEG_ID_SHIFT,
+            Location::MAX_SEGMENT_ID as u64,
+            "GHOST must sit at the id field's maximum"
         );
+        const {
+            assert!(
+                Location::MAX_SEGMENTS < Location::MAX_SEGMENT_ID,
+                "the aliasing id must be reserved, not issuable"
+            )
+        };
     }
 }

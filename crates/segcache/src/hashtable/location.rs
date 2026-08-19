@@ -62,14 +62,27 @@ impl Location {
     /// Maximum raw value (44 bits set).
     pub const MAX_RAW: u64 = 0xFFF_FFFF_FFFF;
 
-    /// Largest segment id a location can encode. Segment ids are 1-based, so
-    /// this is also the largest number of segments a heap may contain;
-    /// `Segments` construction refuses anything larger rather than silently
-    /// aliasing ids together.
+    /// Largest segment id the 20-bit id field can encode.
+    ///
+    /// This is the field's capacity, NOT the largest id a heap may issue —
+    /// see [`Self::MAX_SEGMENTS`], which is one lower on purpose.
     pub(crate) const MAX_SEGMENT_ID: u32 = (1 << SEG_ID_BITS) - 1;
 
+    /// Largest number of segments a heap may contain, and (ids being 1-based)
+    /// the largest segment id that is ever issued.
+    ///
+    /// One below the field's capacity, so that [`Self::MAX_SEGMENT_ID`] is
+    /// **never** a live segment id. That reservation is what makes [`Self::GHOST`]
+    /// — all 44 bits set — unreachable by construction: the only packing that
+    /// equals it needs `MAX_SEGMENT_ID` in the id field, which no heap can
+    /// issue, so no `pack_location` of a real item can ever alias the sentinel.
+    /// `Segments` construction refuses a larger heap rather than relying on
+    /// "an 8 MiB segment whose last 8 bytes hold an item is implausible".
+    pub(crate) const MAX_SEGMENTS: u32 = Self::MAX_SEGMENT_ID - 1;
+
     /// Sentinel value indicating a ghost entry (recently evicted).
-    /// All 44 location bits set to 1.
+    /// All 44 location bits set to 1. Unreachable as a real location: see
+    /// [`Self::MAX_SEGMENTS`].
     pub const GHOST: Self = Self(Self::MAX_RAW);
 
     /// Create a location from a raw 44-bit value.
@@ -112,6 +125,16 @@ impl Location {
     pub fn tag(&self) -> u8 {
         ((self.0 >> TAG_SHIFT) & TAG_MASK) as u8
     }
+}
+
+/// The incarnation tag carried by a location published under `generation`.
+///
+/// The ONE definition of the generation -> tag projection: `crate::pack_location`
+/// stamps it and `Segments::resolve` compares against it, so the two cannot
+/// drift apart into a mask that matches nothing.
+#[inline(always)]
+pub(crate) fn tag_for_generation(generation: u16) -> u8 {
+    ((generation as u64) & TAG_MASK) as u8
 }
 
 impl fmt::Debug for Location {

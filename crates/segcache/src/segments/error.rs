@@ -24,8 +24,9 @@ pub enum SegmentsError {
         segment_size: usize,
     },
     #[error(
-        "heap requires {segments} segments, more than the {limit} a location's 20-bit segment id \
-         can address; increase segment_size (or reduce heap_size)"
+        "heap requires {segments} segments, more than the {limit} a location can address (the \
+         20-bit segment id holds one more, reserved so no location aliases the ghost sentinel); \
+         increase segment_size (or reduce heap_size)"
     )]
     TooManySegments { segments: usize, limit: usize },
     #[error("mmap allocation failed")]
