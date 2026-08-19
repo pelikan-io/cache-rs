@@ -1,0 +1,25 @@
+schema_version: 1
+instance_id: 1587491a-742c-481c-8d88-c02c3c3307e3
+template:
+  id: engineering-journal-skill
+  version: 0.1.0
+source:
+  repository: https://github.com/iopsystems/skills-mcp
+  commit: 81bfe916c34e90435c5e431ba5e6775c5cf72080
+base:
+  aggregate_sha256: 6b365294b96640d4de6c50f65c1f753bc8b6625f42031910de7e461f6b462867
+  files:
+    - path: SKILL.md
+      sha256: 38fde395ca5932fc5c1690a7ac9a52e0e2d2cc39efbbc12722139af96c0eaa35
+      merge_strategy: three-way
+    - path: references/project-profile.md
+      sha256: c5c4c99ea77b3261c7d5410bb6e9f6bab549501ea90ac06e39fb912ca892ec9f
+      merge_strategy: three-way
+    - path: evals/trigger-evals.json
+      sha256: 43cb9a4b1cccc6661f48677750650d23e61ceba31208f4d458474b31e8c2d8ed
+      merge_strategy: preserve-local
+installed_at: 2026-08-18
+last_upgraded_at: null
+customizations:
+  - path: references/project-profile.md
+    rationale: filled with cache-rs journal conventions (docs/journal layout, cargo-based evidence and validation commands, beta-skill feedback pull-model policy)
