@@ -1,0 +1,39 @@
+// Hand-authored schematic (a design claim, not derivable from code):
+// v1 as shipped vs. the v2 chained shape reserved by the chain-root flag.
+// Dashed = reserved-not-built. Render:
+//   dot -Tsvg docs/diagrams/ziplist-chaining.dot > docs/diagrams/ziplist-chaining.svg
+digraph ziplist_chaining {
+  graph [rankdir=LR, bgcolor="#FCFCFA", fontname="Helvetica", fontsize=12,
+         fontcolor="#22303C", color="#22303C", ranksep=0.5, nodesep=0.3];
+  node [shape=box, style=filled, fontname="Courier", fontsize=11,
+        fontcolor="#22303C", color="#22303C", margin="0.15,0.08"];
+  edge [color="#22303C", fontname="Helvetica", fontsize=10, fontcolor="#22303C"];
+
+  subgraph cluster_v1 {
+    label="v1 — shipped"; labelloc=t; style=solid; margin=10;
+    key1 [label="key", fillcolor="#FCFCFA"];
+    block [label="block (≤ item cap)", fillcolor="#B3CDE3"];
+    key1 -> block [label="hash"];
+  }
+
+  subgraph cluster_v2 {
+    label="v2 — reserved by the chain-root flag"; labelloc=t; style=dashed; margin=10;
+    node [style="filled,dashed"];
+    edge [style=dashed];
+    key2 [label="key", fillcolor="#FCFCFA"];
+    root [label="root: directory\n(chunk boundaries)", fillcolor="#FBB4AE"];
+    c0 [label="chunk H(key)‖0", fillcolor="#B3CDE3"];
+    c1 [label="chunk H(key)‖1", fillcolor="#B3CDE3"];
+    c2 [label="chunk H(key)‖2", fillcolor="#B3CDE3"];
+    key2 -> root [label="hash"];
+    root -> c0 [label="derived key"];
+    root -> c1;
+    root -> c2;
+    note [shape=plaintext, style=solid, fontname="Helvetica", fontsize=10,
+          label="each chunk is an ordinary v1 block — no format break;\lwrites touch one chunk; a lost chunk reads as a miss\l"];
+    c1 -> note [style=invis];
+  }
+
+  // reading order: shipped on the left, reserved on the right
+  block -> key2 [style=invis];
+}
