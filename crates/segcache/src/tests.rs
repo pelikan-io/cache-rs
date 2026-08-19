@@ -840,13 +840,31 @@ fn cas_stale_token_rejected_after_segment_recycle() {
     assert!(cache.insert(b"coffee", b"cold", None, ttl).is_ok());
     let fresh = cache.get(b"coffee").unwrap().cas();
 
-    // Precondition: this really is the ABA scenario — same location bits.
-    // If free-queue ordering ever changes, fail loudly here rather than
-    // silently passing without exercising ABA.
+    // Precondition: this really is the ABA scenario — the same key landed at
+    // the same ADDRESS (segment id + offset) in the recycled segment. If
+    // free-queue ordering ever changes, fail loudly here rather than silently
+    // passing without exercising ABA.
+    let stale_loc = Location::from_raw(stale & CasToken::LOCATION_MASK);
+    let fresh_loc = Location::from_raw(fresh & CasToken::LOCATION_MASK);
     assert_eq!(
-        stale & CasToken::LOCATION_MASK,
-        fresh & CasToken::LOCATION_MASK,
-        "test precondition violated: item did not land at the same location"
+        unpack_location(stale_loc),
+        unpack_location(fresh_loc),
+        "test precondition violated: item did not land at the same address"
+    );
+    // The location bits themselves now differ, because a location carries the
+    // segment's incarnation tag (#50): recycling the segment advanced the
+    // generation, so the reused address packs to a different 44-bit value.
+    // That is a second, structural line of defence under the token's own
+    // generation field — the ABA the token was added for cannot even produce
+    // matching location bits any more.
+    assert_ne!(
+        stale_loc, fresh_loc,
+        "the incarnation tag must differentiate the two locations"
+    );
+    assert_ne!(
+        stale_loc.tag(),
+        fresh_loc.tag(),
+        "the differing bits must be the incarnation tag"
     );
     assert_ne!(stale, fresh, "generation must differentiate the tokens");
 

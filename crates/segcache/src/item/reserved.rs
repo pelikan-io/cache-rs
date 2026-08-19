@@ -14,16 +14,30 @@ use core::num::NonZeroU32;
 pub(crate) struct ReservedItem {
     item: RawItem,
     seg: NonZeroU32,
+    generation: u16,
     offset: usize,
     _pin: WriterPin,
 }
 
 impl ReservedItem {
     /// Create a `ReservedItem` from its parts, taking ownership of the writer pin.
-    pub fn new(item: RawItem, seg: NonZeroU32, offset: usize, pin: WriterPin) -> Self {
+    ///
+    /// `generation` is the reserving segment's generation, read while the
+    /// `WriterPin` was already held. It is captured here rather than re-read at
+    /// publish time only for economy: the pin holds the segment out of the
+    /// `-> Free` transitions that bump the generation, so the two reads are
+    /// equal by construction.
+    pub fn new(
+        item: RawItem,
+        seg: NonZeroU32,
+        generation: u16,
+        offset: usize,
+        pin: WriterPin,
+    ) -> Self {
         Self {
             item,
             seg,
+            generation,
             offset,
             _pin: pin,
         }
@@ -47,5 +61,11 @@ impl ReservedItem {
     /// Get the segment id
     pub fn seg(&self) -> NonZeroU32 {
         self.seg
+    }
+
+    /// Get the incarnation generation of the segment this space was reserved
+    /// in — the generation the item's location must be published under.
+    pub fn generation(&self) -> u16 {
+        self.generation
     }
 }

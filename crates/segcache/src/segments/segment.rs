@@ -182,7 +182,12 @@ impl<'a> Segment<'a> {
             }
 
             if !item.is_deleted() {
-                let loc = pack_location(self.id(), offset as u64);
+                // Reconstruction (see `pack_location`): this debug-only scan is
+                // meant for a quiescent cache, where the header's generation is
+                // the one every resident item was published under. Under
+                // concurrent recycling it would simply stop resolving items,
+                // which is the same direction the scan already tolerates.
+                let loc = pack_location(self.id(), self.generation(), offset as u64);
                 let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
                 if !deleted {
                     count += 1;
@@ -220,6 +225,13 @@ impl<'a> Segment<'a> {
     #[inline]
     pub fn id(&self) -> NonZeroU32 {
         self.header.id()
+    }
+
+    /// The current incarnation's generation. Locations published into this
+    /// segment carry its low 4 bits as their tag (see `pack_location`).
+    #[inline]
+    pub fn generation(&self) -> u16 {
+        self.header.generation()
     }
 
     #[inline]
@@ -378,7 +390,16 @@ impl<'a> Segment<'a> {
             let item_size = item.size();
             let write_offset = target.write_offset() as usize;
 
-            let old_loc = pack_location(self.id(), read_offset as u64);
+            // RECONSTRUCTION (see `pack_location`): this rebuilds the location
+            // the item was PUBLISHED under, to use as the expected value of the
+            // relink CAS below — it does not mint a new one. `self.generation()`
+            // is the publishing generation because this scan runs under the
+            // caller's `Sealed -> Draining` claim on `self`: the generation only
+            // advances on the transitions that end a used incarnation, and
+            // neither can run while the claim is held. If this tag were wrong
+            // the CAS would fail for every item and the merge would silently
+            // relocate nothing.
+            let old_loc = pack_location(self.id(), self.generation(), read_offset as u64);
             let deleted =
                 item.is_deleted() || hashtable.get_item_frequency(item.key(), old_loc).is_none();
             if deleted || write_offset + item_size >= target.data.len() {
@@ -389,7 +410,10 @@ impl<'a> Segment<'a> {
             let src = unsafe { self.data.as_ptr().add(read_offset) };
             let dst = unsafe { target.data.as_mut_ptr().add(write_offset) };
 
-            let new_loc = pack_location(target.id(), write_offset as u64);
+            // Fresh publish into the destination: its own current generation.
+            // The destination is `Relinking` and owned by this merge, so its
+            // generation is likewise fixed for the duration of the copy.
+            let new_loc = pack_location(target.id(), target.generation(), write_offset as u64);
             // NUMERIC RELOCATION GATE: in-place numeric writers
             // (`numeric_update`) mutate item bytes holding only a READER
             // pin plus the item's seqlock writer lock — and the drain
@@ -533,7 +557,8 @@ impl<'a> Segment<'a> {
                 continue;
             }
 
-            let loc = pack_location(self.id(), offset as u64);
+            // Reconstruction under this segment's drain claim (see `copy_into`).
+            let loc = pack_location(self.id(), self.generation(), offset as u64);
             // Fallback for items deleted before is_deleted was introduced.
             let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
             if deleted {
@@ -626,7 +651,9 @@ impl<'a> Segment<'a> {
             // racing reader's freq-bump CAS instead of abandoning the
             // entry (table.rs). Without that retry a spurious false here
             // would recycle the segment with the entry still published.
-            let loc = pack_location(self.id(), offset as u64);
+            // Reconstruction under this segment's `Draining` claim (asserted
+            // above), so `self.generation()` is the publishing generation.
+            let loc = pack_location(self.id(), self.generation(), offset as u64);
             let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
             if !deleted && hashtable.remove(item.key(), loc) {
                 trace!("evicting from hashtable");

@@ -409,7 +409,13 @@ impl Segcache {
             };
             let reserved = self.reserve_and_define(key, attempt_value, optional, ttl)?;
 
-            let new_location = pack_location(reserved.seg(), reserved.offset() as u64);
+            // Fresh publish: the generation of the incarnation we reserved in,
+            // captured under the reservation's WriterPin.
+            let new_location = pack_location(
+                reserved.seg(),
+                reserved.generation(),
+                reserved.offset() as u64,
+            );
             let (new_seg, new_offset) = (reserved.seg(), reserved.offset());
             let verifier = self.verifier();
 
@@ -735,7 +741,13 @@ impl Segcache {
         reserved: ReservedItem,
         expected_token: Option<u64>,
     ) -> Result<(), SegcacheError> {
-        let new_location = pack_location(reserved.seg(), reserved.offset() as u64);
+        // Fresh publish: the generation of the incarnation we reserved in,
+        // captured under the reservation's WriterPin.
+        let new_location = pack_location(
+            reserved.seg(),
+            reserved.generation(),
+            reserved.offset() as u64,
+        );
         // Capture the reservation's own location up front so the rollback paths
         // can reclaim it AFTER the pin is released (see the drop-before-remove_at
         // invariant below), without borrowing `reserved`.

@@ -3,8 +3,9 @@
 //! Ported from crucible's `cache/core/src/state.rs` with one deviation:
 //! chain pointers use cache-rs's 1-indexed `Option<NonZeroU32>` convention
 //! (0 = none) rather than crucible's `INVALID_SEGMENT_ID = 0xFF_FFFF`
-//! sentinel. Segment ids are asserted `< 2^24` at construction, so they
-//! always fit the 24-bit packed fields.
+//! sentinel. Segment ids are capped at `Location::MAX_SEGMENT_ID` (< 2^20)
+//! at construction — a `Location` addresses a segment in 20 bits — so they
+//! always fit the 24-bit packed fields here with room to spare.
 
 use core::num::NonZeroU32;
 

@@ -792,8 +792,11 @@ fn reservers_vs_evictor_disjoint() {
                         // op, item-4/7b) so it is a REAL item, not an orphan —
                         // an unpublished reserved item would break the merge's
                         // clear() accounting if its segment were ever merged.
-                        let location =
-                            crate::pack_location(reserved.seg(), reserved.offset() as u64);
+                        let location = crate::pack_location(
+                            reserved.seg(),
+                            reserved.generation(),
+                            reserved.offset() as u64,
+                        );
                         let verifier = segments.verifier();
                         let _ = hashtable.insert(item.key(), location, &verifier);
                     }
@@ -981,7 +984,11 @@ fn concurrent_reservers_vs_drain_same_bucket() {
                         // publish, so the segment only becomes drainable once
                         // the item is a real, resolvable entry (H2).
                         let location =
-                            crate::pack_location(reserved.seg(), reserved.offset() as u64);
+                            crate::pack_location(
+                                reserved.seg(),
+                                reserved.generation(),
+                                reserved.offset() as u64,
+                            );
                         let verifier = segments.verifier();
                         let _ = hashtable.insert(item.key(), location, &verifier);
                     }

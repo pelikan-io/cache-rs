@@ -22,14 +22,51 @@ use std::fmt;
 /// ```
 ///
 /// For segcache, the location encodes:
-/// - bits 43..20: segment id (24 bits)
+/// - bits 43..24: segment id (20 bits)
+/// - bits 23..20: incarnation tag (4 bits — the low bits of the segment
+///   header's `generation`)
 /// - bits 19..0: offset / 8 (20 bits, 8-byte aligned)
+///
+/// The incarnation tag is what makes a location identify an *incarnation* of
+/// a segment rather than just an address: a segment that is drained and
+/// recycled advances its generation, so every location published into the
+/// previous incarnation now carries a stale tag. Because the tag rides inside
+/// the 44 bits that sit in the packed hashtable slot word, every existing
+/// compare-exchange on a published entry validates it for free.
+///
+/// Locations are built ONLY by `crate::pack_location`, which takes the
+/// generation explicitly. There is deliberately no way to assemble one from
+/// `(id, tag, offset)` parts elsewhere; [`Location::new`]/[`Location::from_raw`]
+/// reinterpret a whole 44-bit word (as the hashtable does when it unpacks a
+/// slot), they do not compose fields.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Location(u64);
+
+/// Width of the segment-id field.
+pub(crate) const SEG_ID_BITS: u32 = 20;
+/// Width of the incarnation-tag field.
+pub(crate) const TAG_BITS: u32 = 4;
+/// Width of the offset field, which stores `byte_offset >> 3`.
+pub(crate) const OFFSET_BITS: u32 = 20;
+
+/// Bit position of the incarnation tag.
+pub(crate) const TAG_SHIFT: u32 = OFFSET_BITS;
+/// Bit position of the segment id.
+pub(crate) const SEG_ID_SHIFT: u32 = OFFSET_BITS + TAG_BITS;
+/// Mask for the incarnation tag, once shifted down.
+pub(crate) const TAG_MASK: u64 = (1 << TAG_BITS) - 1;
+/// Mask for the offset field.
+pub(crate) const OFFSET_MASK: u64 = (1 << OFFSET_BITS) - 1;
 
 impl Location {
     /// Maximum raw value (44 bits set).
     pub const MAX_RAW: u64 = 0xFFF_FFFF_FFFF;
+
+    /// Largest segment id a location can encode. Segment ids are 1-based, so
+    /// this is also the largest number of segments a heap may contain;
+    /// `Segments` construction refuses anything larger rather than silently
+    /// aliasing ids together.
+    pub(crate) const MAX_SEGMENT_ID: u32 = (1 << SEG_ID_BITS) - 1;
 
     /// Sentinel value indicating a ghost entry (recently evicted).
     /// All 44 location bits set to 1.
@@ -62,6 +99,18 @@ impl Location {
     #[inline(always)]
     pub fn is_ghost(&self) -> bool {
         *self == Self::GHOST
+    }
+
+    /// The 4-bit incarnation tag: the low bits of the segment header's
+    /// `generation` at the time the location was published.
+    ///
+    /// Validation compares this against the segment's *live* generation; a
+    /// mismatch means the location names an incarnation that has since been
+    /// drained and recycled, i.e. "this is no longer yours". It is not an
+    /// address component — use `crate::unpack_location` for addressing.
+    #[inline(always)]
+    pub fn tag(&self) -> u8 {
+        ((self.0 >> TAG_SHIFT) & TAG_MASK) as u8
     }
 }
 
@@ -107,6 +156,25 @@ mod tests {
         let loc = Location::from_raw(0xFFFF_FFFF_FFFF_FFFF);
         assert_eq!(loc.as_raw(), Location::MAX_RAW);
         assert!(loc.is_ghost());
+    }
+
+    /// Compose a raw 44-bit value field by field, so the test states the
+    /// layout independently of `pack_location`.
+    fn raw(seg_id: u64, tag: u64, offset_field: u64) -> u64 {
+        (seg_id << SEG_ID_SHIFT) | (tag << TAG_SHIFT) | offset_field
+    }
+
+    #[test]
+    fn test_tag_reads_the_middle_field() {
+        // Every tag value is readable, and none of them disturbs — or is
+        // disturbed by — the neighbouring id and offset fields.
+        for tag in 0..=0xF {
+            let loc = Location::new(raw(0xABCDE, tag, 0x12345));
+            assert_eq!(loc.tag() as u64, tag);
+            assert_eq!(loc.as_raw() >> SEG_ID_SHIFT, 0xABCDE);
+            assert_eq!(loc.as_raw() & OFFSET_MASK, 0x12345);
+        }
+        assert_eq!(Location::GHOST.tag(), 0xF);
     }
 
     #[test]

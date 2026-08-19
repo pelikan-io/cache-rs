@@ -103,10 +103,18 @@ impl Segments {
             builder.heap_size, segment_size, segments
         );
 
-        assert!(
-            segments < (1 << 24),
-            "heap size requires too many segments, reduce heap size or increase segment size"
-        );
+        // HARD failure, never a debug assert: segment ids are 1-based and a
+        // `Location` encodes one in 20 bits (the other 24 are the 4-bit
+        // incarnation tag and the 20-bit offset). A heap with more segments
+        // than that would truncate ids and silently ALIAS distinct segments
+        // onto one another — corruption that no later check would catch — so
+        // an oversized configuration must fail at construction.
+        if segments > Location::MAX_SEGMENT_ID as usize {
+            return Err(SegmentsError::TooManySegments {
+                segments,
+                limit: Location::MAX_SEGMENT_ID as usize,
+            });
+        }
 
         let evict_policy = builder.evict_policy;
 
@@ -116,7 +124,8 @@ impl Segments {
         let mut headers = Vec::with_capacity(0);
         headers.reserve_exact(segments);
         for idx in 0..segments {
-            // SAFETY: idx + 1 is always >= 1 and constrained to < 2^24.
+            // SAFETY: idx + 1 is always >= 1 and, by the capacity check above,
+            // at most `Location::MAX_SEGMENT_ID` (< 2^20).
             let header = SegmentHeader::new(unsafe { NonZeroU32::new_unchecked(idx as u32 + 1) });
             headers.push(header);
         }
@@ -416,9 +425,13 @@ impl Segments {
         // `offset + size <= segment_size`, so the granted region lies
         // inside this segment's slice of the data mmap.
         let ptr = unsafe { (self.data.as_ptr() as *mut u8).add(byte_offset) };
+        // Read the generation under the writer pin taken above: the pin blocks
+        // the `-> Free` transitions that bump it, so this is still the segment's
+        // generation when the caller publishes the location.
         AllocOutcome::Reserved(ReservedItem::new(
             RawItem::from_ptr(ptr),
             seg_id,
+            header.generation(),
             offset as usize,
             pin,
         ))
@@ -1898,7 +1911,13 @@ impl Segments {
             item.check_magic();
 
             let item_size = item.size();
-            let old_loc = pack_location(src.id(), offset as u64);
+            // RECONSTRUCTION (see `pack_location`): rebuilds the location the
+            // item was PUBLISHED under, for the relink CAS below. The caller
+            // claimed `src` for drain before this scan, so its generation
+            // cannot advance underneath us and `src.generation()` is the
+            // publishing generation. A wrong tag here would fail every relink
+            // CAS and silently turn promotion into a no-op.
+            let old_loc = pack_location(src.id(), src.generation(), offset as u64);
             if item.is_deleted() {
                 offset += item_size;
                 continue;
@@ -1914,7 +1933,9 @@ impl Segments {
             if freq > 0 {
                 let write_offset = dst.write_offset() as usize;
                 if write_offset + item_size < seg_size {
-                    let new_loc = pack_location(dst.id(), write_offset as u64);
+                    // Fresh publish into the promotion destination, which this
+                    // pass owns (`Relinking`), so its generation is fixed too.
+                    let new_loc = pack_location(dst.id(), dst.generation(), write_offset as u64);
                     // NUMERIC RELOCATION GATE (see `Segment::copy_into` for
                     // the full argument): hold the item's seqlock writer
                     // lock across the byte copy AND the relink CAS so an
@@ -2012,7 +2033,9 @@ impl Segments {
 
                 let item_size = item.size();
                 if !item.is_deleted() {
-                    let loc = pack_location(segment.id(), offset as u64);
+                    // Reconstruction: the caller holds this segment's drain
+                    // claim, so its generation is the publishing one.
+                    let loc = pack_location(segment.id(), segment.generation(), offset as u64);
                     let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
                     if !deleted {
                         let mut hasher = hashtable.hash_builder().build_hasher();
@@ -2880,5 +2903,70 @@ mod loom_tests {
             assert_eq!(spare_count.load(Ordering::Relaxed), wins);
             assert!(spare_count.load(Ordering::Relaxed) <= CAPACITY);
         });
+    }
+}
+
+/// A `Location` addresses a segment in 20 bits, so a heap may hold at most
+/// `Location::MAX_SEGMENT_ID` segments (ids are 1-based). Exceeding that would
+/// truncate ids and alias distinct segments onto each other, so construction
+/// refuses it outright rather than deferring to a debug assertion.
+#[cfg(all(test, not(feature = "loom")))]
+mod capacity_tests {
+    use super::*;
+
+    /// A small-but-legal segment size (comfortably above the item-header
+    /// minimum under every feature combination), so a heap of a given segment
+    /// COUNT costs as little memory as possible.
+    const TINY_SEGMENT: i32 = 24;
+
+    fn build_with_segments(count: usize) -> Result<Segments, SegmentsError> {
+        SegmentsBuilder::default()
+            .segment_size(TINY_SEGMENT)
+            .heap_size(TINY_SEGMENT as usize * count)
+            .build()
+    }
+
+    #[test]
+    fn rejects_more_segments_than_the_id_field_holds() {
+        let over = Location::MAX_SEGMENT_ID as usize + 1;
+        let Err(err) = build_with_segments(over) else {
+            panic!("oversized heap must fail to build");
+        };
+        assert!(
+            matches!(
+                err,
+                SegmentsError::TooManySegments { segments, limit }
+                    if segments == over && limit == Location::MAX_SEGMENT_ID as usize
+            ),
+            "unexpected error: {err}"
+        );
+        // The message names both the limit and the lever.
+        let msg = err.to_string();
+        assert!(msg.contains(&Location::MAX_SEGMENT_ID.to_string()), "{msg}");
+        assert!(msg.contains("segment_size"), "{msg}");
+    }
+
+    #[test]
+    fn accepts_a_heap_just_under_the_limit() {
+        // One below the limit still builds: the check is `>`, not `>=`, and a
+        // heap that fits must not be refused.
+        let segments = match build_with_segments(Location::MAX_SEGMENT_ID as usize - 1) {
+            Ok(s) => s,
+            Err(e) => panic!("must build: {e}"),
+        };
+        assert_eq!(segments.cap, Location::MAX_SEGMENT_ID - 1);
+    }
+
+    #[test]
+    fn accepts_a_heap_at_exactly_the_limit() {
+        let segments = match build_with_segments(Location::MAX_SEGMENT_ID as usize) {
+            Ok(s) => s,
+            Err(e) => panic!("must build: {e}"),
+        };
+        assert_eq!(segments.cap, Location::MAX_SEGMENT_ID);
+        // The largest id is exactly representable, tag and offset untouched.
+        let max_id = NonZeroU32::new(segments.cap).unwrap();
+        let loc = crate::pack_location(max_id, 0, 0);
+        assert_eq!(crate::unpack_location(loc), (Location::MAX_SEGMENT_ID, 0));
     }
 }

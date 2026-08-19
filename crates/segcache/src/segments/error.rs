@@ -23,6 +23,11 @@ pub enum SegmentsError {
         heap_size: usize,
         segment_size: usize,
     },
+    #[error(
+        "heap requires {segments} segments, more than the {limit} a location's 20-bit segment id \
+         can address; increase segment_size (or reduce heap_size)"
+    )]
+    TooManySegments { segments: usize, limit: usize },
     #[error("mmap allocation failed")]
     Mmap(#[from] std::io::Error),
 }
