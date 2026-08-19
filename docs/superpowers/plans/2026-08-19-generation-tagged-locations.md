@@ -98,9 +98,9 @@ Run both; (1) must FAIL on current code, (2) may already pass. Report the exact 
 
 ### Task 5: Benchmark A/B
 
-- [ ] **Step 1:** `cargo bench -p segcache --bench benchmark -- --save-baseline pre` on `upstream/main` (separate worktree), covering `get/1b/0b`, `set/1b/64b`, `set_fresh`, `hot_counter`.
+- [ ] **Step 1:** `cargo bench -p segcache --bench benchmark -- --save-baseline pre` on `upstream/main` (separate worktree), covering `get_hit/1b/0b`, `get_miss/1b/0b`, `set/1b/64b`, `set_fresh`, `hot_counter`. (#70 renamed the old `get/*` group to `get_miss/*` — it never inserts anything — and added `get_hit/*`. `get_hit` is the group that exercises the pin and the tag check, so it is the one that matters here; keep `get_miss` as a sentinel.)
 - [ ] **Step 2:** Same benches on the branch with `--baseline pre`.
-- [ ] **Step 3:** Report every number and criterion's verdict verbatim. The unpack gains a mask and compare on the read path; #60 showed a 1-2% regression can appear from a change that looks free. If `get` regresses meaningfully, say so plainly rather than explaining it away — a `#[cold]` split or a cheaper validation order may be needed.
+- [ ] **Step 3:** Report every number and criterion's verdict verbatim. The unpack gains a mask and compare on the read path; #60 showed a 1-2% regression can appear from a change that looks free. If `get_hit` regresses meaningfully, say so plainly rather than explaining it away — a `#[cold]` split or a cheaper validation order may be needed. (The `#[cold]` split is what the #68 reconciliation already chose: the tag is compared inside `acquire_item_at`'s pin, and the unpinned `resolve` that decides *which* retry arm a failed pin takes lives in `relookup_after_pin_failure`, off the hot path.)
 
 ---
 

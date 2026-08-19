@@ -127,6 +127,8 @@ A new `Segments::resolve(location) -> Option<(NonZeroU32, usize)>` compares the 
 
 No site treats a mismatch as an error to surface; a stale location always means "this is no longer yours", which every caller already has a path for.
 
+**Where `get_pinned`'s check sits (reconciled with #68).** The row above says *what* a mismatch means, not where it is tested, and the two are not the same question once #68's converging retry is in the loop. `acquire_item_at` already compares the tag under the reader guard, which is the only place the generation is frozen while it is read — so a stale incarnation fails the pin, and `get_pinned` needs no `resolve` of its own on the fast path. What it does need is to tell the two pin failures apart, because they take different arms: a transient not-readable state is retried *unboundedly* (a drain must be allowed to finish), while a stale tag must be retried under a bound or a permanently stale entry spins that arm forever. That triage — one unpinned `resolve` of the failed location — lives in `relookup_after_pin_failure`, which is `#[cold] #[inline(never)]`, so the miss-and-retry policy is honoured without putting a second generation load on the hit path. It shares `attempts`/`REVALIDATE_RETRIES` with the post-pin revalidation: both bound how many times one `get` re-attempts because the world moved under it, one pin apiece.
+
 ## 3. Scope
 
 **In:** the layout change, `pack_location`/`unpack_location`/`resolve`, the validation sites above, the build-time capacity assertion, and the documentation of the reconstruction precondition at the two rebuild sites.
