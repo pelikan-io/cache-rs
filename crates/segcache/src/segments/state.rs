@@ -44,32 +44,52 @@ use core::num::NonZeroU32;
 /// # State Transition Diagram (as used by this crate)
 ///
 /// ```text
-///        +--------------->  Free  <-------------------------------+
-///        |                   | try_reserve (generation bump)      |
-///        |                   v                                    |
-///  try_release           Reserved                                 |
-///        |                   | link into chain (prev set)         |
-///        +---------------  Linking                                |
-///                            | publish                            |
-///                            v                                    |
-///        +---------------> Live  (bucket tail: writable)          |
-///        |                   | sealed by the appender, in the     |
-///        |                   | same CAS that sets `next`          |
-///        |                   v                                    |
-///        | (copy dest:    Sealed  (readable, evictable)           |
-///        |  Linking ->        | begin drain (SeqCst)              |
-///        |  Relinking ->      v                                   |
-///        |  Sealed)       Draining ---- ref_count == 0 -----------+
-///        |                 |     ^  \                        (-> Free)
-///        +--- revert ------+     |   \ ref_count > 0
-///            (merge source        \   v
-///             found pinned)        AwaitingRelease
-///                                    | last reader guard drop
-///                                    +------------------> Free
+///                        Free
+///                         | try_reserve (no generation bump)
+///                         v
+///                      Reserved ---+
+///                         |        |
+///                         | link   | try_release (Reserved|Linking -> Free):
+///                         | into   | the ONLY release that does NOT bump the
+///                         | chain  | generation — nothing was ever published
+///                         v        | into this incarnation, so there is
+///                      Linking ----+ nothing for a new one to invalidate
+///                         |
+///                         | publish
+///                         v
+///                       Live  (bucket tail: writable)
+///                         | sealed by the appender, in the
+///                         | same CAS that sets `next`
+///     (copy dest:         v
+///      Linking ->       Sealed  (readable, evictable)
+///      Relinking ->       | begin drain (SeqCst)
+///      Sealed)            v
+///                      Draining --- ref_count == 0 ----------> Free
+///                         |                     try_release_drained
+///                         | ref_count > 0        (GENERATION BUMP)
+///                         v
+///                   AwaitingRelease --- last reader guard drop -> Free
+///                                       try_release_condemned
+///                                        (GENERATION BUMP)
 /// ```
+///
+/// The generation advances on exactly the two `-> Free` transitions that end
+/// a *used* incarnation — `try_release_drained` and `try_release_condemned`,
+/// the unpinned and reader-pinned halves of the same event. That is what
+/// invalidates every `Location` (via its incarnation tag) and every
+/// `CasToken` published into the incarnation just ended. `try_reserve` does
+/// NOT bump: a reservation begins an incarnation rather than ending one.
 ///
 /// Live -> Draining also exists for draining the bucket tail during
 /// `clear()`/`expire()`.
+///
+/// There is deliberately no `Draining -> Sealed` revert edge: a drain claim
+/// always ends the incarnation, and a segment whose items are still pinned by
+/// in-flight readers is condemned (`Draining -> AwaitingRelease`) rather than
+/// handed back to `Sealed`. (Earlier revisions of this diagram drew such a
+/// "revert (merge source found pinned)" arrow; no production path ever
+/// implemented it — the only `Draining -> Sealed` CAS in the tree is inside a
+/// loom model in `header.rs`.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum State {
