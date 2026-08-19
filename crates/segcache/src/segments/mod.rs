@@ -6,6 +6,8 @@ mod guard;
 mod header;
 mod remover_pin;
 mod segment;
+#[cfg(feature = "fault-injection")]
+pub use segment::fault as segment_fault;
 #[allow(clippy::module_inception)]
 mod segments;
 pub(crate) mod state;

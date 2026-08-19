@@ -1907,8 +1907,8 @@ impl Segments {
                             // `remove_item_at` above already decremented the
                             // global item gauges, while the destination's
                             // header bumps do not touch them. Re-add here,
-                            // mirroring `Segment::copy_into`'s batch
-                            // compensation.
+                            // per item, exactly as `Segment::copy_into`
+                            // does.
                             ITEM_CURRENT.increment();
                             ITEM_CURRENT_BYTES.add(item_size as _);
                         }

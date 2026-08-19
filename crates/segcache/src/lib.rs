@@ -65,6 +65,12 @@ pub use eviction::Policy;
 pub use hashtable::Location;
 pub use item::Item;
 pub use keyvalue::Value;
+// Hidden from rustdoc: docs.rs commonly builds `--all-features`, which would
+// otherwise publish this as documented API surface for a knob whose own docs
+// say never to enable it outside tests.
+#[cfg(feature = "fault-injection")]
+#[doc(hidden)]
+pub use segments::segment_fault as fault;
 
 // items from submodules which are imported for convenience to the crate level
 pub(crate) use crate::rand::*;

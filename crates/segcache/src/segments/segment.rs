@@ -9,6 +9,97 @@ use core::num::NonZeroU32;
 
 pub const SEG_MAGIC: u64 = 0xBADC0FFEEBADCAFE;
 
+/// Fault injection for `copy_into`'s relink CAS. Compiled only under
+/// `feature = "fault-injection"` — there is no trace of it in a normal build,
+/// and `debug` does NOT pull it in: `debug` is observational, this is not.
+///
+/// `copy_into` aborts an entire in-flight copy with `RelinkFailure` when its
+/// relink CAS loses the item it is relocating. Thanks to the remover Dekker
+/// pair, a pinned replace/delete can NOT republish an entry out of a
+/// `Draining` segment, so the only thing that can lose that CAS is an
+/// UNPINNED unlink landing in the few tens of nanoseconds between the
+/// per-item liveness gate and the CAS itself. That is not reachable by
+/// workload — a tuned storm of 46k relocations across merge drains and
+/// concurrent same-key writers/deleters produced zero — yet the path has
+/// real accounting to get right, since items relocated earlier in the same
+/// call have already moved. This knob makes it reachable for
+/// `tests/copy_into_relink_failure.rs`.
+#[cfg(feature = "fault-injection")]
+pub mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `Some(n)`: let the next `n` relink CASes run, then force the one
+        /// after them to behave as a lost CAS (and disarm). `None`: inactive.
+        static RELINKS_BEFORE_FAILURE: Cell<Option<u32>> = const { Cell::new(None) };
+        /// How many relinks the CALL that took the injected failure had
+        /// already completed. Reset at each `copy_into` entry, frozen when
+        /// the failure fires. Lets a test assert the abort actually stranded
+        /// relocated items rather than hitting a call's very first item.
+        static RELINKS_THIS_CALL: Cell<u32> = const { Cell::new(0) };
+        static RELINKS_BEFORE_FIRING: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// Arm this thread so that, after `after` further successful relink
+    /// CASes, the next one behaves as though it lost. One-shot.
+    pub fn fail_relink_after(after: u32) {
+        RELINKS_BEFORE_FIRING.with(|c| c.set(None));
+        RELINKS_BEFORE_FAILURE.with(|c| c.set(Some(after)));
+    }
+
+    /// Disarm this thread.
+    pub fn disarm() {
+        RELINKS_BEFORE_FAILURE.with(|c| c.set(None));
+    }
+
+    /// Whether this thread is still armed. A test can assert this is `false`
+    /// afterwards to prove the injected failure actually fired.
+    pub fn armed() -> bool {
+        RELINKS_BEFORE_FAILURE.with(|c| c.get().is_some())
+    }
+
+    /// How many items the aborting `copy_into` call had ALREADY relocated
+    /// when the injected failure fired, or `None` if it never fired. A test
+    /// asserting this is `> 0` proves the abort actually stranded
+    /// compensation — the whole point of the path under test — rather than
+    /// landing on a call's first item, where the bug would be invisible.
+    pub fn relinks_before_firing() -> Option<u32> {
+        RELINKS_BEFORE_FIRING.with(|c| c.get())
+    }
+
+    /// Called at each `copy_into` entry: the per-call relink tally is what
+    /// makes `relinks_before_firing` meaningful (the arming countdown itself
+    /// spans calls).
+    pub(crate) fn enter_copy_into() {
+        RELINKS_THIS_CALL.with(|c| c.set(0));
+    }
+
+    /// Record a relink that the current `copy_into` call completed.
+    pub(crate) fn note_relink() {
+        RELINKS_THIS_CALL.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Consume one relink attempt. Returns `true` when this attempt must be
+    /// treated as a lost CAS. Skipping the CAS is faithful to losing it:
+    /// either way the hashtable entry stays at the old location, the item
+    /// stays in the source, and the bytes already written to the
+    /// destination are orphaned (its write offset is not advanced).
+    pub(crate) fn take_forced_relink_failure() -> bool {
+        RELINKS_BEFORE_FAILURE.with(|c| match c.get() {
+            Some(0) => {
+                c.set(None);
+                RELINKS_BEFORE_FIRING.with(|f| f.set(Some(RELINKS_THIS_CALL.with(|n| n.get()))));
+                true
+            }
+            Some(n) => {
+                c.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
+    }
+}
+
 /// A view of a single segment, combining a shared header reference with
 /// a mutable data slice. The header is accessed via shared reference
 /// since all its fields are atomic.
@@ -253,17 +344,14 @@ impl<'a> Segment<'a> {
         target: &mut Segment,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
+        #[cfg(feature = "fault-injection")]
+        fault::enter_copy_into();
         let max_offset = self.max_item_offset();
         let mut read_offset = if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC)
         } else {
             0
         };
-
-        #[cfg(feature = "metrics")]
-        let mut items_copied = 0;
-        #[cfg(feature = "metrics")]
-        let mut bytes_copied = 0;
 
         while read_offset <= max_offset {
             let item = self.get_item_at(read_offset).unwrap();
@@ -328,7 +416,13 @@ impl<'a> Segment<'a> {
             if let Some(guard) = &vguard {
                 guard.stamp_relocated_copy(&RawItem::from_ptr(dst));
             }
-            if hashtable.cas_location(item.key(), old_loc, new_loc, true) {
+            #[cfg(feature = "fault-injection")]
+            let relinked = !fault::take_forced_relink_failure()
+                && hashtable.cas_location(item.key(), old_loc, new_loc, true);
+            #[cfg(not(feature = "fault-injection"))]
+            let relinked = hashtable.cas_location(item.key(), old_loc, new_loc, true);
+
+            if relinked {
                 // Unlock only AFTER the publish resolved: a numeric writer
                 // spinning on this lock re-validates its linkage inside the
                 // lock, and the acquire it wins synchronizes-with this drop's
@@ -339,11 +433,29 @@ impl<'a> Segment<'a> {
                 target.header.incr_live_bytes(item_size as i32);
                 target.set_write_offset(write_offset as i32 + item_size as i32);
 
+                #[cfg(feature = "fault-injection")]
+                fault::note_relink();
+
                 #[cfg(feature = "metrics")]
                 {
                     ITEM_RELINK.increment();
-                    items_copied += 1;
-                    bytes_copied += item_size;
+                    // A relocation MOVES an item, it does not kill one, so
+                    // it must be gauge-NEUTRAL: `remove_item_at` above
+                    // decremented the global item gauges, while the
+                    // destination's header bumps do not touch them.
+                    //
+                    // Compensate PER ITEM, in the same block that recorded
+                    // the relink, rather than batching a running total for
+                    // a tail block: the loop has an early
+                    // `Err(RelinkFailure)` return below, and a tail block
+                    // silently loses the compensation for every item
+                    // already relocated by that call. Per-item leaves no
+                    // pending state for an exit path to drop, and matches
+                    // `Segments::s3fifo_promote_from`. The cost is two
+                    // atomics on a path that already does four in
+                    // `remove_item_at`.
+                    ITEM_CURRENT.increment();
+                    ITEM_CURRENT_BYTES.add(item_size as _);
                 }
             } else {
                 drop(vguard);
@@ -351,12 +463,6 @@ impl<'a> Segment<'a> {
             }
 
             read_offset += item_size;
-        }
-
-        #[cfg(feature = "metrics")]
-        {
-            ITEM_CURRENT.add(items_copied);
-            ITEM_CURRENT_BYTES.add(bytes_copied as _);
         }
 
         Ok(())

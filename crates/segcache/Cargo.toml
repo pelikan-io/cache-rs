@@ -24,6 +24,15 @@ metrics = ["metriken"]
 # enables loom concurrency model checking for the hashtable
 loom = ["dep:loom"]
 
+# enables the test-only fault-injection knob (`segcache::fault`) that forces
+# `Segment::copy_into`'s relink CAS to lose, so its `RelinkFailure` abort path
+# can be exercised. Deliberately NOT default and NOT implied by `debug`:
+# `debug` is purely observational (`items()`, `check_integrity()`) and is
+# reasonable to enable in staging, whereas this knob CHANGES BEHAVIOUR. It
+# needs nothing else to compile; the test that uses it also wants `debug` for
+# `items()`, which its own invocation enables.
+fault-injection = []
+
 # metafeatures
 debug = ["integrity"]
 

@@ -56,6 +56,7 @@ D=4 cuckoo hashing with four independent ahash builders (deterministic seeds). E
 - `magic`: Enables 0xDECAFBAD corruption-detection bytes in item headers
 - `debug`: Enables `magic` + exposes `items()` count and `check_integrity()`
 - `metrics` (default): Exports counters/gauges via `metriken` crate with `metadata = { engine = "segcache" | "cuckoo" }`
+- `fault-injection` (segcache, test-only): Exposes `segcache::fault`, which forces `Segment::copy_into`'s relink CAS to lose so its otherwise-unreachable `RelinkFailure` abort path can be tested. Deliberately not default and **not** implied by `debug` — `debug` is observational, this changes behaviour. Never enable it outside tests.
 
 **Error types**: `thiserror`-derived enums (`SegcacheError`, `CuckooCacheError`).
 

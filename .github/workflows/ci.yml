@@ -42,6 +42,18 @@ jobs:
       - name: Test with debug feature
         run: cargo test -p segcache --features debug
 
+      # `tests/copy_into_relink_failure.rs` covers `Segment::copy_into`'s
+      # `RelinkFailure` abort path, which no workload can reach (the relink CAS
+      # can only lose to an unpinned unlink landing in a few tens of
+      # nanoseconds). It drives the abort with the `fault-injection` knob and
+      # needs `debug` for `items()`. Neither feature is default, so without
+      # this step that file compiles to an empty binary and the path goes
+      # untested. Scoped to the one binary: the rest of the suite is already
+      # covered by the steps above, and this still compiles the lib under the
+      # new feature combination, so the gating is validated either way.
+      - name: Test copy_into abort accounting (fault injection)
+        run: cargo test -p segcache --features fault-injection,debug --test copy_into_relink_failure
+
       - name: Test with loom
         run: cargo test -p segcache --features loom -- loom
 

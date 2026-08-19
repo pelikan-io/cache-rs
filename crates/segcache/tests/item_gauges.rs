@@ -55,6 +55,32 @@ fn counter(name: &str) -> u64 {
     panic!("metric {name} is not registered");
 }
 
+/// Drain every segment out of the hashtable, repeating until a pass frees
+/// nothing, so every segment that can recycle has recycled (and therefore
+/// run `reset_write_stats`).
+fn drain_fully(cache: &Segcache) {
+    for _ in 0..64 {
+        if cache.clear() == 0 {
+            break;
+        }
+    }
+    assert_eq!(cache.clear(), 0, "cache must be fully drained");
+}
+
+/// Cheap deterministic-per-thread spread for filler keys.
+fn filler_spread() -> usize {
+    use std::cell::Cell;
+    thread_local! { static S: Cell<usize> = const { Cell::new(0x9E37_79B9) }; }
+    S.with(|s| {
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        x & 0xFFFF
+    })
+}
+
 fn key(i: usize) -> String {
     format!("k{i:06}")
 }
@@ -168,19 +194,63 @@ fn item_gauges_return_to_zero_after_drain_storm() {
         });
     });
 
-    // Phase 5: quiesce. Drain every segment from the hashtable; repeat until
-    // a pass frees nothing, so every segment that can recycle has recycled
-    // (and run `reset_write_stats`).
-    for _ in 0..16 {
-        if cache.clear() == 0 {
-            break;
-        }
-    }
-    assert_eq!(cache.clear(), 0, "cache must be fully drained");
+    drain_fully(&cache);
     assert!(
         cache.get(key(0).as_bytes()).is_none(),
         "nothing may survive the drain"
     );
+
+    // Phase 5: a SECOND cache, on the Merge policy. Everything above runs on
+    // S3-FIFO, which relocates through `Segments::s3fifo_promote_from` and
+    // never touches the OTHER relocation site, `Segment::copy_into` — the
+    // one merge drains use. Same-key overwrite churn against continuous
+    // merge pressure exercises it (measured: ~3.5k `copy_into` calls
+    // relocating ~7.6k items). The gauges are process-global, so this
+    // cache's items land in the same totals asserted below.
+    //
+    // This covers `copy_into`'s SUCCESS path only. Its `RelinkFailure` abort
+    // is not reachable by workload — see `tests/copy_into_relink_failure.rs`,
+    // which drives it directly.
+    let merge_cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(segment_size as usize * TOTAL_SEGMENTS)
+        .hash_power(16)
+        .eviction(Policy::Merge {
+            max: 8,
+            merge: 4,
+            compact: 0,
+        })
+        .build()
+        .expect("failed to create merge cache");
+    let merge_cache = std::sync::Arc::new(merge_cache);
+    std::thread::scope(|scope| {
+        for t in 0..4 {
+            let cache = std::sync::Arc::clone(&merge_cache);
+            scope.spawn(move || {
+                for i in 0..8_000 {
+                    // A small shared key space across all threads: every
+                    // write is an overwrite of a key some other thread (or a
+                    // merge drain) may be relocating right now.
+                    let k = i % 64;
+                    let _ = cache.insert(key(k).as_bytes(), val(k + t).as_bytes(), None, ttl);
+                    let _ = cache.get(key(k).as_bytes());
+                }
+            });
+        }
+        for _ in 0..2 {
+            let cache = std::sync::Arc::clone(&merge_cache);
+            scope.spawn(move || {
+                for _ in 0..4_000 {
+                    // Fresh keys keep the pool under eviction pressure, so
+                    // merge drains run continuously against the writers.
+                    let k = 500_000 + filler_spread();
+                    let _ = cache.insert(key(k).as_bytes(), val(k).as_bytes(), None, ttl);
+                }
+            });
+        }
+    });
+
+    drain_fully(&merge_cache);
 
     // KNOWN GAP (theoretical, not observed here): a segment condemned while
     // still reader-pinned is freed by the last `SegmentGuard::drop`, which
