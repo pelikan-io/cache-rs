@@ -446,6 +446,127 @@ fn same_key_cas_vs_drain_completes() {
     assert_eq!(item.value(), Value::Bytes(b"Cfinal0"));
 }
 
+/// `cas` variant of bug 1 (false absence during merge drains): `cas` mints
+/// its token via `acquire_item_at(..).ok_or(NotFound)`, so a cas racing a
+/// merge drain of a LIVE key returns NOT_FOUND — memcached semantics say a
+/// live key can fail a cas only with EXISTS (or succeed). It must retry the
+/// lookup+pin through the transient drain window, exactly as `get_pinned`
+/// does. Here the drain resolves by the revert arc with the item untouched,
+/// so the caller's token is still exact and the cas must succeed.
+#[test]
+fn cas_retries_through_transient_drain_instead_of_false_not_found() {
+    let cache = Arc::new(small_merge_cache(8));
+    let ttl = Duration::from_secs(3600);
+    let (_location, seg_id) = insert_and_seal(&cache, b"target2", b"Vtarge2");
+    let token = {
+        let item = cache.get_no_freq_incr(b"target2").expect("live key");
+        item.cas()
+    };
+
+    // A merge drain claims the segment (Sealed -> Draining) and is "mid
+    // copy": the key is live and published, but its segment is unpinnable.
+    assert!(cache.segments_for_test().claim_for_drain_for_test(seg_id));
+
+    let (tx, rx) = mpsc::channel();
+    let caser = {
+        let cache = Arc::clone(&cache);
+        std::thread::spawn(move || {
+            let res = cache.cas(b"target2", b"Wtarge2", None, ttl, token);
+            let _ = tx.send(res);
+        })
+    };
+
+    // Give the cas time to hit the unpinnable segment. (Pre-fix it returned
+    // a false NOT_FOUND here instantly.)
+    std::thread::sleep(Duration::from_millis(50));
+
+    // The drain finishes without touching the item: revert Draining -> Sealed.
+    assert!(
+        cache.segments.header(seg_id).cas_metadata(
+            State::Draining,
+            State::Sealed,
+            None,
+            None,
+            crate::sync::Ordering::SeqCst,
+        ),
+        "test owns the claimed segment; revert must succeed"
+    );
+
+    let res = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("cas wedged after the segment recovered from the drain");
+    assert_ne!(
+        res,
+        Err(SegcacheError::NotFound),
+        "cas on a LIVE key returned NOT_FOUND during a merge drain window"
+    );
+    assert_eq!(
+        res,
+        Ok(()),
+        "token unchanged across the drain window; the cas must succeed"
+    );
+    let item = cache.get(b"target2").expect("key stays live");
+    assert_eq!(item.value(), Value::Bytes(b"Wtarge2"));
+    let _ = caser.join();
+}
+
+/// `try_into_numeric` variant of bug 1: same `acquire_item_at(..)
+/// .ok_or(NotFound)` pattern (a #51-acknowledged follow-up), same fix — a
+/// LIVE canonical-numeric key must convert, never report NOT_FOUND because
+/// its segment happened to be draining.
+#[test]
+fn try_into_numeric_retries_through_transient_drain() {
+    let cache = Arc::new(small_merge_cache(8));
+    let ttl = Duration::from_secs(3600);
+    let (_location, seg_id) = insert_and_seal(&cache, b"target3", b"5000000");
+
+    assert!(cache.segments_for_test().claim_for_drain_for_test(seg_id));
+
+    let (tx, rx) = mpsc::channel();
+    let converter = {
+        let cache = Arc::clone(&cache);
+        std::thread::spawn(move || {
+            let res = cache.try_into_numeric(b"target3", 0, ttl);
+            let _ = tx.send(res);
+        })
+    };
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    assert!(
+        cache.segments.header(seg_id).cas_metadata(
+            State::Draining,
+            State::Sealed,
+            None,
+            None,
+            crate::sync::Ordering::SeqCst,
+        ),
+        "test owns the claimed segment; revert must succeed"
+    );
+
+    let res = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("try_into_numeric wedged after the segment recovered from the drain");
+    assert_ne!(
+        res,
+        Err(SegcacheError::NotFound),
+        "try_into_numeric on a LIVE key returned NOT_FOUND during a merge drain window"
+    );
+    assert_eq!(
+        res,
+        Ok(()),
+        "conversion of a live canonical value must succeed"
+    );
+    let item = cache.get(b"target3").expect("key stays live");
+    assert_eq!(item.value(), Value::U64(5_000_000));
+    assert_eq!(
+        cache.wrapping_add(b"target3", 1),
+        Ok(5_000_001),
+        "converted key must accept numeric ops"
+    );
+    let _ = converter.join();
+}
+
 /// Stress: bugs 1 and 2 through REAL merge eviction churn (no test shims).
 /// A churn writer drives continuous merge eviction on a small heap; a reader
 /// hammers hot keys asserting no key ever REAPPEARS after a miss (a genuine

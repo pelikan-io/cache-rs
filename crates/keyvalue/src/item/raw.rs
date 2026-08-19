@@ -350,10 +350,12 @@ impl RawItem {
     /// version reported by [`NumericVersionGuard::version`] — the even
     /// value observed at lock time — cannot advance. This lets a caller
     /// atomically pair "the version is still V" with a publish action of
-    /// its own (e.g. a hashtable slot swap that supersedes this item):
-    /// any concurrent increment either completes before the lock (the
-    /// caller sees its bumped version) or starts after the guard drops
-    /// (and can then observe whatever the caller published).
+    /// its own (e.g. a hashtable slot swap that supersedes this item, or
+    /// a relocation that byte-copies the item and relinks its location —
+    /// see [`NumericVersionGuard::stamp_relocated_copy`]): any concurrent
+    /// increment either completes before the lock (the caller sees its
+    /// bumped version / final value) or starts after the guard drops (and
+    /// can then observe whatever the caller published).
     ///
     /// The guard resolves one of two ways: [`NumericVersionGuard::update`]
     /// applies a value update under the lock and unlocks at version + 2
@@ -571,6 +573,33 @@ impl NumericVersionGuard<'_> {
     #[inline]
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Stamp a relocated byte copy of this guard's item with the frozen
+    /// EVEN version.
+    ///
+    /// A raw byte copy of a numeric item taken while this guard is held
+    /// necessarily captures the source's version word in its LOCKED (odd)
+    /// state — the lock acquisition itself made it odd. Publishing that
+    /// copy as-is would create a permanently write-in-progress item that
+    /// wedges every seqlock reader and writer forever. The value and CRC
+    /// bytes in the copy ARE coherent (this guard excludes all in-place
+    /// writers), so storing the guard's observed even version makes the
+    /// copy exactly the value/version pair the guard froze.
+    ///
+    /// `copy` must be a byte copy of this guard's item (checked: it must
+    /// at least be numeric) that is not yet reachable by any other
+    /// thread; the store is `Relaxed` because the caller's subsequent
+    /// publish (e.g. a Release hashtable CAS) is what orders it for
+    /// readers of the new location.
+    pub fn stamp_relocated_copy(&self, copy: &RawItem) {
+        assert!(
+            copy.header().is_numeric(),
+            "stamp_relocated_copy requires a numeric item copy"
+        );
+        // SAFETY: is_numeric checked; a byte copy of an aligned numeric
+        // item placed at an 8-aligned start keeps the words aligned.
+        unsafe { copy.version_word() }.store(self.version, Ordering::Relaxed);
     }
 
     /// Apply `op` to the value under this lock, consuming the guard.

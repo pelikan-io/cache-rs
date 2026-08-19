@@ -276,6 +276,35 @@ impl<'a> Segment<'a> {
             let dst = unsafe { target.data.as_mut_ptr().add(write_offset) };
 
             let new_loc = pack_location(target.id(), write_offset as u64);
+            // NUMERIC RELOCATION GATE: in-place numeric writers
+            // (`numeric_update`) mutate item bytes holding only a READER
+            // pin plus the item's seqlock writer lock — and the drain
+            // claim behind this copy waits on writers/removers, NOT
+            // readers. Without this gate the raw copy below races the
+            // value/CRC stores (torn copy, formally a data race), can
+            // capture the version word in its transient ODD state and
+            // publish a permanently write-in-progress destination (every
+            // subsequent seqlock read/incr of the key spins forever), and
+            // can publish a pre-increment value AFTER the increment acked
+            // (a lost acked increment). Taking the item's version lock
+            // across the byte copy AND the relink CAS closes all three:
+            // an increment that locked first completes before we read
+            // (the copy carries its final value/CRC); one that arrives
+            // while we hold the lock spins, and its in-lock linkage
+            // re-validation then observes the published new location and
+            // retries against the destination — no lost ack. The copied
+            // version word is odd (our own lock), so the destination is
+            // stamped back to the guard's frozen even version before the
+            // publish. Deadlock-free: the version lock is a leaf — its
+            // holders (`numeric_update`, `replace_at`) do bounded
+            // lock-free work and never wait on chain locks, claims, or
+            // pins (and `replace_at` cannot even hold it on an item in
+            // this Draining source: it requires a remover pin the claim
+            // already waited out). Non-numeric items stay on the raw
+            // copy: they are immutable in place once published (the only
+            // header mutation, delete's `set_deleted`, runs under a
+            // remover pin, which the drain claim waited out).
+            let vguard = item.lock_numeric_version().ok();
             // Copy-then-publish: write the bytes into the destination BEFORE the
             // Release-CAS publishes the new location. The Release success ordering
             // on cas_location orders these writes ahead of the publish, so a
@@ -285,7 +314,15 @@ impl<'a> Segment<'a> {
             unsafe {
                 std::ptr::copy_nonoverlapping(src, dst, item_size);
             }
+            if let Some(guard) = &vguard {
+                guard.stamp_relocated_copy(&RawItem::from_ptr(dst));
+            }
             if hashtable.cas_location(item.key(), old_loc, new_loc, true) {
+                // Unlock only AFTER the publish resolved: a numeric writer
+                // spinning on this lock re-validates its linkage inside the
+                // lock, and the acquire it wins synchronizes-with this drop's
+                // Release store, making the new location visible to it.
+                drop(vguard);
                 self.remove_item_at(read_offset);
                 target.header.incr_live_items();
                 target.header.incr_live_bytes(item_size as i32);
@@ -298,6 +335,7 @@ impl<'a> Segment<'a> {
                     bytes_copied += item_size;
                 }
             } else {
+                drop(vguard);
                 return Err(SegmentsError::RelinkFailure);
             }
 

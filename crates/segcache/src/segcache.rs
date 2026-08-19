@@ -669,8 +669,11 @@ impl Segcache {
             //    (`lock_numeric_version`) and hold it across the re-verify
             //    AND the slot CAS. In-place numeric writers serialize
             //    their own check-linkage-then-write step on that same lock
-            //    (`numeric_update`), so the two critical sections cannot
-            //    interleave; whichever completes first decides:
+            //    (`numeric_update`), and merge/s3fifo relocation holds it
+            //    across its byte copy + relink (`copy_into`,
+            //    `s3fifo_promote_from`), so no two of these critical
+            //    sections can interleave; whichever completes first
+            //    decides:
             //      - increment first: its bumped version fails the compare
             //        below — `Exists`, the increment's ack survives (and a
             //        cas whose token was read after the increment
@@ -849,32 +852,68 @@ impl Segcache {
         ttl: std::time::Duration,
         cas: u64,
     ) -> Result<(), SegcacheError> {
-        // Look up the current item to check its CAS token
+        // Look up the current item to check its CAS token. The lookup+pin
+        // retries through transient drain windows, exactly like
+        // `get_pinned`: a reader-pin failure means a drain owns the
+        // segment, and under merge eviction a drain RETAINS live items
+        // (they are relocated and republished) — so failing here with
+        // `NotFound` would report a LIVE key missing (memcached: a live
+        // key can only fail a cas with EXISTS). Termination mirrors
+        // `get_pinned`'s argument: the owning drain either republishes the
+        // entry (the fresh lookup resolves it in a readable segment) or
+        // removes it (the lookup returns `None` and we exit `NotFound`,
+        // now truthfully).
         let verifier = self.verifier();
-        let (location, slot) = self
-            .hashtable
-            .lookup_slot(key, &verifier)
-            .ok_or(SegcacheError::NotFound)?;
-
-        let (seg_id, offset) = unpack_location(location);
-        let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
-
-        // Lazy expiry: memcached returns NOT_FOUND for a cas on an expired
-        // key, even before the segment is reclaimed. The header is read
-        // unpinned here, so this is a semantic filter, not a safety
-        // mechanism — if the segment races a recycle, the token/generation
-        // check below still protects correctness.
-        self.remaining_ttl(seg_id)?;
-
-        let current_cas = {
-            // Pin briefly to read the item's seqlock version (numeric
-            // items fold it into the token); drop the pin before the
-            // reservation below — pinned segments are unevictable.
-            let (raw, _guard) = self
-                .segments
-                .acquire_item_at(seg_id, offset)
+        let backoff = Backoff::new();
+        let mut attempts = 0;
+        let (location, slot, current_cas) = loop {
+            let (location, slot) = self
+                .hashtable
+                .lookup_slot(key, &verifier)
                 .ok_or(SegcacheError::NotFound)?;
-            Self::token_for(&raw, location, self.segments.generation(seg_id))
+
+            let (seg_id, offset) = unpack_location(location);
+            let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
+
+            // Lazy expiry: memcached returns NOT_FOUND for a cas on an expired
+            // key, even before the segment is reclaimed. The header is read
+            // unpinned here, so this is a semantic filter, not a safety
+            // mechanism — if the segment races a recycle, the token/generation
+            // check below still protects correctness.
+            self.remaining_ttl(seg_id)?;
+
+            // Pin briefly to read the item's seqlock version (numeric
+            // items fold it into the token); the pin drops before the
+            // reservation below — pinned segments are unevictable.
+            let Some((raw, guard)) = self.segments.acquire_item_at(seg_id, offset) else {
+                // Transient drain window — retry from the lookup (not
+                // counted against `attempts`, same as `get_pinned`).
+                backoff.snooze();
+                continue;
+            };
+            // Re-validate after pinning (see `get_pinned`): if the key no
+            // longer resolves to this exact location, the entry moved (or
+            // the segment recycled) between lookup and pin — the token we
+            // would mint from `raw` could be an aliased read. A bounded
+            // number of mismatches means the key is churning under us, and
+            // any relocation/replacement has already staled the caller's
+            // location-bearing token: fail `Exists` (never a false
+            // `NotFound` for a live key).
+            if self
+                .hashtable
+                .lookup_no_freq_update(key, &verifier)
+                .map(|(l, _)| l)
+                != Some(location)
+            {
+                drop(guard);
+                attempts += 1;
+                if attempts >= RESERVE_RETRIES {
+                    return Err(SegcacheError::Exists);
+                }
+                continue;
+            }
+            let token = Self::token_for(&raw, location, self.segments.generation(seg_id));
+            break (location, slot, token);
         };
         if current_cas != cas {
             return Err(SegcacheError::Exists);
@@ -1137,12 +1176,23 @@ impl Segcache {
     /// Looks up the key, checks its segment deadline (memcached lazily
     /// treats expired keys as missing — increments must not resurrect
     /// them), pins the segment, and performs the seqlocked in-place
-    /// update through the pinned item. The pin is the load-bearing
-    /// safety argument for mutating in place: eviction\'s byte-copy
-    /// paths (merge prune/copy_into) only proceed on segments
-    /// whose reader count is zero (the Sealed -> Draining CAS plus the
-    /// SeqCst recheck-and-revert from the drain protocol), so segment
-    /// memory cannot be moved or reused out from under the update.
+    /// update through the pinned item. Mutating in place under only a
+    /// reader pin is safe by two mechanisms working together:
+    ///
+    /// - the reader pin keeps the segment's MEMORY alive: a drained
+    ///   segment is recycled or condemned-and-released only once its
+    ///   reader count is observed zero, so the item bytes cannot be
+    ///   reused out from under the write. The pin does NOT stop a drain
+    ///   from claiming the segment or relocating the item — drains wait
+    ///   on writers/removers, not readers;
+    /// - the item's seqlock version lock serializes the write against
+    ///   every party that can supersede or MOVE the item: cas publishes
+    ///   re-verify their token under it (`replace_at`), and merge/s3fifo
+    ///   relocation holds it across its byte copy and relink CAS
+    ///   (`copy_into`, `s3fifo_promote_from`). Linkage is re-validated
+    ///   INSIDE the lock, so a write can never land on an item that was
+    ///   superseded or relocated first — the re-check observes the new
+    ///   location and retries against the live item before acking.
     ///
     /// Returns the value this call published.
     fn numeric_update(&self, key: &[u8], op: impl Fn(u64) -> u64) -> Result<u64, SegcacheError> {
@@ -1187,9 +1237,14 @@ impl Segcache {
                     // linkage INSIDE it, so the "still the published item"
                     // check and the value write are one atomic step with
                     // respect to every party that serializes on this lock —
-                    // in particular a cas publish, which re-verifies its
-                    // token and swaps the hashtable slot while holding it
-                    // (`replace_at`). Interleavings:
+                    // a cas publish, which re-verifies its token and swaps
+                    // the hashtable slot while holding it (`replace_at`),
+                    // and a merge/s3fifo relocation, which byte-copies the
+                    // item and relinks its location while holding it
+                    // (`copy_into`, `s3fifo_promote_from`; a relocation
+                    // that completed first is seen by the re-check below as
+                    // a new location, and we retry against the
+                    // destination). Interleavings:
                     //
                     //   - cas critical section completed first and
                     //     PUBLISHED: the re-check below sees the new
@@ -1246,23 +1301,49 @@ impl Segcache {
         initial: u64,
         ttl: std::time::Duration,
     ) -> Result<(), SegcacheError> {
+        // Lookup+pin retries through transient drain windows, exactly like
+        // `get_pinned`/`cas`: a reader-pin failure means a drain owns the
+        // segment, and a merge drain RETAINS live items — reporting
+        // `NotFound` here was a false miss on a live key (a
+        // #51-acknowledged follow-up, fixed alongside `cas`).
         let verifier = self.verifier();
-        let Some((location, slot)) = self.hashtable.lookup_slot(key, &verifier) else {
-            // Missing: create with the caller's ttl. NOTE for the
-            // concurrent future: this publishes via plain insert, which
-            // would overwrite a concurrently created value; revisit with
-            // insert-if-absent when the API goes concurrent.
-            return self.insert(key, initial, None, ttl);
-        };
+        let backoff = Backoff::new();
+        let mut attempts = 0;
+        let (location, slot, parsed, opt_buf, olen, seg_ttl) = loop {
+            let Some((location, slot)) = self.hashtable.lookup_slot(key, &verifier) else {
+                // Missing: create with the caller's ttl. NOTE for the
+                // concurrent future: this publishes via plain insert, which
+                // would overwrite a concurrently created value; revisit with
+                // insert-if-absent when the API goes concurrent.
+                return self.insert(key, initial, None, ttl);
+            };
 
-        let (seg_id, offset) = unpack_location(location);
-        let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
+            let (seg_id, offset) = unpack_location(location);
+            let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
 
-        let (parsed, opt_buf, olen, seg_ttl) = {
-            let (raw, _guard) = self
-                .segments
-                .acquire_item_at(seg_id, offset)
-                .ok_or(SegcacheError::NotFound)?;
+            let Some((raw, guard)) = self.segments.acquire_item_at(seg_id, offset) else {
+                // Transient drain window — retry from the lookup.
+                backoff.snooze();
+                continue;
+            };
+            // Re-validate after pinning (see `get_pinned`): a moved entry
+            // means `raw` may be an aliased read; retry, and after a
+            // bounded number of mismatches report the churn as `Exists`
+            // (the same outcome `replace_at` gives a concurrent
+            // replacement), never a false `NotFound`.
+            if self
+                .hashtable
+                .lookup_no_freq_update(key, &verifier)
+                .map(|(l, _)| l)
+                != Some(location)
+            {
+                drop(guard);
+                attempts += 1;
+                if attempts >= RESERVE_RETRIES {
+                    return Err(SegcacheError::Exists);
+                }
+                continue;
+            }
             let parsed = match raw.value() {
                 Value::U64(_) => return Ok(()),
                 Value::Bytes(b) => {
@@ -1275,7 +1356,7 @@ impl Segcache {
                 o.len()
             });
             let seg_ttl = self.remaining_ttl(seg_id)?;
-            (parsed, opt_buf, olen, seg_ttl)
+            break (location, slot, parsed, opt_buf, olen, seg_ttl);
         };
 
         let reserved =
