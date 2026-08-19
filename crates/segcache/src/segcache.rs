@@ -1292,6 +1292,9 @@ impl Segcache {
     ///   existing item (its absolute expiration is preserved) — the
     ///   caller's `ttl` is deliberately unused
     /// - any other value: `Err(NotNumeric)`, item untouched
+    /// - key churning under concurrent relocation/replacement: may fail
+    ///   safe with `Err(Exists)` after bounded retries — retryable, never
+    ///   a false `NotFound`
     ///
     /// Composes with [`Self::wrapping_add`]/[`Self::saturating_sub`] to
     /// implement memcached-style incr-with-initial at a protocol layer.

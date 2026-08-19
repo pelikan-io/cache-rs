@@ -1070,6 +1070,10 @@ impl MultiChoiceHashtable {
         let bucket = self.bucket(slot.bucket_index);
         let slot_index = slot.slot_index;
 
+        // NOTE: relocation calls this while holding an item's numeric
+        // version lock; the retry-through-freq-bumps loop below stays
+        // bounded because the 8-bit frequency counter saturates, keeping
+        // the version lock's critical section finite.
         loop {
             let packed = bucket.items[slot_index].load(Ordering::Acquire);
 
