@@ -41,7 +41,27 @@ costs nothing but a failed election, and under contended extension on one TTL bu
 
 Those cycles do not themselves create alias states — an election loser is never written into, so no location ever points into it at that generation — but they *consume tag space*, which is what a 4-bit tag cannot afford.
 
-**Fix: bump when a segment that was actually used becomes reusable** — in `recycle()` and on the condemned free path — and not in `try_release`. That is precisely the event that invalidates previously-published locations, which is the only event the tag needs to track. Reusing a never-written segment without a bump is sound because nothing can hold a location into it.
+**Fix: bump when a segment that was actually used becomes reusable**, and not when an unused one is handed back. That is precisely the event that invalidates previously-published locations, which is the only event the tag needs to track. Reusing a never-written segment without a bump is sound because nothing can hold a location into it.
+
+**Where the bump lives: the header state transition, not the queue helper.** Segments reach a queue from four sites today (a fifth arrives with #63), and they do *not* share a single funnel:
+
+| Site | Transition | Queue return | Bump? |
+|---|---|---|---|
+| `recycle` (`segments.rs:634-644`) | `Draining → Free` | `return_segment` | yes |
+| `condemn` race-fix (`segments.rs:954-956`) | `AwaitingRelease → Free` | `return_segment` | yes |
+| last reader's **guard drop** (`guard.rs:58-66`) | `AwaitingRelease → Free` | **pushes `free_queue` directly** | yes |
+| `release_unused` (`segments.rs:756`) | `Reserved\|Linking → Free` | `return_segment` | **no** |
+| #63's `ReleaseCondemned` arm | `AwaitingRelease → Free` | — | yes |
+
+Putting the bump in `return_segment` (with a separate non-bumping helper for the election loser) is tempting and covers three of the four — but the guard drop **cannot** use `return_segment`: it holds only a raw pointer to the free queue, not `&Segments`, and deliberately bypasses the spare-aware helper. That path is a condemned free that must bump, so a queue-level bump would leave exactly the hole the tag exists to close.
+
+The transitions, by contrast, are already header methods and every free path must perform one:
+
+- `try_release_condemned()` — `AwaitingRelease → Free`. **Bumps.** One line covers the guard drop, the condemn race-fix, and #63's arm, because all three already call it.
+- A new `try_release_drained()` — `Draining → Free`, replacing `recycle`'s inline `cas_metadata`. **Bumps.**
+- `try_release()` — `Reserved|Linking → Free`. **Does not bump**, and its different name and different source states make the exception visible at the call site rather than living in a comment.
+
+The distinction is then carried by which transition a path performs, which the state machine already forces it to get right, rather than by which queue helper it remembers to call.
 
 Verified against every production reader of `generation`, all of which keep their meaning:
 
