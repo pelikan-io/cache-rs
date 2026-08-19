@@ -142,10 +142,13 @@ than "must decode somehow."
 
 ![Byte-by-byte anatomy of the 27-byte hash golden block: 12-byte header, then four entries each made of a tag byte, optional data bytes, and a backlen byte; tail_off points at the last entry's first byte](diagrams/ziplist-block-anatomy.svg)
 
-The figure is generated from these exact bytes by
-`diagrams/ziplist_anatomy.py`, whose mini-decoder re-walks the block and
-aborts on any span/byte disagreement (regeneration command in the script
-header; snapshot pinned to the fixture as frozen at `a68fd2d`).
+The figure's committed source is `diagrams/ziplist-block-anatomy.dot`,
+emitted by `cargo run -p ziplist --example block_anatomy`: the example
+rebuilds this exact fixture through the crate's own ops, derives every
+cell and cluster by decoding with the crate's own primitives, and aborts
+on any disagreement (including a byte-identical re-encode check). The SVG
+is `dot -Tsvg` over that source; see `diagrams/README.md` for the
+regeneration commands.
 
 Building the same 2-field hash step by step, reproducing
 `tests/golden.rs::hash_golden_bytes` byte for byte:
