@@ -104,6 +104,45 @@ pub(crate) mod revalidation_fault {
     }
 }
 
+/// Test-only tally of how often [`Segcache::relookup_after_pin_failure`] has
+/// taken its **stale-incarnation** arm and charged the revalidation budget.
+///
+/// The arm's safety argument is that charging costs a real segment *recycle*,
+/// so exhausting `REVALIDATE_RETRIES` inside one lookup -> pin window would
+/// take ~16 full segment lifecycles. A test of that argument has to prove it
+/// entered the arm at all: a churn test that only republishes the key never
+/// invalidates an incarnation, so it never charges, and it would pass while
+/// asserting nothing. Counting here (rather than inferring from the fault
+/// hooks) is what makes that vacuity impossible to reach silently — if a
+/// future change stops routing stale locations through this arm, the count
+/// goes to zero and the test fails instead of quietly becoming a no-op.
+///
+/// Thread-local, like the fault hooks it is used with: the `get` under test
+/// runs on the thread that installed them.
+#[cfg(all(test, not(feature = "loom")))]
+pub(crate) mod stale_incarnation_charges {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CHARGES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// One budget attempt charged for a location whose incarnation is gone.
+    #[inline]
+    pub(crate) fn record() {
+        CHARGES.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Read the tally and reset it, so consecutive tests on one thread do not
+    /// inherit each other's counts.
+    // Used by `revalidation_tests`, which needs `fault-injection`; without
+    // that feature the only caller is cfg'd out.
+    #[allow(dead_code)]
+    pub(crate) fn take() -> usize {
+        CHARGES.with(|c| c.replace(0))
+    }
+}
+
 /// A pre-allocated key-value store with eager expiration. It uses a
 /// segment-structured design that stores data in fixed-size segments, grouping
 /// objects with nearby expiration time into the same segment, and lifting most
@@ -367,6 +406,12 @@ impl Segcache {
     /// #68 split the read path's budget out of it precisely because 3 is far too
     /// tight for a live key, and re-coupling this arm to it would re-introduce
     /// the false miss on the other face of the same window.
+    ///
+    /// Charging costs a real segment RECYCLE, so exhausting the budget here
+    /// needs ~16 full segment lifecycles inside one lookup -> pin window.
+    /// `revalidation_tests::budget_absorbs_recycled_incarnations_without_a_false_absent`
+    /// drives 15 of them deterministically and counts the charges, so that
+    /// argument is tested rather than merely stated.
     #[cold]
     #[inline(never)]
     fn relookup_after_pin_failure(
@@ -379,6 +424,8 @@ impl Segcache {
         attempts: &mut usize,
     ) -> Option<Location> {
         if self.segments.resolve(location).is_none() {
+            #[cfg(all(test, not(feature = "loom")))]
+            stale_incarnation_charges::record();
             *attempts += 1;
             if *attempts >= REVALIDATE_RETRIES {
                 return None;
