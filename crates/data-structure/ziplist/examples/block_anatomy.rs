@@ -230,7 +230,7 @@ fn render_svg(bytes: &[u8], hdr: &BlockHeader, spans: &[Span]) -> String {
     let hx = X0 + 8 * CW + CW / 2;
     let lx = X0 + spans.last().expect("nonempty").start * CW + CW / 2;
     let ya = Y0 + CH + 58;
-    let _ = write!(
+    let _ = writeln!(
         s,
         "<path d=\"M {hx} {y1} V {y2} H {lx} V {y3}\" fill=\"none\" stroke=\"{INK}\" \
          stroke-width=\"1.2\" stroke-dasharray=\"4 3\" marker-end=\"url(#arr)\"/>\
@@ -239,7 +239,7 @@ fn render_svg(bytes: &[u8], hdr: &BlockHeader, spans: &[Span]) -> String {
          entry's first byte: O(1) tail access</text>\
          <defs><marker id=\"arr\" viewBox=\"0 0 8 8\" refX=\"7\" refY=\"4\" markerWidth=\"7\" \
          markerHeight=\"7\" orient=\"auto\"><path d=\"M0 0 L8 4 L0 8 z\" fill=\"{INK}\"/></marker>\
-         </defs></svg>\n",
+         </defs></svg>",
         y1 = Y0 + CH + 24,
         y2 = ya + 26,
         y3 = yb + 30,
