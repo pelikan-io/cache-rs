@@ -2370,7 +2370,6 @@ mod spare_tests {
     // pin precisely in the gap between them. No scheduler involved.
     #[test]
     fn condemned_segment_is_freed_under_a_live_reader_pin() {
-        use crate::sync::Ordering;
         use crate::Segcache;
         use core::num::NonZeroU32;
         use std::time::Duration;
@@ -2428,10 +2427,7 @@ mod spare_tests {
             ClearOutcome::Deferred,
             "a pinned segment must be condemned, not recycled"
         );
-        assert_eq!(
-            cache.segments.header(head).state(),
-            State::AwaitingRelease
-        );
+        assert_eq!(cache.segments.header(head).state(), State::AwaitingRelease);
         // The hashtable is fully drained: no NEW lookup can route here.
         assert!(cache.get(b"k000000").is_none());
 
@@ -2492,6 +2488,130 @@ mod spare_tests {
             "the next incarnation must not inherit a phantom reader count"
         );
         drop(pinned);
+    }
+
+    // ISSUE #64, DEFECT 3 — deterministic reproduction.
+    //
+    // `try_acquire_reader` increments `ref_count` BEFORE it knows the
+    // segment is still readable. A drain that runs inside that window sees
+    // the transient pin, so `finalize_drained` condemns the segment and
+    // defers reclamation to "the last reader" — but the only reader is the
+    // acquire itself, which is about to back its pin out. A backout that
+    // performs no handoff leaves the segment in `AwaitingRelease` with
+    // nobody left to free it, and nothing anywhere sweeps that state: the
+    // strand is permanent, costing a segment per occurrence.
+    //
+    // Driven through the acquire's interposition hook rather than by
+    // threads, so the drain lands exactly in the increment/re-check window
+    // with no scheduler involved. The call under test is the production
+    // `acquire_item_at`, so the free-queue return on the winning backout is
+    // covered too, not just the state transition.
+    #[test]
+    fn acquire_backout_must_not_strand_a_condemned_segment() {
+        use crate::segments::header::acquire_hook;
+        use crate::Segcache;
+        use core::num::NonZeroU32;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        const ITEMS_PER_SEGMENT: usize = 4;
+        const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
+        let value: &[u8] = b"x";
+        let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(value), 0);
+        let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+        let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+        let total_segments = 5usize;
+
+        // `Rc` only so the hook closure can own a handle to the cache; the
+        // whole test runs on one thread.
+        let cache = Rc::new(
+            Segcache::builder()
+                .segment_size(segment_size)
+                .heap_size(segment_size as usize * total_segments)
+                .hash_power(16)
+                .eviction(Policy::Merge {
+                    max: 8,
+                    merge: 4,
+                    compact: 0,
+                })
+                .build()
+                .expect("failed to create cache"),
+        );
+
+        let ttl = Duration::from_secs(3600);
+        for i in 0..10 {
+            let key = format!("k{i:06}");
+            assert_eq!(key.len(), KEY_LEN);
+            cache
+                .insert(key.as_bytes(), value, None, ttl)
+                .expect("fill inserts must succeed");
+        }
+
+        // Segment 1 is the held-back merge spare; segment 2 is the chain
+        // head and holds the first key.
+        let head = NonZeroU32::new(2).unwrap();
+        assert_eq!(cache.segments.header(head).state(), State::Sealed);
+        assert_eq!(
+            cache.segments.header(head).ref_count(),
+            0,
+            "precondition: no real reader pins the head"
+        );
+        let free_before = cache.segments.free();
+
+        // Phase 0: the acquire has taken its transient pin and has not yet
+        //   re-checked. A drain claims the segment here, so the re-check
+        //   will see `Draining` and the acquire will back out.
+        // Phase 1: the acquire is parked between that failed re-check and
+        //   its backout. The drain finishes: it observes the transient pin
+        //   and condemns, deferring reclamation to "the last reader".
+        let hooked = Rc::clone(&cache);
+        let hook = acquire_hook::install(Box::new(move |phase| match phase {
+            0 => {
+                assert!(
+                    hooked.segments.claim_for_drain_for_test(head),
+                    "the drain must win the Sealed -> Draining claim"
+                );
+            }
+            _ => {
+                assert_eq!(
+                    hooked
+                        .segments
+                        .finalize_drained_for_test(head, &hooked.hashtable),
+                    ClearOutcome::Deferred,
+                    "the drain observes the transient pin and condemns"
+                );
+                assert_eq!(
+                    hooked.segments.header(head).state(),
+                    State::AwaitingRelease,
+                    "the drain handed reclamation to the last reader"
+                );
+            }
+        }));
+
+        let acquired = cache.segments.acquire_item_at(head, magic_overhead);
+        drop(hook);
+
+        assert!(
+            acquired.is_none(),
+            "the acquire must fail on a segment claimed out from under it"
+        );
+        assert_eq!(
+            cache.segments.header(head).ref_count(),
+            0,
+            "the backout must leave no pin behind"
+        );
+        assert_eq!(
+            cache.segments.header(head).state(),
+            State::Free,
+            "the backout removed the LAST pin on a condemned segment, so it \
+             owes the AwaitingRelease -> Free handoff; nothing else will ever \
+             do it and nothing sweeps AwaitingRelease"
+        );
+        assert_eq!(
+            cache.segments.free(),
+            free_before + 1,
+            "the segment must return to the pool, not be stranded"
+        );
     }
 }
 
