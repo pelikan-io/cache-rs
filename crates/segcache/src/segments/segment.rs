@@ -228,7 +228,7 @@ impl<'a> Segment<'a> {
     }
 
     /// The current incarnation's generation. Locations published into this
-    /// segment carry its low 4 bits as their tag (see `pack_location`).
+    /// segment carry its low 6 bits as their tag (see `pack_location`).
     #[inline]
     pub fn generation(&self) -> u16 {
         self.header.generation()

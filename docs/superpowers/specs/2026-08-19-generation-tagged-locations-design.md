@@ -20,12 +20,14 @@ A `Location` is `(segment id, offset)` and carries no incarnation identity. A se
 
 ```
 current:  [ 24-bit segment id ][ 20-bit offset>>3 ]
-proposed: [ 20-bit segment id ][ 4-bit tag ][ 20-bit offset>>3 ]
+proposed: [ 18-bit segment id ][ 6-bit tag ][ 20-bit offset>>3 ]
 ```
 
-The tag is the low 4 bits of the segment header's existing `generation`, which increments on every reserve from the free queue.
+The tag is the low 6 bits of the segment header's existing `generation`, which increments on every reserve from the free queue.
 
-**Capacity:** 1,048,575 segments (from 16,777,215). At 1 MiB segments that is 1 TiB of heap; at the 8 MiB maximum, 8 TiB. Both are far above any current deployment, and `segment_size` remains the lever if more is needed. Construction asserts the configured segment count fits, so an oversized heap fails loudly at build time rather than silently aliasing.
+**Capacity: 262,142 segments** (from 16,777,215). The 18-bit field addresses 262,143 ids, and the top one is deliberately never issued — kept unissuable so that `Location::GHOST` (all 44 bits set) is unreachable *by construction* rather than merely implausible — so the limit a heap can actually reach is one below the field's capacity. At 1 MiB segments that is 256 GiB of heap; at the 8 MiB maximum, 2 TiB. Both are above any current deployment, and `segment_size` remains the lever if more is needed. Construction refuses an oversized heap outright, so it fails loudly at build time rather than silently aliasing ids.
+
+> An earlier revision of this section quoted 1,048,575 for a 20-bit id field. That figure was wrong even then: it was the field's capacity, not the issuable limit, which the reserved top id put at 1,048,574. The distinction is restated above because it is the thing the reservation buys.
 
 ### Prerequisite: move the generation bump to reuse-of-a-used-segment
 
@@ -39,7 +41,7 @@ Free → Reserved (generation++) → try_release → Free → Reserved (generati
 
 costs nothing but a failed election, and under contended extension on one TTL bucket with a short free queue a specific id can round-trip in microseconds. The counter therefore advances at a rate **decoupled from segment lifecycles**.
 
-Those cycles do not themselves create alias states — an election loser is never written into, so no location ever points into it at that generation — but they *consume tag space*, which is what a 4-bit tag cannot afford.
+Those cycles do not themselves create alias states — an election loser is never written into, so no location ever points into it at that generation — but they *consume tag space* at a rate no practical tag width can afford, because the rate is set by contention rather than by anything a location's lifetime is measured against.
 
 **Fix: bump when a segment that was actually used becomes reusable**, and not when an unused one is handed back. That is precisely the event that invalidates previously-published locations, which is the only event the tag needs to track. Reusing a never-written segment without a bump is sound because nothing can hold a location into it.
 
@@ -77,9 +79,21 @@ Verified against every production reader of `generation`, all of which keep thei
 
 An election-loser round trip is invisible to all three, because none of them can observe a segment that was never published into.
 
-**Why 4 bits is then sufficient, and why the argument does not depend on deployment churn:** with the bump tied to reuse-of-a-used-segment, the tag's unit really is a *full segment lifecycle* — fill, seal, drain, recycle. Aliasing needs **16 complete lifecycles of one specific segment inside a single thread's stall window** — on the order of 16 MiB of writes targeted at that segment while one thread is descheduled — *on top of* the coincidences already required (same offset, same slot, matching tag bits in the packed word). Widening to 8 bits buys another factor of 16 against a term that is already the least likely in the product, at the cost of 16× the segment count.
+### Why 6 bits, stated honestly
 
-This ordering matters for review: the bump change is a **prerequisite**, not an optimization. Landing the tag without it ships a 4-bit counter advancing on failed elections, which is the "looks right, only shrinks the window" outcome this project has repeatedly rejected.
+With the bump tied to reuse-of-a-used-segment, the tag's unit is one *incarnation* of a segment id, and 6 bits distinguishes 64 of them. Aliasing — a stale location passing validation — requires the generation of **one specific segment id to advance by an exact multiple of 64 while a single thread is stalled** between reading that location and acting on it.
+
+That is the entire claim. Three things it deliberately does **not** rest on, each of which an earlier revision of this document got wrong:
+
+- **A lifecycle is not a segment's worth of writes.** An incarnation does not have to be *filled* to end. `drain_chain` drains the Live tail directly, so `clear()` and `expire()` retire a segment holding a single item; and a `Sealed` segment is freed as soon as `live_items()` reaches zero, which deletes alone can cause. A workload of inserts and deletes against a short TTL can cycle one id far faster than "fill 1 MiB, seal, drain, recycle" suggests. The old costing of 16 lifecycles as ~16 MiB of targeted writes was simply not true, and the width is not justified by it.
+- **"Same offset" is not an independent coincidence.** Segments are append-only from a fixed start offset, so under uniform item sizes the n-th item of every incarnation lands at *exactly* the same offset. For such a workload matching offsets are the common case, not a lucky one. The offset term contributes no meaningful factor and must not be multiplied into the estimate.
+- **The tag is sometimes the only remaining check.** At `get_pinned` and `acquire_item_at` a mismatch is one defence among several (the key verify, the packed-word CAS). But `remove_at` and `rollback_reservation` unlink *without* a remover pin and have no surviving slot-word term, so there the tag alone stands between a stale location and a decrement charged to the wrong incarnation. The width therefore has to stand on its own, not as the least likely factor in a product.
+
+What survives is the residual as stated: **one thread stalled across 64 complete lifecycles of one specific segment id.** 64 is chosen as the point where that stall is long by any scheduler's standard even under a recycle-happy workload, while the price — one bit of tag halves the addressable segment count — is still comfortable at 262,142 segments (256 GiB at 1 MiB segments).
+
+The residual is real and bounded, not zero, and is not claimed to be zero. It shrinks by 2× per bit and grows with the recycling rate of a single id. If a workload is ever found that cycles one id 64 times inside a stall window, the answer is a wider tag at proportionally fewer segments, or an incarnation counter carried outside the 44 bits — not a re-derivation of why the current width was fine all along.
+
+This ordering matters for review: the bump change is a **prerequisite**, not an optimization. Landing the tag without it ships a tag counter advancing on failed elections, which is the "looks right, only shrinks the window" outcome this project has repeatedly rejected.
 
 ### The mechanism is mostly free, because the tag rides inside the packed slot word
 

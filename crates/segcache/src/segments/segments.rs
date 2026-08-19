@@ -104,7 +104,7 @@ impl Segments {
         );
 
         // HARD failure, never a debug assert: segment ids are 1-based and a
-        // `Location` encodes one in 20 bits (the other 24 are the 4-bit
+        // `Location` encodes one in 18 bits (the other 26 are the 6-bit
         // incarnation tag and the 20-bit offset). A heap with more segments
         // than that would truncate ids and silently ALIAS distinct segments
         // onto one another — corruption that no later check would catch — so
@@ -113,8 +113,8 @@ impl Segments {
         // The limit is `MAX_SEGMENTS`, one BELOW the id field's maximum: the
         // top id is reserved so that no real location can equal
         // `Location::GHOST` (all 44 bits set), whose id field is exactly that
-        // value. Reserving one id of a million is cheaper than reasoning about
-        // when "max id + tag 15 + last offset" is reachable.
+        // value. Reserving one id of 262,143 is cheaper than reasoning about
+        // when "max id + tag 63 + last offset" is reachable.
         if segments > Location::MAX_SEGMENTS as usize {
             return Err(SegmentsError::TooManySegments {
                 segments,
@@ -131,7 +131,7 @@ impl Segments {
         headers.reserve_exact(segments);
         for idx in 0..segments {
             // SAFETY: idx + 1 is always >= 1 and, by the capacity check above,
-            // at most `Location::MAX_SEGMENT_ID` (< 2^20).
+            // at most `Location::MAX_SEGMENT_ID` (< 2^18).
             let header = SegmentHeader::new(unsafe { NonZeroU32::new_unchecked(idx as u32 + 1) });
             headers.push(header);
         }
@@ -314,7 +314,7 @@ impl Segments {
     /// Resolve a published `Location` to the `(segment id, byte offset)` it
     /// addresses, but ONLY if it still names the incarnation that published it.
     ///
-    /// The location's 4-bit tag is compared against the segment's live
+    /// The location's 6-bit tag is compared against the segment's live
     /// `generation`; the generation advances exactly once per used-segment
     /// lifecycle (`Draining -> Free`, `AwaitingRelease -> Free`), so a mismatch
     /// means the addressed bytes were reclaimed and handed to someone else.
@@ -3010,7 +3010,7 @@ mod loom_tests {
     }
 }
 
-/// A `Location` addresses a segment in 20 bits, so a heap may hold at most
+/// A `Location` addresses a segment in 18 bits, so a heap may hold at most
 /// `Location::MAX_SEGMENTS` segments (ids are 1-based). Exceeding that would
 /// truncate ids and alias distinct segments onto each other, so construction
 /// refuses it outright rather than deferring to a debug assertion.
@@ -3034,6 +3034,23 @@ mod capacity_tests {
             .segment_size(TINY_SEGMENT)
             .heap_size(TINY_SEGMENT as usize * count)
             .build()
+    }
+
+    /// The user-visible number, stated once in absolute terms. The tests
+    /// around it are all written against `MAX_SEGMENTS`, so without this they
+    /// would follow a botched width change silently instead of failing.
+    #[test]
+    fn the_capacity_limit_is_the_documented_number() {
+        assert_eq!(
+            Location::MAX_SEGMENT_ID,
+            262_143,
+            "2^18 - 1 addressable ids"
+        );
+        assert_eq!(
+            Location::MAX_SEGMENTS,
+            262_142,
+            "one fewer than the field holds: the top id is reserved for GHOST"
+        );
     }
 
     #[test]
@@ -3101,7 +3118,7 @@ mod capacity_tests {
 
     /// The ghost corner, closed by construction: on the LARGEST heap that can
     /// be built, the most extreme location any item in it could publish — top
-    /// id, tag 15, last encodable offset — is still not the sentinel. There is
+    /// id, tag 63, last encodable offset — is still not the sentinel. There is
     /// no configuration left in which a real location aliases `GHOST`.
     #[test]
     fn largest_buildable_heap_cannot_alias_the_ghost_sentinel() {
@@ -3111,7 +3128,8 @@ mod capacity_tests {
         };
         let max_id = NonZeroU32::new(segments.cap).unwrap();
         let max_offset = crate::hashtable::location::OFFSET_MASK << 3;
-        let loc = crate::pack_location(max_id, 0xF, max_offset);
+        let max_tag = crate::hashtable::location::TAG_MASK as u16;
+        let loc = crate::pack_location(max_id, max_tag, max_offset);
         assert!(
             !loc.is_ghost(),
             "the extreme location of the largest buildable heap aliased GHOST: {loc:?}"

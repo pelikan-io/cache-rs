@@ -25,7 +25,7 @@ pub enum SegmentsError {
     },
     #[error(
         "heap requires {segments} segments, more than the {limit} a location can address (the \
-         20-bit segment id holds one more, reserved so no location aliases the ghost sentinel); \
+         18-bit segment id holds one more, reserved so no location aliases the ghost sentinel); \
          increase segment_size (or reduce heap_size)"
     )]
     TooManySegments { segments: usize, limit: usize },

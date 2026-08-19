@@ -4,7 +4,7 @@
 
 **Goal:** Give `Location` incarnation identity so a stale location cannot silently resolve to a different item at the same address.
 
-**Architecture:** A 4-bit tag carved out of the 44-bit location's segment-id field, sourced from the segment header's `generation`. Because the tag rides inside the packed hashtable slot word, every existing compare-exchange on a published entry validates it for free. Requires first moving the generation bump from `try_reserve` to the state transitions that end a *used* incarnation. Full reasoning: `docs/superpowers/specs/2026-08-19-generation-tagged-locations-design.md` — **read it before starting**; it is the contract, and its five-site table and reconstruction constraint are load-bearing.
+**Architecture:** A 6-bit tag carved out of the 44-bit location's segment-id field, sourced from the segment header's `generation`. Because the tag rides inside the packed hashtable slot word, every existing compare-exchange on a published entry validates it for free. Requires first moving the generation bump from `try_reserve` to the state transitions that end a *used* incarnation. Full reasoning: `docs/superpowers/specs/2026-08-19-generation-tagged-locations-design.md` — **read it before starting**; it is the contract, and its five-site table and reconstruction constraint are load-bearing.
 
 **Tech Stack:** Rust; `crate::sync` atomics; loom; criterion.
 
@@ -66,13 +66,13 @@ Run both; (1) must FAIL on current code, (2) may already pass. Report the exact 
 
 **Files:** `crates/segcache/src/hashtable/mod.rs`, `location.rs`, plus every `pack_location` call site
 
-- [ ] **Step 1: Repartition.** `Location` becomes `seg_id(20) | tag(4) | offset>>3 (20)`. Keep `Location` opaque: add `fn tag(&self) -> u8`; `unpack_location` keeps returning `(seg_id, offset)`; **do not** add a way to rebuild a `Location` from parts other than `pack_location`.
+- [ ] **Step 1: Repartition.** `Location` becomes `seg_id(18) | tag(6) | offset>>3 (20)`. Keep `Location` opaque: add `fn tag(&self) -> u8`; `unpack_location` keeps returning `(seg_id, offset)`; **do not** add a way to rebuild a `Location` from parts other than `pack_location`.
 
-- [ ] **Step 2: `pack_location(seg_id, generation, offset)`** — generation passed explicitly, masked to 4 bits internally. Doc-comment the reconstruction precondition: callers that rebuild a *published* location (`Segment::copy_into`, `Segments::s3fifo_promote_from`) must pass the generation of the incarnation that published it, which is sound there only because the drain owns the segment so its generation cannot advance underneath them.
+- [ ] **Step 2: `pack_location(seg_id, generation, offset)`** — generation passed explicitly, masked to 6 bits internally. Doc-comment the reconstruction precondition: callers that rebuild a *published* location (`Segment::copy_into`, `Segments::s3fifo_promote_from`) must pass the generation of the incarnation that published it, which is sound there only because the drain owns the segment so its generation cannot advance underneath them.
 
 - [ ] **Step 3: Update all 5 production `pack_location` call sites** (`segcache.rs` ×2, `segments.rs` ×3 — grep to confirm the current set) to pass the correct generation. For the two reconstruction sites, read the generation from the segment they already hold.
 
-- [ ] **Step 4: Capacity assertion.** At `Segments` construction, assert the configured segment count fits in 20 bits, with an error naming the limit and pointing at `segment_size` as the lever. This must be a real error or panic at build time, not a debug assert — a silently oversized heap aliases.
+- [ ] **Step 4: Capacity assertion.** At `Segments` construction, assert the configured segment count fits in 18 bits (one below the field's capacity, the top id being reserved for the ghost sentinel), with an error naming the limit and pointing at `segment_size` as the lever. This must be a real error or panic at build time, not a debug assert — a silently oversized heap aliases.
 
 - [ ] **Step 5: Bit-layout unit tests** — round-trip across id/tag/offset boundaries including maximum values; `Location::GHOST` still distinguishable from every real location; the capacity assertion fires at the limit and not below it.
 
@@ -115,7 +115,7 @@ Run both; (1) must FAIL on current code, (2) may already pass. Report the exact 
 
 ### Task 7: Review and PR
 
-- [ ] **Step 1:** Controller runs an adversarial review focused on: whether any path can still reuse a segment without a bump (the five-site table is the checklist); whether the two reconstruction sites can ever see an advanced generation; whether 4 bits holds given the corrected bump semantics; and whether any `Location` can be built bypassing `pack_location`.
+- [ ] **Step 1:** Controller runs an adversarial review focused on: whether any path can still reuse a segment without a bump (the five-site table is the checklist); whether the two reconstruction sites can ever see an advanced generation; whether 6 bits holds given the corrected bump semantics; and whether any `Location` can be built bypassing `pack_location`.
 - [ ] **Step 2:** Rebase onto whatever of #63/#67 has landed. Open the PR to `pelikan-io/cache-rs` main, titled `segcache: generation-tagged locations (fixes #50)`, with the bump change presented as the prerequisite it is, the capacity change stated plainly, the benchmark table, and the metrics-consolidation ordering note from the design's §2.
 
 ---
@@ -124,4 +124,4 @@ Run both; (1) must FAIL on current code, (2) may already pass. Report the exact 
 
 - Design §2 prerequisite → Task 2; layout + reconstruction constraint → Task 3; validation policy table → Task 4; §4 testing → Tasks 3-6.
 - Task 2 is independently correct and independently reviewable; if #50 is ever abandoned, that commit still stands on its own.
-- The capacity assertion is the one user-visible breaking change: heaps above 1,048,575 segments now fail at construction. That belongs in the PR body, not buried.
+- The capacity assertion is the one user-visible breaking change: heaps above 262,142 segments now fail at construction. That belongs in the PR body, not buried.

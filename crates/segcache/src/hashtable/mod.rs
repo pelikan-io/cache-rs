@@ -28,8 +28,8 @@ use keyvalue::RawItem;
 /// Pack a segment id, incarnation generation, and offset into a Location.
 ///
 /// Layout (44 bits total):
-/// - bits 43..24: segment id (20 bits)
-/// - bits 23..20: incarnation tag (4 bits — `generation` masked here)
+/// - bits 43..26: segment id (18 bits)
+/// - bits 25..20: incarnation tag (6 bits — `generation` masked here)
 /// - bits 19..0: offset / 8 (20 bits, 8-byte aligned)
 ///
 /// This is the ONLY way a `Location` is composed from parts.
@@ -66,7 +66,7 @@ pub(crate) fn pack_location(seg_id: NonZeroU32, generation: u16, offset: u64) ->
     );
     debug_assert!(
         (offset >> 3) <= location::OFFSET_MASK,
-        "offset exceeds the 20-bit location field"
+        "offset exceeds the location's offset field"
     );
     let tag = location::tag_for_generation(generation) as u64;
     Location::new(
@@ -179,6 +179,12 @@ mod tests {
     /// `test_ghost_is_unreachable_by_construction`.
     const MAX_ID: u32 = Location::MAX_SEGMENTS;
     const MAX_OFFSET: u64 = location::OFFSET_MASK << 3;
+    /// The largest tag the field holds — i.e. the generation just before the
+    /// projection wraps. Derived, so the boundary tests below follow the width
+    /// instead of pinning a stale literal.
+    const MAX_TAG: u16 = location::TAG_MASK as u16;
+    /// How many distinct incarnations a tag distinguishes.
+    const TAG_PERIOD: u16 = MAX_TAG + 1;
 
     #[test]
     fn test_pack_unpack_roundtrip() {
@@ -195,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_pack_max_seg_id() {
-        // 20-bit max segment id
+        // The largest id the 18-bit field can actually issue.
         let seg_id = NonZeroU32::new(MAX_ID).unwrap();
         let offset = 0u64;
 
@@ -224,12 +230,12 @@ mod tests {
     #[test]
     fn test_pack_all_fields_maxed() {
         let seg_id = NonZeroU32::new(MAX_ID).unwrap();
-        let loc = pack_location(seg_id, 0xF, MAX_OFFSET);
+        let loc = pack_location(seg_id, MAX_TAG, MAX_OFFSET);
         let (unpacked_seg, unpacked_offset) = unpack_location(loc);
 
         assert_eq!(unpacked_seg, MAX_ID);
         assert_eq!(unpacked_offset, MAX_OFFSET as usize);
-        assert_eq!(loc.tag(), 0xF);
+        assert_eq!(loc.tag(), MAX_TAG as u8);
         // Even with every issuable field maxed, the raw word falls short of
         // all-ones: the reserved id keeps the ghost sentinel out of reach.
         assert_ne!(loc.as_raw(), Location::MAX_RAW);
@@ -245,7 +251,7 @@ mod tests {
 
         for id in ids {
             for offset in offsets {
-                for generation in 0u16..16 {
+                for generation in 0..=MAX_TAG {
                     let loc = pack_location(NonZeroU32::new(id).unwrap(), generation, offset);
                     let (unpacked_id, unpacked_offset) = unpack_location(loc);
                     assert_eq!(unpacked_id, id, "id {id} gen {generation} offset {offset}");
@@ -264,15 +270,55 @@ mod tests {
     }
 
     /// The generation is masked to the tag width inside `pack_location`, so a
-    /// wrapped counter aliases every 16 lifecycles (by design) and never
+    /// wrapped counter aliases every 64 lifecycles (by design) and never
     /// corrupts the segment id above it.
+    ///
+    /// All 65,536 generations are swept, so the projection is checked to be
+    /// exactly `generation % 64` — 1024 generations onto each of the 64 tags —
+    /// rather than merely "some function that looks periodic".
     #[test]
-    fn test_generation_is_masked_to_four_bits() {
+    fn test_generation_is_masked_to_the_tag_width() {
         let seg_id = NonZeroU32::new(12345).unwrap();
+        let mut per_tag = [0u32; 64];
         for generation in 0u16..=u16::MAX {
             let loc = pack_location(seg_id, generation, 4096);
-            assert_eq!(loc.tag() as u16, generation % 16);
+            assert_eq!(loc.tag() as u16, generation % TAG_PERIOD);
             assert_eq!(unpack_location(loc), (12345, 4096));
+            per_tag[loc.tag() as usize] += 1;
+        }
+        assert_eq!(TAG_PERIOD, 64, "the tag must distinguish 64 incarnations");
+        assert!(
+            per_tag.iter().all(|&n| n == 65536 / 64),
+            "every tag must be hit equally often: {per_tag:?}"
+        );
+    }
+
+    /// The tag width, asserted as behaviour rather than as a constant: a
+    /// generation aliases the fresh one after exactly 64 lifecycles, and NOT
+    /// after 16 — which is what it did while the field was 4 bits wide. This
+    /// is the test that fails if a future edit narrows the field back.
+    #[test]
+    fn test_tag_aliases_after_sixty_four_lifecycles_not_sixteen() {
+        let seg_id = NonZeroU32::new(7).unwrap();
+        let offset = 4096;
+        let base = pack_location(seg_id, 0, offset);
+
+        // 64 lifecycles later the location is indistinguishable — the honest
+        // limit of the scheme, documented in the design doc.
+        assert_eq!(
+            base,
+            pack_location(seg_id, 64, offset),
+            "generation 64 must alias generation 0 at a 6-bit tag"
+        );
+
+        // Everything short of that stays distinct, 16 (the old wrap point)
+        // included.
+        for generation in 1u16..64 {
+            assert_ne!(
+                base,
+                pack_location(seg_id, generation, offset),
+                "generation {generation} must NOT alias generation 0"
+            );
         }
     }
 
@@ -292,7 +338,7 @@ mod tests {
     /// — not "implausibly", but by construction.
     ///
     /// The only packing that would alias it needs ALL of: the id field at
-    /// `MAX_SEGMENT_ID`, tag 15, and an item at the very last encodable offset.
+    /// `MAX_SEGMENT_ID`, tag 63, and an item at the very last encodable offset.
     /// The id field's maximum is deliberately NOT issuable (`MAX_SEGMENTS` is
     /// one lower, and `Segments::from_builder` refuses a heap that would need
     /// it — see `segments::capacity_tests`), so the first conjunct is
@@ -306,13 +352,13 @@ mod tests {
         // simultaneously maximal.
         let corners = [
             (1u32, 0u16, 0u64),
-            (1, 0xF, MAX_OFFSET),
-            (MAX_ID, 0xF, 0),
+            (1, MAX_TAG, MAX_OFFSET),
+            (MAX_ID, MAX_TAG, 0),
             (MAX_ID, 0, MAX_OFFSET),
-            (MAX_ID - 1, 0xF, MAX_OFFSET),
-            (MAX_ID, 0xE, MAX_OFFSET),
-            (MAX_ID, 0xF, MAX_OFFSET - 8),
-            (MAX_ID, 0xF, MAX_OFFSET),
+            (MAX_ID - 1, MAX_TAG, MAX_OFFSET),
+            (MAX_ID, MAX_TAG - 1, MAX_OFFSET),
+            (MAX_ID, MAX_TAG, MAX_OFFSET - 8),
+            (MAX_ID, MAX_TAG, MAX_OFFSET),
         ];
         for (id, generation, offset) in corners {
             let loc = pack_location(NonZeroU32::new(id).unwrap(), generation, offset);

@@ -13,7 +13,7 @@ Traditional caches (Memcached, Redis) store per-item metadata: pointers for hash
 Segcache lifts most metadata into shared structures:
 
 - **Segment headers** (64 bytes each, stored in DRAM) track write offset, live bytes/items, TTL, pool classification, and doubly-linked list pointers. One header covers thousands of items.
-- **Hash bucket slots** (8 bytes each) store a 12-bit tag, 8-bit frequency counter, 24-bit segment ID, and 20-bit offset. No per-item pointers.
+- **Hash bucket slots** (8 bytes each) store a 12-bit tag, 8-bit frequency counter, 18-bit segment ID, 6-bit incarnation tag, and 20-bit offset. No per-item pointers.
 - **Item headers** (5 bytes without magic, 9 with) store only key length (8 bits), value length (24 bits), and flags (8 bits). Defined in the shared [keyvalue](keyvalue.md) crate.
 
 The result: ~5 bytes of per-item overhead vs ~56 bytes in Memcached.
@@ -80,7 +80,7 @@ Hashbucket (64 bytes = 1 cache line):
 └──────────────────────────────────────────────────────┘
 ```
 
-- All 8 slots hold items: a 12-bit tag (partial hash for fast rejection), an 8-bit approximate frequency counter (ASFC), and a 44-bit opaque location encoding segment ID and offset.
+- All 8 slots hold items: a 12-bit tag (partial hash for fast rejection), an 8-bit approximate frequency counter (ASFC), and a 44-bit opaque location encoding segment ID, incarnation tag, and offset.
 - Each slot is an `AtomicU64` — all mutations use compare-and-swap, no locks.
 - N-choice hashing: each key maps to N candidate buckets (default 2). Inserts prefer the least-full bucket. No overflow chains needed.
 - SIMD tag scanning (AVX2 on x86_64, NEON on aarch64) filters all 8 slots in parallel, falling back to scalar on other platforms.
