@@ -850,6 +850,23 @@ impl Segments {
         self.claim_for_drain(id)
     }
 
+    /// Test-only shim exposing the private `finalize_drained` (sweep the
+    /// segment's remaining hashtable entries, then recycle or condemn it),
+    /// the completion half of `claim_for_drain_for_test`. Lets a test park a
+    /// segment mid-drain and later let the drain PROGRESS, which is what the
+    /// writer-vs-drain rollback/restart loop waits on — a permanently parked
+    /// segment would legitimately spin that loop forever and is not a valid
+    /// liveness test.
+    #[cfg(test)]
+    #[allow(dead_code)] // callers are cfg'd out under loom
+    pub(crate) fn finalize_drained_for_test(
+        &self,
+        id: NonZeroU32,
+        hashtable: &MultiChoiceHashtable,
+    ) -> ClearOutcome {
+        self.finalize_drained(id, hashtable, false)
+    }
+
     /// Finalize a segment this thread has already claimed (it is `Draining`,
     /// owned by this thread via `claim_for_drain`): capture its chain links,
     /// drain its remaining hashtable entries, then recycle it (ref_count == 0)

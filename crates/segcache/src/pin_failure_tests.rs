@@ -39,6 +39,7 @@
 
 use crate::*;
 use core::num::NonZeroU32;
+use crossbeam_utils::Backoff;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -444,6 +445,196 @@ fn same_key_cas_vs_drain_completes() {
         .expect("post-storm insert");
     let item = cache.get(b"hotkey1").expect("post-storm get");
     assert_eq!(item.value(), Value::Bytes(b"Cfinal0"));
+}
+
+/// Bug 3, DETERMINISTIC complement (issue #49) to the two 20k-iteration
+/// stress races above: those pound a hot key against a real drainer and rely
+/// on landing in the window; this one builds the window by hand.
+///
+/// The fix does not let the writer punch through a stuck drain — it makes
+/// the writer ROLL BACK its reservation (releasing the pin the drain may be
+/// waiting on) and restart. So the property is precisely "the write
+/// completes ONCE THE DRAIN PROGRESSES", and the test has to model that: the
+/// key's segment is parked in `Draining` (via `claim_for_drain_for_test`) so
+/// the writer's `try_pin_remover` on the old entry can only fail, and a
+/// background thread then FINALIZES that drain (sweep + recycle) after a
+/// short delay. Parking the segment forever would NOT be a valid test — the
+/// rollback/restart loop is entitled to spin while a drain makes no
+/// progress.
+///
+/// `drain_started` is stored before the sweep and read after the write
+/// returns: the write cannot possibly complete while the old entry is still
+/// published in a `Draining` segment, so observing it proves the writer was
+/// genuinely held by the parked drain rather than sailing straight through.
+fn same_key_write_completes_when_parked_drain_progresses<T, P, E, F>(
+    key: &'static [u8],
+    seed_val: &'static [u8],
+    name: &'static str,
+    prepare: P,
+    engage: E,
+    write: F,
+) where
+    P: FnOnce(&Segcache) -> T,
+    T: Send + 'static,
+    E: FnOnce(&Segcache) + Send + 'static,
+    F: FnOnce(&Segcache, T) + Send + 'static,
+{
+    let cache = Arc::new(small_merge_cache(64));
+    let (_location, seg_id) = insert_and_seal(&cache, key, seed_val);
+    // Anything the write needs from the LIVE key (e.g. a cas token) must be
+    // taken before the segment is parked — afterwards the key is unreadable
+    // until the drain progresses, and then it is gone.
+    let prepared = prepare(&cache);
+
+    // Park the drain mid-flight: Sealed -> Draining, entry still published.
+    assert!(cache.segments_for_test().claim_for_drain_for_test(seg_id));
+
+    let drain_started = Arc::new(AtomicBool::new(false));
+    // Both workers leave the gate together; `engage` then holds the park open
+    // until the writer is demonstrably stuck in its retry loop.
+    let gate = Arc::new(std::sync::Barrier::new(2));
+
+    let (dtx, drx) = mpsc::channel();
+    let drainer = {
+        let cache = Arc::clone(&cache);
+        let drain_started = Arc::clone(&drain_started);
+        let gate = Arc::clone(&gate);
+        std::thread::spawn(move || {
+            gate.wait();
+            engage(&cache);
+            drain_started.store(true, AtomicOrdering::Release);
+            // `Freed`, not just "returned": the writer holds no reader pin on
+            // this segment, so the drain must sweep the entry AND recycle the
+            // segment. `Deferred` (condemned, still pinned) would mean the
+            // park ended in a different state than the one the writer's
+            // rollback/restart loop is waiting on, making a pass here prove
+            // less than it claims.
+            assert_eq!(
+                cache
+                    .segments_for_test()
+                    .finalize_drained_for_test(seg_id, &cache.hashtable),
+                ClearOutcome::Freed,
+                "parked drain must finish by recycling the segment"
+            );
+            let _ = dtx.send(());
+        })
+    };
+
+    let (wtx, wrx) = mpsc::channel();
+    let writer = {
+        let cache = Arc::clone(&cache);
+        let drain_started = Arc::clone(&drain_started);
+        let gate = Arc::clone(&gate);
+        std::thread::spawn(move || {
+            gate.wait();
+            write(&cache, prepared);
+            assert!(
+                drain_started.load(AtomicOrdering::Acquire),
+                "write completed while the old entry was still published in a \
+                 Draining segment — the test never exercised the parked-drain \
+                 window it is meant to cover"
+            );
+            let _ = wtx.send(());
+        })
+    };
+
+    join_within(name, wrx, writer, 10);
+    join_within("parked drain finalizer", drx, drainer, 10);
+}
+
+/// `insert` (replace arm) variant of the deterministic liveness test — the
+/// one that exercises the rollback/restart loop itself.
+///
+/// The park window is closed on the WRITER'S OWN PROGRESS, not on a clock:
+/// each rollback/restart burns a fresh reservation, so the free-segment
+/// count falling is direct evidence that the writer went round the loop
+/// several times. A fixed sleep would be doubly wrong here — too short and
+/// the writer might not have entered the loop, too long and the churn
+/// exhausts the pool (measured: a 64-segment cache is fully consumed in
+/// ~4 ms of looping) and the insert fails with `NoFreeSegments` instead.
+#[test]
+fn same_key_insert_completes_when_parked_drain_progresses() {
+    same_key_write_completes_when_parked_drain_progresses(
+        b"parked0",
+        b"Vparke0",
+        "same-key insert vs parked drain",
+        |_cache| (),
+        |cache| {
+            // 3 segments' worth of restarts is unambiguous evidence of the
+            // loop and a small fraction of the ~64 the pool can absorb.
+            const RESTART_EVIDENCE: usize = 3;
+            let start = cache.segments_for_test().free_only();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            // Bounded spin, then yield — the same shape #41 gave every
+            // production spin site. This waits on ANOTHER thread's progress,
+            // so on an oversubscribed host (CI) a pure spin burns the quantum
+            // competing with the very writer whose restarts it is waiting to
+            // observe.
+            let backoff = Backoff::new();
+            while start.saturating_sub(cache.segments_for_test().free_only()) < RESTART_EVIDENCE {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "writer never entered the reserve/rollback/restart loop"
+                );
+                backoff.snooze();
+            }
+        },
+        |cache, ()| {
+            let ttl = Duration::from_secs(3600);
+            cache
+                .insert(b"parked0", b"Wparke0", None, ttl)
+                .expect("insert must complete once the parked drain progresses");
+            // The drain swept the old entry, so this is a fresh publish of
+            // the new value — it must be the value that is readable.
+            let item = cache.get(b"parked0").expect("overwritten key must resolve");
+            assert_eq!(item.value(), Value::Bytes(b"Wparke0"));
+        },
+    );
+}
+
+/// `cas` variant of the same parked-drain window. NOTE on what this does and
+/// does not cover: `cas` re-pins the OLD item (`acquire_item_at`) before it
+/// ever reserves, and that pin fails on a `Draining` segment, so a parked
+/// drain holds the cas in the *lookup* retry — it never gets as far as
+/// `replace_at`'s reservation, and therefore never burns free segments (the
+/// reason this variant can hold the park open with a plain sleep while the
+/// `insert` one cannot). The `replace_at` rollback arm itself is reachable
+/// only when the drain starts AFTER the cas has reserved, which is a race
+/// window, not a state a test can park in; `same_key_cas_vs_drain_completes`
+/// above covers it by stress. What is deterministic here is the same
+/// end-to-end liveness property: a cas caught by a drain completes once the
+/// drain progresses. The sweep removes the key, so `NotFound` is a legal
+/// verdict — completion, not the verdict, is what is asserted.
+#[test]
+fn same_key_cas_completes_when_parked_drain_progresses() {
+    same_key_write_completes_when_parked_drain_progresses(
+        b"parked1",
+        b"Vparke1",
+        "same-key cas vs parked drain",
+        |cache| {
+            cache
+                .get_no_freq_incr(b"parked1")
+                .expect("seeded key is live")
+                .cas()
+        },
+        // The cas spins without reserving, so there is nothing to starve and
+        // no progress counter to watch: a plain park window is enough.
+        |_cache| std::thread::sleep(Duration::from_millis(50)),
+        |cache, token| {
+            let ttl = Duration::from_secs(3600);
+            let res = cache.cas(b"parked1", b"Wparke1", None, ttl, token);
+            assert!(
+                res == Ok(()) || res == Err(SegcacheError::NotFound),
+                "cas returned an illegal verdict for a key its drain swept: {res:?}"
+            );
+            // The engine is still fully functional on that key afterwards.
+            cache
+                .insert(b"parked1", b"Xparke1", None, ttl)
+                .expect("post-drain insert");
+            let item = cache.get(b"parked1").expect("post-drain get");
+            assert_eq!(item.value(), Value::Bytes(b"Xparke1"));
+        },
+    );
 }
 
 /// `cas` variant of bug 1 (false absence during merge drains): `cas` mints
