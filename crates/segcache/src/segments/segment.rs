@@ -100,12 +100,23 @@ impl<'a> Segment<'a> {
             offset += item.size();
         }
 
-        if count != self.live_items() {
+        // DIRECTIONAL invariant, not equality: the design deliberately
+        // retains unpinned unlinks (a delete racing a drain, the fresh-key
+        // insert de-dup race, a reservation rollback) that drop the
+        // hashtable entry WITHOUT running `remove_item_at`, so the header
+        // legitimately EXCEEDS the resolving count until the segment is
+        // drained and `reset_write_stats` reconciles the residue. What is
+        // never legal is the other direction: more items resolving through
+        // the hashtable than the header claims are live means a decrement
+        // without an unlink, or a lost increment — real corruption.
+        let live_items = self.live_items();
+        if count > live_items {
             error!(
-                "seg: {} has mismatch between counted items: {} and header items: {}",
+                "seg: {} has more resolving items: {} than header items: {} (excess: {})",
                 self.id(),
                 count,
-                self.live_items()
+                live_items,
+                count - live_items
             );
             integrity = false;
         }
