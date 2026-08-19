@@ -112,6 +112,8 @@ offset from the offset one past its end.
 
 ## Per-Type Conventions (`format = 0x00`)
 
+![Four rows showing the same entry glyphs arranged per type: list positional, hash field-value pairs sorted by field, set sorted members, zset member-score pairs sorted by score then member](diagrams/ziplist-type-conventions.svg)
+
 | type | body | ordering | notes |
 |---|---|---|---|
 | List | one entry per element | positional | `push_back` is O(1) at `tail_off`; `push_front` memmoves the body |
@@ -138,7 +140,14 @@ than "must decode somehow."
 
 ## Worked Example: A Hash Block
 
-Building a 2-field hash step by step, reproducing
+![Byte-by-byte anatomy of the 27-byte hash golden block: 12-byte header, then four entries each made of a tag byte, optional data bytes, and a backlen byte; tail_off points at the last entry's first byte](diagrams/ziplist-block-anatomy.svg)
+
+The figure is generated from these exact bytes by
+`diagrams/ziplist_anatomy.py`, whose mini-decoder re-walks the block and
+aborts on any span/byte disagreement (regeneration command in the script
+header; snapshot pinned to the fixture as frozen at `a68fd2d`).
+
+Building the same 2-field hash step by step, reproducing
 `tests/golden.rs::hash_golden_bytes` byte for byte:
 
 ```rust
@@ -209,6 +218,12 @@ decode error, never silently reinterpreted. Concretely:
   accepted) but has no body semantics yet in any `format = 0x00` layout --
   it's reserved for a future chained/directory body format, deliberately
   unplanned here.
+
+![Left: v1 as shipped, a key maps to one block item. Right: v2 as reserved, the key maps to a root directory item whose derived keys address chunk items, each an ordinary v1 block; the v2 half is drawn dashed](diagrams/ziplist-chaining.svg)
+
+The dashed half is the reserved-not-built claim: links are derived keys,
+never segment pointers, so eviction and merge never chase them; each chunk
+stays an ordinary v1 block, bounding a write's amplification to one chunk.
 
 ## API Notes
 

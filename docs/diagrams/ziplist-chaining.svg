@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 300" role="img" aria-label="Left: v1, a key maps to one block item. Right: v2 planned, the key maps to a root directory item whose derived keys address chunk items, each an ordinary v1 block." style="max-width:100%;height:auto"><rect x="0" y="0" width="900" height="300" fill="#FCFCFA"/>
+    <style>text{font-family:system-ui,sans-serif}</style>
+    <defs><marker id="a3" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#22303C"/></marker></defs>
+    <text x="20" y="34" font-size="15" font-weight="600" fill="#22303C">v1 — shipped</text>
+    <rect x="20" y="60" width="120" height="36" rx="4" fill="none" stroke="#22303C" stroke-width="1.4"/>
+    <text x="80" y="83" text-anchor="middle" font-size="13" font-family="ui-monospace,monospace" fill="#22303C">key</text>
+    <path d="M 140 78 H 190" stroke="#22303C" stroke-width="1.4" fill="none" marker-end="url(#a3)"/>
+    <text x="165" y="70" text-anchor="middle" font-size="11" fill="#22303C">hash</text>
+    <rect x="192" y="56" width="180" height="44" fill="#B3CDE3" stroke="#22303C" stroke-opacity="0.4"/>
+    <text x="282" y="83" text-anchor="middle" font-size="13" font-family="ui-monospace,monospace" fill="#22303C">block (≤ item cap)</text>
+    <text x="20" y="150" font-size="15" font-weight="600" fill="#22303C">v2 — reserved by the chain-root flag</text>
+    <g stroke-dasharray="5 4">
+      <rect x="20" y="176" width="120" height="36" rx="4" fill="none" stroke="#22303C" stroke-width="1.4"/>
+      <path d="M 140 194 H 190" stroke="#22303C" stroke-width="1.4" fill="none" marker-end="url(#a3)"/>
+      <rect x="192" y="172" width="180" height="44" fill="#FBB4AE" stroke="#22303C" stroke-opacity="0.4"/>
+      <path d="M 372 186 C 430 160, 470 160, 520 176" stroke="#22303C" stroke-width="1.2" fill="none" marker-end="url(#a3)"/>
+      <path d="M 372 194 H 520" stroke="#22303C" stroke-width="1.2" fill="none" marker-end="url(#a3)"/>
+      <path d="M 372 202 C 430 228, 470 228, 520 212" stroke="#22303C" stroke-width="1.2" fill="none" marker-end="url(#a3)"/>
+      <rect x="524" y="150" width="150" height="40" fill="#B3CDE3" stroke="#22303C" stroke-opacity="0.4"/>
+      <rect x="524" y="196" width="150" height="40" fill="#B3CDE3" stroke="#22303C" stroke-opacity="0.4"/>
+      <rect x="524" y="242" width="150" height="40" fill="#B3CDE3" stroke="#22303C" stroke-opacity="0.4"/>
+    </g>
+    <text x="80" y="199" text-anchor="middle" font-size="13" font-family="ui-monospace,monospace" fill="#22303C">key</text>
+    <text x="282" y="190" text-anchor="middle" font-size="12" font-family="ui-monospace,monospace" fill="#22303C">root: directory</text>
+    <text x="282" y="205" text-anchor="middle" font-size="11" fill="#22303C">chunk boundaries</text>
+    <text x="599" y="174" text-anchor="middle" font-size="12" font-family="ui-monospace,monospace" fill="#22303C">chunk H(key)‖0</text>
+    <text x="599" y="220" text-anchor="middle" font-size="12" font-family="ui-monospace,monospace" fill="#22303C">chunk H(key)‖1</text>
+    <text x="599" y="266" text-anchor="middle" font-size="12" font-family="ui-monospace,monospace" fill="#22303C">chunk H(key)‖2</text>
+    <text x="700" y="200" font-size="12" fill="#22303C">each chunk is an ordinary v1 block —</text>
+    <text x="700" y="216" font-size="12" fill="#22303C">no format break, writes touch one</text>
+    <text x="700" y="232" font-size="12" fill="#22303C">chunk, a lost chunk reads as a miss</text>
+  </svg>
