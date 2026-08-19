@@ -37,6 +37,12 @@ fn sizes() {
 // is visibly missing — which is exactly the gap that let a textual merge
 // move the `generation.fetch_add` off `try_release_condemned` and onto
 // `cas_condemn` with the entire suite, loom included, still green.
+//
+// Calibration, measured rather than asserted: with that defect reinstated
+// and ONLY this test skipped, 151 lib tests and all 31 loom models still
+// pass. That is what this assertion is standing in for — nothing else in
+// the tree pins which edge spends a generation, so weakening it removes the
+// only signal, not one signal among several.
 #[test]
 fn generation_advances_on_exactly_the_two_transitions_that_end_a_used_incarnation() {
     use crate::segments::state::State;
