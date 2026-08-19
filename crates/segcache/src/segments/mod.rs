@@ -14,6 +14,8 @@ pub(crate) mod state;
 mod writer_pin;
 
 #[cfg(all(test, not(feature = "loom")))]
+mod dead_accounting_tests;
+#[cfg(all(test, not(feature = "loom")))]
 mod eviction_concurrency_tests;
 
 pub(crate) use builder::SegmentsBuilder;

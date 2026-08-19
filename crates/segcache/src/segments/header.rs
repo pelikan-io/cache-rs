@@ -16,8 +16,11 @@
 //! │          METADATA           │ GEN  │PL│PD│ ACTIVE WRITERS │
 //! │          AtomicU64          │ 16b  │8b│8b│  AtomicU32/32b │
 //! ├─────────────────────────────┴──────┴──┴──┴────────────────┤
-//! │        ACTIVE REMOVERS      │          PADDING            │
-//! │        AtomicU32/32b        │            96 bit           │
+//! │        ACTIVE REMOVERS      │        DEAD ITEMS           │
+//! │        AtomicU32/32b        │        AtomicI32/32b        │
+//! ├─────────────────────────────┼─────────────────────────────┤
+//! │         DEAD BYTES          │          PADDING            │
+//! │        AtomicI32/32b        │            32 bit           │
 //! └───────────────────────────────────────────────────────────┘
 //!
 //! METADATA = [8 tag][8 state][24 prev][24 next] (see segments::state)
@@ -152,7 +155,9 @@ impl SegmentPool {
 /// 43       1    (implicit alignment pad before active_writers)
 /// 44       4    active_writers (AtomicU32, in-flight reserve/write pins)
 /// 48       4    active_removers (AtomicU32, in-flight replace/delete pins)
-/// 52       9    _pad          (+3 implicit trailing bytes to align(64) → 64)
+/// 52       4    dead_items    (AtomicI32, retired-but-not-reclaimed items)
+/// 56       4    dead_bytes    (AtomicI32, retired-but-not-reclaimed bytes)
+/// 60       4    _pad          (align(64) → 64)
 /// ```
 #[repr(C, align(64))]
 pub(crate) struct SegmentHeader {
@@ -169,7 +174,15 @@ pub(crate) struct SegmentHeader {
     pool: AtomicU8,
     active_writers: AtomicU32,
     active_removers: AtomicU32,
-    _pad: [u8; 9],
+    /// Items retired from this segment whose space has NOT been reclaimed
+    /// yet — the per-segment share of the global `ITEM_DEAD` gauge. Fits in
+    /// what used to be header padding, so the 64-byte line is unchanged.
+    /// Maintained unconditionally (not behind `metrics`) so the counters are
+    /// available to `Debug`/tests in every build, exactly like `live_*`; only
+    /// the global gauge mirror below is feature-gated.
+    dead_items: AtomicI32,
+    dead_bytes: AtomicI32,
+    _pad: [u8; 4],
 }
 
 // Loom atomics are larger than std atomics, so skip size check under loom.
@@ -201,7 +214,9 @@ impl SegmentHeader {
             pool: AtomicU8::new(SegmentPool::Main as u8),
             active_writers: AtomicU32::new(0),
             active_removers: AtomicU32::new(0),
-            _pad: [0; 9],
+            dead_items: AtomicI32::new(0),
+            dead_bytes: AtomicI32::new(0),
+            _pad: [0; 4],
         }
     }
 
@@ -217,6 +232,8 @@ impl SegmentHeader {
         self.write_offset.store(initial_offset, Ordering::Relaxed);
         self.live_bytes.store(initial_offset, Ordering::Relaxed);
         self.live_items.store(0, Ordering::Relaxed);
+        self.dead_items.store(0, Ordering::Relaxed);
+        self.dead_bytes.store(0, Ordering::Relaxed);
         self.metadata
             .store(Metadata::new_free().pack(), Ordering::Relaxed);
     }
@@ -234,10 +251,21 @@ impl SegmentHeader {
     /// race, a reservation rollback), so the global item gauges are
     /// corrected by the residue. Exactly-once: the first reset zeroes the
     /// counters, so a second reset (recycle then try_reserve) subtracts
-    /// nothing. The residue is also mirrored into the dead-item gauges,
-    /// exactly as `Segment::remove_item_at` does on the normal path, so an
-    /// item that dies via an unpinned unlink is accounted the same way as
-    /// one that dies normally.
+    /// nothing.
+    ///
+    /// The same reset RECLAIMS the segment's dead space: `ITEM_DEAD` /
+    /// `ITEM_DEAD_BYTES` are occupancy gauges ("dead weight currently
+    /// sitting in segments"), and this segment's contribution to them ends
+    /// here — its bytes are about to be handed to the next tenant. The
+    /// per-segment counters are `swap(0)`ped, which is what makes the
+    /// subtraction idempotent in exactly the same way the live side is: a
+    /// second reset finds zero and subtracts nothing.
+    ///
+    /// The residue is deliberately NOT mirrored into the dead gauges (as it
+    /// was while they were cumulative totals): an item that dies at the very
+    /// instant its segment is reclaimed leaves no dead space behind, so
+    /// adding it here and subtracting it again below would only produce a
+    /// transient — and adding it AFTER the swap would leak it permanently.
     pub fn reset_write_stats(&self) {
         let initial_offset = if cfg!(feature = "integrity") {
             std::mem::size_of::<u64>() as i32
@@ -250,12 +278,23 @@ impl SegmentHeader {
             let leaked_bytes = self.live_bytes.load(Ordering::Relaxed) - initial_offset;
             if leaked_items > 0 {
                 crate::ITEM_CURRENT.sub(leaked_items as _);
-                crate::ITEM_DEAD.add(leaked_items as _);
             }
             if leaked_bytes > 0 {
                 crate::ITEM_CURRENT_BYTES.sub(leaked_bytes as _);
-                crate::ITEM_DEAD_BYTES.add(leaked_bytes as _);
             }
+            let dead_items = self.dead_items.swap(0, Ordering::Relaxed);
+            let dead_bytes = self.dead_bytes.swap(0, Ordering::Relaxed);
+            if dead_items > 0 {
+                crate::ITEM_DEAD.sub(dead_items as _);
+            }
+            if dead_bytes > 0 {
+                crate::ITEM_DEAD_BYTES.sub(dead_bytes as _);
+            }
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            self.dead_items.store(0, Ordering::Relaxed);
+            self.dead_bytes.store(0, Ordering::Relaxed);
         }
         self.write_offset.store(initial_offset, Ordering::Relaxed);
         self.live_bytes.store(initial_offset, Ordering::Relaxed);
@@ -754,6 +793,44 @@ impl SegmentHeader {
         self.decr_live_bytes(size);
     }
 
+    // -- Dead items/bytes --
+    //
+    // The space held by items that were retired from this segment and has
+    // not been reclaimed yet. It is reclaimed wholesale when the segment is
+    // reset (`reset_write_stats`, from recycle / try_reserve / the condemned
+    // guard-drop free), which is what lets the global gauges these mirror be
+    // true occupancy gauges rather than monotone totals. NOT derivable from
+    // `write_offset - live_bytes`: `Segment::clear` rewinds `write_offset`
+    // to `live_bytes` on the way out, and a relocation lowers `live_bytes`
+    // without anything having died.
+
+    #[inline]
+    pub fn dead_items(&self) -> i32 {
+        self.dead_items.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn dead_bytes(&self) -> i32 {
+        self.dead_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Record one item's worth of dead space (a death: evict, expire,
+    /// delete, or replace).
+    #[inline]
+    pub fn incr_dead_item(&self, size: i32) {
+        self.dead_items.fetch_add(1, Ordering::Relaxed);
+        self.dead_bytes.fetch_add(size, Ordering::Relaxed);
+    }
+
+    /// Undo one `incr_dead_item`, for a RELOCATION: `remove_item_at` runs on
+    /// the source of a merge copy / S3-FIFO promotion, but a moved item is
+    /// not a dead item, so the site takes the bump back off.
+    #[inline]
+    pub fn decr_dead_item(&self, size: i32) {
+        self.dead_items.fetch_sub(1, Ordering::Relaxed);
+        self.dead_bytes.fetch_sub(size, Ordering::Relaxed);
+    }
+
     // -- Chain pointers (views of the metadata word) --
 
     #[inline]
@@ -872,6 +949,8 @@ impl std::fmt::Debug for SegmentHeader {
             .field("write_offset", &self.write_offset())
             .field("live_bytes", &self.live_bytes())
             .field("live_items", &self.live_items())
+            .field("dead_bytes", &self.dead_bytes())
+            .field("dead_items", &self.dead_items())
             .field("state", &meta.state)
             .field("pool", &self.pool())
             .field("prev_seg", &meta.prev)

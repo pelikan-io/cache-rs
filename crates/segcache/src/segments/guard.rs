@@ -62,7 +62,21 @@ impl Drop for SegmentGuard {
             // AwaitingRelease -> Free transition: return it to the free
             // queue ourselves.
             //
-            // Intentionally bypasses the spare-aware `return_segment`
+            // Settle the segment's accounting FIRST. The CAS we just won is
+            // exclusive (exactly one of us and the condemner's race-fix
+            // recheck can win it) and nothing can find the segment until we
+            // push it, so we are its sole owner here — the same ownership
+            // `recycle` has when it calls this. Without it a condemned
+            // segment carries its unpinned-unlink residue AND its whole dead
+            // total onto the free queue, unreconciled until some later
+            // `try_reserve` happens to pick it up: `item_current` would sit
+            // above the true live count and `item_dead` above the true dead
+            // occupancy for as long as the segment stays free (issue #58
+            // part 2). `reset_write_stats` is idempotent, so the later
+            // reserve-time reset is harmless.
+            header.reset_write_stats();
+
+            // The push below intentionally bypasses the spare-aware `return_segment`
             // helper: this guard only holds a raw pointer to the free
             // queue (see the struct doc), not `&Segments`, so it cannot
             // see or update the spare queue/count. A segment freed here

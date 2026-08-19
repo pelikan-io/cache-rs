@@ -7,7 +7,8 @@
 //! `Segments::s3fifo_promote_from`) must be gauge-NEUTRAL because a
 //! relocation MOVES an item rather than killing one, and residue left by
 //! unpinned unlinks is reconciled by `SegmentHeader::reset_write_stats`
-//! when the segment recycles. If any of those sites is wrong, the error is
+//! when the segment recycles (or is freed by the last reader of a condemned
+//! segment). If any of those sites is wrong, the error is
 //! permanent and cumulative — so after a storm that drains every segment,
 //! the gauges must be back at exactly zero.
 //!
@@ -167,8 +168,7 @@ fn item_gauges_return_to_zero_after_drain_storm() {
     // way to produce unpinned unlinks (a delete/replace losing its remover
     // pin to a drain, a reservation rollback into a draining segment). Those
     // skip `remove_item_at` entirely and leave a residue that only
-    // `reset_write_stats` reconciles — the path the ITEM_DEAD mirroring
-    // below exists for. Bounded work, and every thread is joined before the
+    // `reset_write_stats` reconciles. Bounded work, and every thread is joined before the
     // gauges are read, so the final state is still deterministic.
     let cache = std::sync::Arc::new(cache);
     std::thread::scope(|scope| {
@@ -252,14 +252,13 @@ fn item_gauges_return_to_zero_after_drain_storm() {
 
     drain_fully(&merge_cache);
 
-    // KNOWN GAP (theoretical, not observed here): a segment condemned while
-    // still reader-pinned is freed by the last `SegmentGuard::drop`, which
-    // pushes it straight onto the free queue without passing through
-    // `recycle` or `try_reserve` — so its unpinned-unlink residue is not
-    // reconciled by `reset_write_stats` until it is re-reserved. This test
-    // holds no `Item`s across a drain, so nothing is ever condemned and the
-    // total lands exactly on zero; a workload that did could leave a
-    // transient residue here. Follow-up tracked separately.
+    // (Formerly a KNOWN GAP here: a segment condemned while still
+    // reader-pinned is freed by the last `SegmentGuard::drop`, which reached
+    // neither `recycle` nor `try_reserve`, so its residue was reconciled only
+    // if and when it was re-reserved. That drop path now settles the segment
+    // itself — see `tests/item_dead_gauges.rs`, which drives it deliberately.
+    // This test still holds no `Item`s across a drain, so it does not depend
+    // on that.)
     assert_eq!(
         gauge("item_current"),
         0,
@@ -273,24 +272,30 @@ fn item_gauges_return_to_zero_after_drain_storm() {
         "ITEM_CURRENT_BYTES did not return to zero after every segment drained"
     );
 
-    // Every item that left `ITEM_CURRENT` must have been mirrored into
-    // `ITEM_DEAD` — on the normal path by `Segment::remove_item_at`, and for
-    // items unlinked WITHOUT a remover pin by the residue reconciliation in
-    // `SegmentHeader::reset_write_stats`. `ITEM_CURRENT` was raised
-    // `item_allocate` times by fresh allocations and `item_relink` times by
-    // relocation compensation, and it is now back at zero, so exactly that
-    // many items must have been accounted dead.
-    //
-    // NOTE: this identity encodes the CURRENT cumulative semantics of
-    // `item_dead` — in particular that a relocation counts as a death (each
-    // relink runs `remove_item_at`, which adds to `ITEM_DEAD`, and is offset
-    // on the live side by the `item_relink` term). If the follow-up that
-    // reconsiders those semantics lands — e.g. relocations stop counting as
-    // deaths, or the metric becomes a true gauge with decrements — this
-    // assertion has to be revisited, not merely re-baselined.
+    // `ITEM_DEAD`/`ITEM_DEAD_BYTES` are OCCUPANCY gauges — dead weight
+    // currently sitting in segments — so a drain that recycles every segment
+    // hands all of it back. (They used to be cumulative totals, and this
+    // assertion used to read `item_dead == item_allocate + item_relink`,
+    // which encoded both the cumulative semantics and relocations counting as
+    // deaths. Both were the subject of issue #58.) The dedicated coverage
+    // lives in `tests/item_dead_gauges.rs` and
+    // `src/segments/dead_accounting_tests.rs`; asserted here too because this
+    // storm is the broadest drain in the suite.
     assert_eq!(
         gauge("item_dead"),
-        (counter("item_allocate") + counter("item_relink")) as i64,
-        "ITEM_DEAD does not account every item that left ITEM_CURRENT"
+        0,
+        "ITEM_DEAD did not return to zero after every segment drained — dead \
+         space is reclaimed when its segment is"
     );
+    assert_eq!(
+        gauge("item_dead_bytes"),
+        0,
+        "ITEM_DEAD_BYTES did not return to zero after every segment drained"
+    );
+
+    // The relocation sites stay live-gauge-neutral, so `ITEM_CURRENT` was
+    // raised `item_allocate` times by fresh allocations and `item_relink`
+    // times by relocation compensation. Both counters must have moved, or the
+    // storm above exercised neither path and proved nothing.
+    assert!(counter("item_allocate") > 0 && counter("item_relink") > 0);
 }

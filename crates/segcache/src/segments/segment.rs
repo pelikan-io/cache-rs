@@ -252,6 +252,13 @@ impl<'a> Segment<'a> {
         self.header.incr_live_bytes(bytes);
     }
 
+    /// Take back the dead charge `remove_item_at` placed on this segment,
+    /// for an item that was RELOCATED rather than killed.
+    #[inline]
+    pub fn decr_dead_item(&self, bytes: i32) {
+        self.header.decr_dead_item(bytes);
+    }
+
     #[inline]
     pub fn state(&self) -> State {
         self.header.state()
@@ -307,7 +314,14 @@ impl<'a> Segment<'a> {
 
     // -- Item operations --
 
-    /// Remove an item at the given offset, decrementing live counters.
+    /// Remove an item at the given offset, decrementing live counters and
+    /// charging the item's space to this segment's dead total.
+    ///
+    /// The dead side is a hand-off, not a death certificate: the space stays
+    /// charged until the segment is reset (`reset_write_stats`), which is
+    /// what makes `ITEM_DEAD`/`ITEM_DEAD_BYTES` occupancy gauges. Relocation
+    /// sites (`copy_into`, `Segments::s3fifo_promote_from`) take the dead
+    /// charge back off, because a moved item did not die.
     pub(crate) fn remove_item_at(&self, offset: usize) {
         let item = self.get_item_at(offset).unwrap();
         let item_size = item.size() as i32;
@@ -322,6 +336,7 @@ impl<'a> Segment<'a> {
 
         self.check_magic();
         self.header.decr_item(item_size);
+        self.header.incr_dead_item(item_size);
         assert!(self.live_bytes() >= 0);
         assert!(self.live_items() >= 0);
 
@@ -429,6 +444,11 @@ impl<'a> Segment<'a> {
                 // Release store, making the new location visible to it.
                 drop(vguard);
                 self.remove_item_at(read_offset);
+                // A relocation is not a death (see the metrics note below):
+                // take back the dead charge `remove_item_at` just put on this
+                // (source) segment. Unconditional, like every other header
+                // counter — only the global gauge mirror is `metrics`-gated.
+                self.header.decr_dead_item(item_size as i32);
                 target.header.incr_live_items();
                 target.header.incr_live_bytes(item_size as i32);
                 target.set_write_offset(write_offset as i32 + item_size as i32);
@@ -440,9 +460,10 @@ impl<'a> Segment<'a> {
                 {
                     ITEM_RELINK.increment();
                     // A relocation MOVES an item, it does not kill one, so
-                    // it must be gauge-NEUTRAL: `remove_item_at` above
-                    // decremented the global item gauges, while the
-                    // destination's header bumps do not touch them.
+                    // it must be gauge-NEUTRAL on BOTH sides:
+                    // `remove_item_at` above decremented the global live
+                    // gauges and incremented the global dead gauges, while
+                    // the destination's header bumps do not touch either.
                     //
                     // Compensate PER ITEM, in the same block that recorded
                     // the relink, rather than batching a running total for
@@ -451,11 +472,13 @@ impl<'a> Segment<'a> {
                     // silently loses the compensation for every item
                     // already relocated by that call. Per-item leaves no
                     // pending state for an exit path to drop, and matches
-                    // `Segments::s3fifo_promote_from`. The cost is two
-                    // atomics on a path that already does four in
+                    // `Segments::s3fifo_promote_from`. The cost is four
+                    // atomics on a path that already does six in
                     // `remove_item_at`.
                     ITEM_CURRENT.increment();
                     ITEM_CURRENT_BYTES.add(item_size as _);
+                    ITEM_DEAD.decrement();
+                    ITEM_DEAD_BYTES.sub(item_size as _);
                 }
             } else {
                 drop(vguard);

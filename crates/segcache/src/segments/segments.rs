@@ -863,6 +863,21 @@ impl Segments {
         self.claim_for_drain(id)
     }
 
+    /// Test-only shim exposing the private `s3fifo_promote_from` (the second
+    /// relocation site, alongside `Segment::copy_into`), so
+    /// `dead_accounting_tests` can drive exactly one promotion and inspect the
+    /// source's counters instead of inferring them from an eviction storm.
+    #[cfg(test)]
+    #[allow(dead_code)] // caller is cfg'd out under loom
+    pub(crate) fn s3fifo_promote_from_for_test(
+        &self,
+        src_id: NonZeroU32,
+        dst_id: NonZeroU32,
+        hashtable: &MultiChoiceHashtable,
+    ) {
+        self.s3fifo_promote_from(src_id, dst_id, hashtable);
+    }
+
     /// Test-only shim exposing the private `finalize_drained` (sweep the
     /// segment's remaining hashtable entries, then recycle or condemn it),
     /// the completion half of `claim_for_drain_for_test`. Lets a test park a
@@ -961,6 +976,14 @@ impl Segments {
         if self.headers[id_idx].ref_count_seqcst() == 0
             && self.headers[id_idx].try_release_condemned()
         {
+            // Settle the accounting before the segment becomes reachable
+            // again, exactly as `recycle` and the last guard drop do: the
+            // won CAS makes us its sole owner, and a segment must not sit on
+            // the free queue carrying live residue or dead occupancy (issue
+            // #58 part 2). Idempotent, so the reserve-time reset still runs
+            // harmlessly.
+            self.headers[id_idx].reset_write_stats();
+
             self.return_segment(id.get());
 
             #[cfg(feature = "metrics")]
@@ -1902,6 +1925,12 @@ impl Segments {
                     drop(vguard);
                     if relinked {
                         src.remove_item_at(offset);
+                        // A promotion is not a death: take back the dead
+                        // charge `remove_item_at` just put on the source
+                        // (see `Segment::copy_into`). Unconditional, like
+                        // every other header counter — only the global gauge
+                        // mirror below is `metrics`-gated.
+                        src.decr_dead_item(item_size as i32);
                         dst.incr_live_items();
                         dst.incr_live_bytes(item_size as i32);
                         dst.set_write_offset(write_offset as i32 + item_size as i32);
@@ -1911,14 +1940,17 @@ impl Segments {
                             ITEM_RELINK.increment();
                             ITEM_COMPACTED.increment();
                             // A promotion MOVES an item, it does not kill
-                            // one, so it must be gauge-NEUTRAL: the
-                            // `remove_item_at` above already decremented the
-                            // global item gauges, while the destination's
-                            // header bumps do not touch them. Re-add here,
+                            // one, so it must be gauge-NEUTRAL on BOTH
+                            // sides: the `remove_item_at` above decremented
+                            // the global live gauges and incremented the
+                            // global dead gauges, while the destination's
+                            // header bumps do not touch either. Undo here,
                             // per item, exactly as `Segment::copy_into`
                             // does.
                             ITEM_CURRENT.increment();
                             ITEM_CURRENT_BYTES.add(item_size as _);
+                            ITEM_DEAD.decrement();
+                            ITEM_DEAD_BYTES.sub(item_size as _);
                         }
                     }
                 }

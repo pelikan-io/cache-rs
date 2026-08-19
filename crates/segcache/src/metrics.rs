@@ -198,21 +198,27 @@ pub static ITEM_CURRENT: Gauge = Gauge::new();
 )]
 pub static ITEM_CURRENT_BYTES: Gauge = Gauge::new();
 
-// `item_dead`/`item_dead_bytes` only ever grow: every site that retires an
-// item adds to them (`Segment::remove_item_at`, and the unpinned-unlink
-// residue reconciled by `SegmentHeader::reset_write_stats`), and nothing in
-// the crate subtracts. They are cumulative totals despite the `Gauge` type,
-// so describe them as such rather than as a current occupancy.
+// `item_dead`/`item_dead_bytes` are OCCUPANCY gauges: dead weight currently
+// sitting in segments, i.e. fragmentation. `Segment::remove_item_at` charges
+// a retired item's space to its segment (and to these gauges);
+// `SegmentHeader::reset_write_stats` reclaims the whole segment's charge when
+// it is recycled, re-reserved, or freed by the last reader of a condemned
+// segment. A RELOCATION (merge copy-out, S3-FIFO promotion) is neutral: the
+// item moved rather than died, so the site takes its charge straight back off.
+//
+// They are therefore NOT cumulative death totals, and they go down as well as
+// up. Rate/total consumers want `item_evict` + `item_expire` + `item_delete`
+// + `item_replace` instead.
 #[metric(
     name = "item_dead",
-    description = "cumulative number of items which have died",
+    description = "current number of dead items occupying space in segments",
     metadata = { engine = "segcache" }
 )]
 pub static ITEM_DEAD: Gauge = Gauge::new();
 
 #[metric(
     name = "item_dead_bytes",
-    description = "cumulative number of bytes for items which have died",
+    description = "current number of bytes held by dead items in segments",
     metadata = { engine = "segcache" }
 )]
 pub static ITEM_DEAD_BYTES: Gauge = Gauge::new();
