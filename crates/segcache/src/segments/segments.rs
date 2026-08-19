@@ -1885,6 +1885,15 @@ impl Segments {
                         {
                             ITEM_RELINK.increment();
                             ITEM_COMPACTED.increment();
+                            // A promotion MOVES an item, it does not kill
+                            // one, so it must be gauge-NEUTRAL: the
+                            // `remove_item_at` above already decremented the
+                            // global item gauges, while the destination's
+                            // header bumps do not touch them. Re-add here,
+                            // mirroring `Segment::copy_into`'s batch
+                            // compensation.
+                            ITEM_CURRENT.increment();
+                            ITEM_CURRENT_BYTES.add(item_size as _);
                         }
                     }
                 }

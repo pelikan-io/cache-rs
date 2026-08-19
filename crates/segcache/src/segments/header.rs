@@ -159,7 +159,10 @@ impl SegmentHeader {
     /// race, a reservation rollback), so the global item gauges are
     /// corrected by the residue. Exactly-once: the first reset zeroes the
     /// counters, so a second reset (recycle then try_reserve) subtracts
-    /// nothing.
+    /// nothing. The residue is also mirrored into the dead-item gauges,
+    /// exactly as `Segment::remove_item_at` does on the normal path, so an
+    /// item that dies via an unpinned unlink is accounted the same way as
+    /// one that dies normally.
     pub fn reset_write_stats(&self) {
         let initial_offset = if cfg!(feature = "integrity") {
             std::mem::size_of::<u64>() as i32
@@ -172,9 +175,11 @@ impl SegmentHeader {
             let leaked_bytes = self.live_bytes.load(Ordering::Relaxed) - initial_offset;
             if leaked_items > 0 {
                 crate::ITEM_CURRENT.sub(leaked_items as _);
+                crate::ITEM_DEAD.add(leaked_items as _);
             }
             if leaked_bytes > 0 {
                 crate::ITEM_CURRENT_BYTES.sub(leaked_bytes as _);
+                crate::ITEM_DEAD_BYTES.add(leaked_bytes as _);
             }
         }
         self.write_offset.store(initial_offset, Ordering::Relaxed);
