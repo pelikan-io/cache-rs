@@ -27,7 +27,35 @@ The tag is the low 4 bits of the segment header's existing `generation`, which i
 
 **Capacity:** 1,048,575 segments (from 16,777,215). At 1 MiB segments that is 1 TiB of heap; at the 8 MiB maximum, 8 TiB. Both are far above any current deployment, and `segment_size` remains the lever if more is needed. Construction asserts the configured segment count fits, so an oversized heap fails loudly at build time rather than silently aliasing.
 
-**Why 4 bits is sufficient, and why the argument does not depend on deployment churn:** the tag's unit is a *full segment lifecycle*, not an operation. A segment's generation advances only when it is reserved from the free queue, which requires it to have been filled, sealed, drained and recycled first. Aliasing therefore needs **16 complete fill-and-recycle cycles of one specific segment inside a single thread's stall window** — 16 MiB of writes targeted at that segment while one thread is descheduled — *on top of* the coincidences already required (same offset, same slot, matching tag bits in the packed word). Widening to 8 bits buys another factor of 16 against a term that is already the least likely in the product, at the cost of 16× the segment count.
+### Prerequisite: move the generation bump to reuse-of-a-used-segment
+
+**This design requires a change to when `generation` advances, and does not work without it.**
+
+Today `try_reserve` bumps on the `Free → Reserved` transition (`header.rs:303`). But `try_release` (`header.rs:309`) returns a `Reserved`/`Linking` segment straight back to `Free` with no fill, no seal, no drain and no recycle — and it is production-reachable from both chain-extension election-loser paths (`ttl_bucket.rs:353`, `:440`). So the cycle
+
+```
+Free → Reserved (generation++) → try_release → Free → Reserved (generation++) → …
+```
+
+costs nothing but a failed election, and under contended extension on one TTL bucket with a short free queue a specific id can round-trip in microseconds. The counter therefore advances at a rate **decoupled from segment lifecycles**.
+
+Those cycles do not themselves create alias states — an election loser is never written into, so no location ever points into it at that generation — but they *consume tag space*, which is what a 4-bit tag cannot afford.
+
+**Fix: bump when a segment that was actually used becomes reusable** — in `recycle()` and on the condemned free path — and not in `try_release`. That is precisely the event that invalidates previously-published locations, which is the only event the tag needs to track. Reusing a never-written segment without a bump is sound because nothing can hold a location into it.
+
+Verified against every production reader of `generation`, all of which keep their meaning:
+
+| Reader | Purpose | Under the change |
+|---|---|---|
+| `CasToken` (`cas.rs`, item #24) | detect that an item was replaced | recycle precedes reuse, so a stale token still mismatches |
+| `try_expand` H3 (`ttl_bucket.rs:353`, `:471`) | same-bucket ABA: tail recycled and reused as this bucket's tail | recycle still bumps before the segment can be re-linked |
+| `Segments::generation` (`segments.rs:293`) | `delete`'s pin-fail snapshot guard | unchanged; it asks "was this recycled under me" |
+
+An election-loser round trip is invisible to all three, because none of them can observe a segment that was never published into.
+
+**Why 4 bits is then sufficient, and why the argument does not depend on deployment churn:** with the bump tied to reuse-of-a-used-segment, the tag's unit really is a *full segment lifecycle* — fill, seal, drain, recycle. Aliasing needs **16 complete lifecycles of one specific segment inside a single thread's stall window** — on the order of 16 MiB of writes targeted at that segment while one thread is descheduled — *on top of* the coincidences already required (same offset, same slot, matching tag bits in the packed word). Widening to 8 bits buys another factor of 16 against a term that is already the least likely in the product, at the cost of 16× the segment count.
+
+This ordering matters for review: the bump change is a **prerequisite**, not an optimization. Landing the tag without it ships a 4-bit counter advancing on failed elections, which is the "looks right, only shrinks the window" outcome this project has repeatedly rejected.
 
 ### The mechanism is mostly free, because the tag rides inside the packed slot word
 
