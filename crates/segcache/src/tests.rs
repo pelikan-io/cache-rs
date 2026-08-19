@@ -557,7 +557,10 @@ fn can_evict_respects_ref_count() {
     assert!(!header.can_evict());
     header.set_state(State::Sealed);
 
-    assert!(header.try_acquire_reader());
+    assert_eq!(
+        header.try_acquire_reader(),
+        crate::segments::AcquireOutcome::Acquired
+    );
     assert!(!header.can_evict());
 
     header.release_reader();
@@ -570,8 +573,14 @@ fn reader_pin_acquire_release() {
 
     // acquisition succeeds in readable states and counts pins
     header.set_state(State::Live);
-    assert!(header.try_acquire_reader());
-    assert!(header.try_acquire_reader());
+    assert_eq!(
+        header.try_acquire_reader(),
+        crate::segments::AcquireOutcome::Acquired
+    );
+    assert_eq!(
+        header.try_acquire_reader(),
+        crate::segments::AcquireOutcome::Acquired
+    );
     assert_eq!(header.ref_count(), 2);
 
     header.release_reader();
@@ -580,11 +589,17 @@ fn reader_pin_acquire_release() {
 
     // acquisition fails in non-readable states and leaves no pin
     header.set_state(State::Draining);
-    assert!(!header.try_acquire_reader());
+    assert_ne!(
+        header.try_acquire_reader(),
+        crate::segments::AcquireOutcome::Acquired
+    );
     assert_eq!(header.ref_count(), 0);
 
     header.set_state(State::Free);
-    assert!(!header.try_acquire_reader());
+    assert_ne!(
+        header.try_acquire_reader(),
+        crate::segments::AcquireOutcome::Acquired
+    );
     assert_eq!(header.ref_count(), 0);
 }
 

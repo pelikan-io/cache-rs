@@ -19,7 +19,7 @@ mod eviction_concurrency_tests;
 pub(crate) use builder::SegmentsBuilder;
 pub(crate) use error::SegmentsError;
 pub(crate) use guard::SegmentGuard;
-pub(crate) use header::{SegmentHeader, SegmentPool};
+pub(crate) use header::{AcquireOutcome, SegmentHeader, SegmentPool};
 pub(crate) use remover_pin::RemoverPin;
 pub(crate) use segment::Segment;
 pub(crate) use segments::{AllocOutcome, ClearOutcome, Segments};

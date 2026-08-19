@@ -56,6 +56,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Live,
+            tag: 0,
         });
 
         assert!(h.try_pin_writer());

@@ -107,15 +107,17 @@ impl State {
 
     /// Check if the segment is readable (allows get operations).
     ///
-    /// Note: AwaitingRelease is readable so in-flight pinned readers can
-    /// complete; new reads cannot arrive because the hashtable is fully
-    /// drained before a segment is condemned.
+    /// AwaitingRelease is deliberately NOT readable. Draining the
+    /// hashtable before condemning stops new *lookups* from routing to a
+    /// segment, but a reader whose lookup preceded the drain still calls
+    /// `try_acquire_reader` afterwards, so a new *pin* can still arrive
+    /// after the condemn. Permitting it lets the reader count return to
+    /// non-zero after reaching zero, which no reference-count handoff can
+    /// survive: the last-reader drop frees the segment while that later
+    /// pin is live.
     #[inline]
     pub fn is_readable(self) -> bool {
-        matches!(
-            self,
-            State::Live | State::Sealed | State::Relinking | State::AwaitingRelease
-        )
+        matches!(self, State::Live | State::Sealed | State::Relinking)
     }
 
     /// Check if the segment is writable (allows append operations).
@@ -136,7 +138,7 @@ impl State {
 /// The packed layout in the `AtomicU64`:
 ///
 /// ```text
-/// bits 63..56  unused      (8)
+/// bits 63..56  tag         (8)  lifetime tag, see `cas_condemn`
 /// bits 55..48  state       (8)
 /// bits 47..24  prev        (24)  0 = none
 /// bits 23..0   next        (24)  0 = none
@@ -146,10 +148,17 @@ pub(crate) struct Metadata {
     pub next: Option<NonZeroU32>,
     pub prev: Option<NonZeroU32>,
     pub state: State,
+    /// Lifetime tag, meaningful only while AwaitingRelease (see `cas_condemn`).
+    pub tag: u8,
 }
 
 impl Metadata {
     const LINK_MASK: u64 = 0xFF_FFFF;
+
+    /// Bit position of the tag byte, which `SegmentHeader::cas_condemn`
+    /// uses to make the AwaitingRelease -> Free CAS token unique to one
+    /// use of a segment.
+    const TAG_SHIFT: u32 = 56;
 
     /// Create metadata for a fresh, unlinked segment.
     pub fn new_free() -> Self {
@@ -157,6 +166,7 @@ impl Metadata {
             next: None,
             prev: None,
             state: State::Free,
+            tag: 0,
         }
     }
 
@@ -167,7 +177,7 @@ impl Metadata {
         let prev = self.prev.map_or(0, NonZeroU32::get) as u64;
         debug_assert!(next <= Self::LINK_MASK, "segment id exceeds 24 bits");
         debug_assert!(prev <= Self::LINK_MASK, "segment id exceeds 24 bits");
-        ((self.state as u64) << 48) | (prev << 24) | next
+        ((self.tag as u64) << Self::TAG_SHIFT) | ((self.state as u64) << 48) | (prev << 24) | next
     }
 
     /// Unpack from the u64 representation.
@@ -177,6 +187,7 @@ impl Metadata {
             next: NonZeroU32::new((packed & Self::LINK_MASK) as u32),
             prev: NonZeroU32::new(((packed >> 24) & Self::LINK_MASK) as u32),
             state: State::from_u8(((packed >> 48) & 0xFF) as u8),
+            tag: ((packed >> Self::TAG_SHIFT) & 0xFF) as u8,
         }
     }
 }
@@ -214,10 +225,10 @@ mod tests {
     #[test]
     fn predicates() {
         use State::*;
-        for s in [Free, Reserved, Linking, Draining, Locked] {
+        for s in [Free, Reserved, Linking, Draining, Locked, AwaitingRelease] {
             assert!(!s.is_readable(), "{s:?} must not be readable");
         }
-        for s in [Live, Sealed, Relinking, AwaitingRelease] {
+        for s in [Live, Sealed, Relinking] {
             assert!(s.is_readable(), "{s:?} must be readable");
         }
         for s in [
@@ -256,16 +267,26 @@ mod tests {
                 next: NonZeroU32::new(1),
                 prev: None,
                 state: State::Live,
+                tag: 0,
             },
             Metadata {
                 next: NonZeroU32::new(0xFF_FFFF),
                 prev: NonZeroU32::new(0xFF_FFFE),
                 state: State::AwaitingRelease,
+                tag: 0,
             },
             Metadata {
                 next: None,
                 prev: NonZeroU32::new(42),
                 state: State::Sealed,
+                tag: 0,
+            },
+            /* a non-zero tag must survive alongside links */
+            Metadata {
+                next: NonZeroU32::new(7),
+                prev: NonZeroU32::new(9),
+                state: State::AwaitingRelease,
+                tag: 0xFF,
             },
         ];
         for m in cases {

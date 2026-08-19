@@ -20,7 +20,7 @@
 //! │        AtomicU32/32b        │            96 bit           │
 //! └───────────────────────────────────────────────────────────┘
 //!
-//! METADATA = [8 unused][8 state][24 prev][24 next] (see segments::state)
+//! METADATA = [8 tag][8 state][24 prev][24 next] (see segments::state)
 //! GEN = generation (AtomicU16)   PL = SegmentPool (AtomicU8)
 //! PD = 8-bit alignment pad before ACTIVE WRITERS (AtomicU32)
 //! Total: 512 bits = 64 bytes = 1 cache line
@@ -37,6 +37,20 @@ use crate::segments::state::{Metadata, State};
 use crate::sync::{AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use clocksource::coarse::{AtomicInstant, Duration, Instant};
 use core::num::NonZeroU32;
+
+/// Outcome of a reader-pin attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcquireOutcome {
+    /// A pin was taken; the caller owns it and must pair it with a guard.
+    Acquired,
+    /// The segment is not readable; no pin is held.
+    NotReadable,
+    /// The segment is not readable, and backing the pin out left a
+    /// condemned segment with no reader remaining to free it. This caller
+    /// won the AwaitingRelease -> Free transition and must return the
+    /// segment to the free queue.
+    ReleaseCondemned,
+}
 
 /// Which pool a segment belongs to (for S3-FIFO eviction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +243,7 @@ impl SegmentHeader {
             state: new_state,
             next: new_next.unwrap_or(meta.next),
             prev: new_prev.unwrap_or(meta.prev),
+            tag: meta.tag,
         };
         self.metadata
             .compare_exchange(current, new.pack(), success, Ordering::Acquire)
@@ -254,6 +269,7 @@ impl SegmentHeader {
                 state: meta.state,
                 next: new_next.unwrap_or(meta.next),
                 prev: new_prev.unwrap_or(meta.prev),
+                tag: meta.tag,
             };
             match self.metadata.compare_exchange(
                 current,
@@ -332,6 +348,11 @@ impl SegmentHeader {
     /// SeqCst: this participates in the release-side Dekker pair (guard
     /// drop decrements ref_count SeqCst, then loads the state; the
     /// condemner CASes to AwaitingRelease SeqCst, then loads ref_count).
+    /// Single-shot, with no retry: every writer of an AwaitingRelease word
+    /// changes the state, so a lost CAS means one of the three claimants
+    /// performed the free. Were an `update_links` against a condemned word
+    /// ever to become reachable, that same lost CAS would strand the segment
+    /// permanently, since nothing sweeps AwaitingRelease.
     pub fn try_release_condemned(&self) -> bool {
         let current = self.metadata.load(Ordering::SeqCst);
         if Metadata::unpack(current).state != State::AwaitingRelease {
@@ -341,6 +362,44 @@ impl SegmentHeader {
             state: State::Free,
             next: None,
             prev: None,
+            tag: 0,
+        };
+        self.metadata
+            .compare_exchange(current, new.pack(), Ordering::SeqCst, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Condemn a drained segment (Draining -> AwaitingRelease, links
+    /// cleared), stamping the low byte of the generation into the spare
+    /// high byte of the metadata word.
+    ///
+    /// Without the stamp the condemned word is the constant
+    /// `{AwaitingRelease, None, None}` for every use of every segment, so
+    /// the token `try_release_condemned` CASes on carries no lifetime
+    /// identity: a thread stalled between that load and its CAS can win
+    /// the transition against a *later* incarnation of the same segment
+    /// that still has live readers, freeing it under them and stealing its
+    /// handoff. `try_reserve` bumps the generation, so a stalled token no
+    /// longer matches once the segment has been recycled.
+    ///
+    /// The tag rides in `Metadata` so `pack`/`unpack` round-trip it:
+    /// `update_links` is a read-modify-write through `Metadata`, reachable
+    /// against an AwaitingRelease segment because `condemn` and `recycle`
+    /// both splice neighbours after their own transition.
+    ///
+    /// The tag is 8 bits, so it aliases every 256 uses of a given segment;
+    /// the residual is a thread stalled across that many full lifecycles
+    /// inside a three-instruction window.
+    pub fn cas_condemn(&self) -> bool {
+        let current = self.metadata.load(Ordering::Acquire);
+        if Metadata::unpack(current).state != State::Draining {
+            return false;
+        }
+        let new = Metadata {
+            state: State::AwaitingRelease,
+            next: None,
+            prev: None,
+            tag: (self.generation.load(Ordering::Relaxed) & 0xFF) as u8,
         };
         self.metadata
             .compare_exchange(current, new.pack(), Ordering::SeqCst, Ordering::Acquire)
@@ -366,9 +425,9 @@ impl SegmentHeader {
     /// paired with exactly one [`Self::release_reader`] (or a
     /// `SegmentGuard` drop).
     #[inline]
-    pub fn try_acquire_reader(&self) -> bool {
+    pub fn try_acquire_reader(&self) -> AcquireOutcome {
         if !self.metadata(Ordering::Acquire).state.is_readable() {
-            return false;
+            return AcquireOutcome::NotReadable;
         }
 
         // `SeqCst` on the increment and the re-check is load-bearing.
@@ -388,11 +447,19 @@ impl SegmentHeader {
         // Re-check after the increment: a writer that observed
         // ref_count == 0 may have transitioned the state concurrently.
         if !self.metadata(Ordering::SeqCst).state.is_readable() {
-            self.ref_count.fetch_sub(1, Ordering::Release);
-            return false;
+            // Back out. The decrement must use the same SeqCst handoff as
+            // a guard drop, not a plain release: a condemner that observed
+            // this transient pin has already deferred reclamation to "the
+            // last reader", and a plain decrement here would leave the
+            // segment in AwaitingRelease with no reader left to free it.
+            let prev = self.release_reader_for_guard();
+            if prev == 1 && self.try_release_condemned() {
+                return AcquireOutcome::ReleaseCondemned;
+            }
+            return AcquireOutcome::NotReadable;
         }
 
-        true
+        AcquireOutcome::Acquired
     }
 
     /// Release a reader pin taken with [`Self::try_acquire_reader`]
@@ -452,10 +519,11 @@ impl SegmentHeader {
         self.active_writers.fetch_add(1, Ordering::SeqCst);
         if !self.metadata(Ordering::SeqCst).state.is_writable() {
             // Backout uses Release, not SeqCst (the design spec's pseudocode
-            // writes SeqCst): this pin never became visible to a claimer that
-            // acted on it — the SeqCst re-check above just proved the segment
-            // left the writable state — so unwinding it needs no place in the
-            // SC total order. Mirrors `try_acquire_reader`'s backout.
+            // writes SeqCst): a claimer that counted this pin WAITS for it
+            // (claim_for_drain spins on active_writers) rather than acting on
+            // it and deferring a handoff, so unwinding needs no place in the
+            // SC total order. Readers differ, and their backout has to
+            // complete the handoff — see try_acquire_reader.
             self.active_writers.fetch_sub(1, Ordering::Release);
             return false;
         }
@@ -789,7 +857,7 @@ mod loom_tests {
                     let h = Arc::clone(&header);
                     let c = Arc::clone(&committed);
                     thread::spawn(move || {
-                        if h.try_acquire_reader() {
+                        if h.try_acquire_reader() == AcquireOutcome::Acquired {
                             // The strong invariant — a pinned reader
                             // never observes a committed drain — is the
                             // SC-total-order property loom cannot model
@@ -856,13 +924,7 @@ mod loom_tests {
                 let f = Arc::clone(&freed);
                 thread::spawn(move || {
                     // condemn (mirrors Segments::condemn)
-                    assert!(h.cas_metadata(
-                        State::Draining,
-                        State::AwaitingRelease,
-                        Some(None),
-                        Some(None),
-                        Ordering::SeqCst,
-                    ));
+                    assert!(h.cas_condemn());
                     // race fix: the pin may have dropped before the CAS
                     if h.ref_count_seqcst() == 0 && h.try_release_condemned() {
                         f.fetch_add(1, Ordering::SeqCst);
@@ -903,8 +965,8 @@ mod loom_tests {
     }
 
     // Acquisition must fail in every interleaving for non-readable
-    // states, leaving no pin behind — and AwaitingRelease must remain
-    // acquirable for in-flight readers.
+    // states, leaving no pin behind — AwaitingRelease included, so that
+    // no pin can arrive after a segment is condemned.
     #[test]
     fn loom_acquire_by_state() {
         loom::model(|| {
@@ -914,12 +976,12 @@ mod loom_tests {
                 (State::Free, false),
                 (State::Reserved, false),
                 (State::Draining, false),
-                (State::AwaitingRelease, true),
+                (State::AwaitingRelease, false),
             ] {
                 header.set_state(state);
                 let h = Arc::clone(&header);
                 let reader = thread::spawn(move || {
-                    if h.try_acquire_reader() {
+                    if h.try_acquire_reader() == AcquireOutcome::Acquired {
                         h.release_reader();
                         true
                     } else {
@@ -1260,6 +1322,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Live,
+            tag: 0,
         });
         assert!(h.try_pin_writer());
         assert_eq!(h.active_writers(), 1);
@@ -1278,6 +1341,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Sealed,
+            tag: 0,
         });
         assert!(!h.try_pin_writer());
         assert_eq!(h.active_writers(), 0);
@@ -1295,6 +1359,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Sealed,
+            tag: 0,
         });
         assert!(h.try_pin_remover());
         assert_eq!(h.active_removers(), 1);
@@ -1303,6 +1368,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Live,
+            tag: 0,
         });
         assert!(h.try_pin_remover());
         assert_eq!(h.active_removers(), 2);
@@ -1315,6 +1381,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Draining,
+            tag: 0,
         });
         assert!(!h.try_pin_remover());
         assert_eq!(h.active_removers(), 0);

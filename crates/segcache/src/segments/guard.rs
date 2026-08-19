@@ -12,8 +12,9 @@ use crate::segments::SegmentHeader;
 /// The guard completes that handoff: when the LAST pin drops on a
 /// condemned segment, the guard's drop transitions it AwaitingRelease ->
 /// Free and returns it to the free queue directly — no `&mut Segments`
-/// pass required. The transition CAS guarantees exactly-one-free between
-/// a racing last-guard drop and the condemner's recheck.
+/// pass required. The transition CAS guarantees exactly-one-free among the
+/// three claimants: a racing last-guard drop, the condemner's recheck, and
+/// the backout of an acquire that failed after its increment.
 ///
 /// Holds raw pointers rather than borrows so that the guard (and the
 /// [`crate::Item`] carrying it) is not lifetime-tied to the cache; this
@@ -28,8 +29,9 @@ impl SegmentGuard {
     ///
     /// # Safety
     ///
-    /// - `SegmentHeader::try_acquire_reader` must have returned `true`
-    ///   on `header`, and ownership of that pin transfers to this guard.
+    /// - `SegmentHeader::try_acquire_reader` must have returned
+    ///   `AcquireOutcome::Acquired` on `header`, and ownership of that pin
+    ///   transfers to this guard.
     /// - `header` must point into the `Segments` headers allocation and
     ///   `free_queue` at the `Segments`-owned boxed Injector; both must
     ///   outlive the guard.

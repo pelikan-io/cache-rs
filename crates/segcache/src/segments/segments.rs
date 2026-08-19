@@ -321,8 +321,21 @@ impl Segments {
         assert!(seg_id.get() <= self.cap);
         let header = &self.headers[seg_id.get() as usize - 1];
 
-        if !header.try_acquire_reader() {
-            return None;
+        match header.try_acquire_reader() {
+            super::AcquireOutcome::Acquired => {}
+            super::AcquireOutcome::NotReadable => return None,
+            super::AcquireOutcome::ReleaseCondemned => {
+                // Backing the pin out left a condemned segment with no
+                // reader remaining, and this caller won its release.
+                self.return_segment(seg_id.get());
+
+                #[cfg(feature = "metrics")]
+                {
+                    SEGMENT_RETURN.increment();
+                    SEGMENT_FREE.increment();
+                }
+                return None;
+            }
         }
         // SAFETY: the acquire above succeeded, and both `headers` (a
         // boxed slice owned by `self`) and the boxed Injector outlive
@@ -902,10 +915,11 @@ impl Segments {
 
     /// Condemn a drained, pinned segment: transition it to
     /// AwaitingRelease (chain-free) and hand reclamation to the last
-    /// reader's guard drop. The hashtable must already be fully drained —
-    /// that is what guarantees no NEW reader can pin an AwaitingRelease
-    /// segment (no hashtable location routes to it), even though the
-    /// state remains readable for in-flight pins.
+    /// reader's guard drop. AwaitingRelease is not readable, so the pins
+    /// handed off here are exactly those taken before this transition. The
+    /// hashtable must already be fully drained for a separate reason: a
+    /// reader whose pin now fails re-looks-up, and has to find nothing
+    /// rather than resolve back into this segment.
     ///
     /// Returns `Freed` if the race-fix recheck discovered the last
     /// reader already dropped (this caller then reclaimed the segment),
@@ -926,13 +940,7 @@ impl Segments {
         }
         self.headers[id_idx].set_pool(SegmentPool::Main);
 
-        let condemned = self.headers[id_idx].cas_metadata(
-            State::Draining,
-            State::AwaitingRelease,
-            Some(None),
-            Some(None),
-            Ordering::SeqCst,
-        );
+        let condemned = self.headers[id_idx].cas_condemn();
         debug_assert!(condemned, "condemned a segment that was not Draining");
 
         // Splice the neighbors using the captured links (this segment's

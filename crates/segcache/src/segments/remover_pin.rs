@@ -48,6 +48,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Sealed,
+            tag: 0,
         });
 
         assert!(h.try_pin_remover());
