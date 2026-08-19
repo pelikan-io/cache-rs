@@ -22,7 +22,10 @@
 //!    segment's live generation names an item that no longer exists.
 //!    `Segments::resolve` rejects it, and each consumer answers per the design's
 //!    policy table: a lookup treats it as a miss, `acquire_item_at` refuses the
-//!    pin, `remove_at` skips the decrement. None of them is an error path.
+//!    pin, `remove_at` skips the decrement, and `Segcache::replace_at` refuses
+//!    to address the item at all (rolling its reservation back and reporting
+//!    `Exists`, its ordinary lost-the-race answer). None of them is an error
+//!    path.
 
 use crate::*;
 use core::num::NonZeroU32;
@@ -497,6 +500,62 @@ fn stale_location_is_rejected_by_every_consumer() {
     assert!(
         cache.get(key_of(fresh_key).as_bytes()).is_none(),
         "a lookup resolving to a stale incarnation must report a miss"
+    );
+
+    // (5) `replace_at` — the cas / try_into_numeric publish path — refuses to
+    //     address the stale location, rolls its reservation back and reports
+    //     `Exists`.
+    //
+    //     Why this needs its own guard: `replace_at` takes a REMOVER PIN on the
+    //     old item's segment and then, on the cas path, builds a `RawItem` at
+    //     the location's offset to re-verify the caller's token under that pin.
+    //     The pin freezes the generation from the moment it is taken, but it
+    //     does not prove the segment it froze is the incarnation the location
+    //     names — and the presence check it does run (`get_item_frequency`)
+    //     matches on (tag, location) alone, so a slot still carrying a
+    //     stale-tagged location reports present. Without an explicit `resolve`
+    //     under the pin, the offset would be dereferenced inside a DIFFERENT
+    //     incarnation, where it need not even be an item boundary: a garbage
+    //     `is_numeric` bit reading true makes the seqlock acquire CAS a version
+    //     word into another incarnation's live payload.
+    //
+    //     The token passed in is exactly the one the publish path recomputes
+    //     (the stale location plus the segment's CURRENT generation), so the
+    //     token compare CANNOT be what rejects this call — only the incarnation
+    //     gate can. The stale entry planted in (4) is still in place, and the
+    //     bytes it addresses really are this key's, so the hashtable's own key
+    //     verification passes too.
+    let planted = cache
+        .hashtable
+        .lookup_slot(key_of(fresh_key).as_bytes(), &cache.segments.verifier())
+        .expect("the planted stale entry is still found by key bytes");
+    assert_eq!(
+        planted.0, stale_fresh,
+        "the planted stale location is what the publish path would be handed"
+    );
+    let generation = cache.segments.generation(seg);
+    let token = crate::cas::CasToken::new(stale_fresh, generation).as_raw();
+    assert_eq!(
+        cache.replace_at_for_test(
+            key_of(fresh_key).as_bytes(),
+            stale_fresh,
+            planted.1,
+            val_of(fresh_key).as_bytes(),
+            Some(token),
+        ),
+        Err(SegcacheError::Exists),
+        "a publish against a location from a previous incarnation must be refused"
+    );
+    assert_eq!(
+        cache.segments.generation(seg),
+        generation,
+        "the reservation must not have recycled the segment under the test \
+         (otherwise the rejection above proves nothing about the tag)"
+    );
+    assert_eq!(
+        location_of(&cache, key_of(fresh_key).as_bytes()),
+        Some(stale_fresh),
+        "a refused publish must leave the hashtable entry exactly as it found it"
     );
 
     // Restore the real entry; the key is readable again, proving the miss above

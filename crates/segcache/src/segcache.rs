@@ -815,7 +815,11 @@ impl Segcache {
         // can reclaim it AFTER the pin is released (see the drop-before-remove_at
         // invariant below), without borrowing `reserved`.
         let new_seg = reserved.seg();
-        let (old_seg_id, old_offset) = unpack_location(old_location);
+        // Only the segment id is taken from the raw unpack — it is all the pin
+        // below needs. The offset is deliberately NOT taken here: it is only
+        // addressable once the location's incarnation has been validated under
+        // the pin (see the `resolve` gate inside the loop).
+        let (old_seg_id, _) = unpack_location(old_location);
         let Some(old_seg_id) = NonZeroU32::new(old_seg_id) else {
             // invalid old location: roll back the (unpublished) reservation.
             self.rollback_reservation(reserved, new_location);
@@ -879,18 +883,50 @@ impl Segcache {
                 }
             };
 
+            // Incarnation gate, under the pin. A remover pin freezes the
+            // generation FROM THE MOMENT IT IS TAKEN; it does NOT prove the
+            // segment it froze is the incarnation `old_location` names. The
+            // segment could have been drained, recycled (generation bumped)
+            // and refilled between the caller's lookup and this pin, with the
+            // hashtable slot still carrying the stale-tagged `old_location` —
+            // `get_item_frequency` matches on (tag, location) alone and would
+            // happily report it present. `old_offset` would then be an offset
+            // into a DIFFERENT incarnation, not necessarily an item boundary
+            // at all, so the token re-verify below would build a `RawItem`
+            // over foreign bytes and read a garbage `is_numeric` bit — and if
+            // that bit read true, CAS a version word into another
+            // incarnation's live payload.
+            //
+            // `resolve` compares the location's tag against the (now frozen)
+            // generation, so a `Some` here holds for the rest of this
+            // iteration. `delete` gates its own `get_item_at`/`set_deleted`
+            // under its remover pin exactly the same way, and `remove_at`
+            // re-checks once more before decrementing. `None` is not an error:
+            // the entry no longer names anything we may touch, which is the
+            // same situation as losing the publish race — roll the
+            // (unpublished) reservation back and report `Exists`.
+            let Some((old_seg_id, old_offset)) = self.segments.resolve(old_location) else {
+                drop(pin);
+                self.rollback_reservation(reserved, new_location);
+                return Err(SegcacheError::Exists);
+            };
+
             // Token re-verify under the remover pin (cas path only; see the
             // doc comment). Ordering of the safety argument:
             //
             // 1. Location-uniqueness before touching item bytes: the entry
-            //    must still map key -> old_location. Under the pin the
-            //    segment cannot drain or recycle, and a drain must unlink
-            //    entries BEFORE its segment is recycled, so entry-present
-            //    implies a real item still starts at `old_offset`. (The ABA
-            //    where the same key was re-inserted at this exact location
-            //    after a full drain+recycle is a real item too — and the
-            //    recycle bumped the generation, which the token compare
-            //    below catches.)
+            //    must still map key -> old_location, AND `old_location` must
+            //    still name the pinned segment's current incarnation (the
+            //    `resolve` gate above — `get_item_frequency` matches on
+            //    (tag, location) alone, so it alone does not establish
+            //    this). Together with the frozen generation those give a real
+            //    item starting at `old_offset`: the segment cannot drain or
+            //    recycle under the pin, a drain must unlink entries BEFORE
+            //    its segment is recycled, and a location surviving from an
+            //    earlier incarnation was rejected above. (The ABA where the
+            //    same key was re-inserted at this exact location after a full
+            //    drain+recycle is a real item too — and the recycle bumped
+            //    the generation, which the token compare below catches.)
             // 2. For a numeric item, take its seqlock WRITER lock
             //    (`lock_numeric_version`) and hold it across the re-verify
             //    AND the slot CAS. In-place numeric writers serialize
@@ -1612,5 +1648,33 @@ impl Segcache {
     #[cfg(test)]
     pub(crate) fn segments_for_test(&self) -> &Segments {
         &self.segments
+    }
+
+    /// Test-only: reserve a fresh item and drive [`Self::replace_at`] against a
+    /// caller-supplied `old_location`/`old_slot`.
+    ///
+    /// The public `cas`/`try_into_numeric` entry points derive those two from a
+    /// lookup that pins the old item first, so they can only ever hand
+    /// `replace_at` a location that was live a moment ago; the state a
+    /// concurrent recycle produces — a slot still carrying a location whose
+    /// incarnation is already gone — is not constructible through them without
+    /// a real race. This hook plants that state directly so `replace_at`'s
+    /// incarnation gate can be tested deterministically.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn replace_at_for_test(
+        &self,
+        key: &[u8],
+        old_location: Location,
+        old_slot: SlotRef,
+        value: &[u8],
+        expected_token: Option<u64>,
+    ) -> Result<(), SegcacheError> {
+        let reserved = self.reserve_and_define(
+            key,
+            Value::Bytes(value),
+            &[],
+            Self::coarse_ttl(std::time::Duration::from_secs(3600)),
+        )?;
+        self.replace_at(key, old_location, old_slot, reserved, expected_token)
     }
 }
