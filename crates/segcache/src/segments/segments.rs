@@ -285,9 +285,12 @@ impl Segments {
         (header.create_at(), header.ttl())
     }
 
-    /// Returns the generation counter for a segment. Bumped each time the
-    /// segment is returned to the free queue, so CAS tokens built from it
-    /// are invalidated when the segment is recycled.
+    /// Returns the generation counter for a segment. Bumped once per
+    /// segment lifecycle, on the transition that ends a *used* incarnation
+    /// (`Draining -> Free` or the condemned `AwaitingRelease -> Free`), so
+    /// CAS tokens built from it are invalidated when the segment is
+    /// recycled. Returning a never-written segment (`release_unused`) does
+    /// not bump: no token can name it.
     #[inline]
     pub(crate) fn generation(&self, seg_id: NonZeroU32) -> u16 {
         self.header(seg_id).generation()
@@ -626,8 +629,10 @@ impl Segments {
     // ── Free queue ───────────────────────────────────────────────────
 
     /// Return a drained segment to the free queue. The segment must be in
-    /// the Draining state with no readers pinning it; its write statistics
-    /// are reset (and its generation bumped) at reserve time.
+    /// the Draining state with no readers pinning it. The `Draining ->
+    /// Free` transition bumps the generation (a used incarnation is
+    /// ending); the write statistics are reset here and again at reserve
+    /// time.
     pub(crate) fn recycle(&self, id: NonZeroU32) {
         let id_idx = id.get() as usize - 1;
         debug_assert_eq!(
@@ -662,13 +667,12 @@ impl Segments {
         // resets at its own free sites instead — see `reset_write_stats`.
         self.headers[id_idx].reset_write_stats();
 
-        let freed = self.headers[id_idx].cas_metadata(
-            State::Draining,
-            State::Free,
-            Some(None),
-            Some(None),
-            Ordering::AcqRel,
-        );
+        // Draining -> Free, which also bumps the generation: this is one of
+        // the two transitions that end a *used* incarnation (the other is
+        // the condemned `AwaitingRelease -> Free`). The bump lands before
+        // the `return_segment` below, so no reserver can take this id and
+        // begin publishing at the outgoing generation.
+        let freed = self.headers[id_idx].try_release_drained();
         debug_assert!(freed, "recycled a segment that was not Draining");
 
         self.return_segment(id.get());
@@ -681,8 +685,9 @@ impl Segments {
     }
 
     /// Reserve a segment from the free queue. Returns the id of a
-    /// segment in the Reserved state (statistics reset, generation
-    /// bumped), which must then be linked into a segment chain.
+    /// segment in the Reserved state (statistics reset), which must then
+    /// be linked into a segment chain. The generation it carries was set
+    /// by whichever transition ended the previous incarnation.
     pub(crate) fn reserve_free(&self) -> Option<NonZeroU32> {
         loop {
             match self.free_queue.steal() {
@@ -2707,6 +2712,117 @@ mod spare_tests {
              freed the segment without settling its accounting, so it reached \
              the free queue still charged"
         );
+    }
+}
+
+/// The generation counter must advance once per *segment lifecycle* — the
+/// unit the location tag (#50) is carved against — and not once per trip
+/// through the free queue. The two tests below pin the two halves of that:
+/// a segment handed back without ever being written into costs nothing,
+/// and a segment that was actually used costs exactly one.
+#[cfg(all(test, not(feature = "loom")))]
+mod generation_tests {
+    use super::*;
+    use crate::eviction::Policy;
+
+    const SEGMENT_SIZE: i32 = 4096;
+
+    /// A single-segment heap: with a non-Merge policy `spare_capacity` is
+    /// zero, so every return lands in the free queue and the one and only
+    /// id comes straight back out of `reserve_free`.
+    fn build_one_segment() -> Segments {
+        SegmentsBuilder::default()
+            .segment_size(SEGMENT_SIZE)
+            .heap_size(SEGMENT_SIZE as usize)
+            .eviction_policy(Policy::Fifo)
+            .build()
+            .expect("build segments")
+    }
+
+    // The chain-extension election loser (`ttl_bucket.rs`'s `try_expand`
+    // paths) reserves a segment, loses the seal CAS, and hands the segment
+    // straight back via `release_unused` — no fill, no seal, no drain, no
+    // recycle. Nothing was ever published into it, so no location can name
+    // it and no generation needs to be spent invalidating one. Under
+    // contention that round trip can repeat in microseconds, so charging it
+    // a generation would decouple the counter from segment lifecycles.
+    #[test]
+    fn election_loser_release_does_not_bump_generation() {
+        let segments = build_one_segment();
+
+        let id = segments
+            .reserve_free()
+            .expect("the free queue starts with the one segment");
+        let generation = segments.generation(id);
+
+        segments.release_unused(id);
+
+        let again = segments
+            .reserve_free()
+            .expect("the released segment must be reservable again");
+        assert_eq!(again, id, "a one-segment heap must hand back the same id");
+
+        assert_eq!(
+            segments.generation(again),
+            generation,
+            "reserve -> release_unused -> re-reserve must not consume a \
+             generation: the segment was never written into"
+        );
+    }
+
+    // The complement: a segment that was reserved, filled, sealed, drained
+    // and recycled has had locations published into it, so exactly one
+    // generation must be spent invalidating them. Measured at the same
+    // phase of consecutive lifecycles (before the reserve), so the
+    // assertion is about the lifecycle, not about which transition carries
+    // the bump.
+    #[test]
+    fn used_segment_recycle_bumps_generation() {
+        let segments = build_one_segment();
+        let seg = NonZeroU32::new(1).unwrap();
+
+        for cycle in 0..3u16 {
+            let before = segments.generation(seg);
+            assert_eq!(before, cycle, "one generation consumed per lifecycle");
+
+            let id = segments.reserve_free().expect("segment must be reservable");
+            assert_eq!(id, seg);
+
+            // Fill: a real space reservation plus the live-item accounting a
+            // published item would leave behind, so `recycle`'s reset has
+            // something to reset.
+            let header = segments.header(id);
+            header
+                .try_reserve_space(64, SEGMENT_SIZE)
+                .expect("segment must have room");
+            header.incr_live_items();
+            header.incr_live_bytes(64);
+
+            // Reserved -> Live (published as the write tail) -> Sealed.
+            header.set_state(State::Live);
+            header.set_state(State::Sealed);
+            assert_eq!(
+                segments.generation(id),
+                before,
+                "filling and sealing must not touch the generation"
+            );
+
+            // Sealed -> Draining, then Draining -> Free.
+            assert!(segments.claim_for_drain(id), "drain claim must win");
+            assert_eq!(
+                segments.generation(id),
+                before,
+                "claiming for drain must not touch the generation"
+            );
+            segments.recycle(id);
+
+            assert_eq!(
+                segments.generation(id),
+                before + 1,
+                "a full fill/seal/drain/recycle lifecycle must bump exactly once"
+            );
+            assert_eq!(segments.header(id).state(), State::Free);
+        }
     }
 }
 

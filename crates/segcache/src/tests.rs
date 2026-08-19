@@ -23,18 +23,48 @@ fn sizes() {
     assert_eq!(std::mem::size_of::<TtlBuckets>(), 24);
 }
 
+// The generation is spent by the transitions that end a *used*
+// incarnation, so CAS tokens from a previous use of the segment can never
+// match again. Reserving does not spend one, and neither does handing back
+// a segment that was never written into.
 #[test]
-fn segment_header_generation_bumps_on_reserve() {
+fn segment_header_generation_bumps_when_used_incarnation_ends() {
+    use crate::segments::state::State;
+
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
     assert_eq!(header.generation(), 0);
 
-    // every Free -> Reserved reservation bumps the generation, so CAS
-    // tokens from a previous use of the segment can never match again
+    // Free -> Reserved: no bump.
     assert!(header.try_reserve());
+    assert_eq!(header.generation(), 0);
+
+    // Reserved -> Free (the chain-extension election loser): still no
+    // bump — nothing was ever published into this incarnation.
+    assert!(header.try_release());
+    assert_eq!(header.generation(), 0);
+
+    // A full use: reserve, run it up to Draining, then Draining -> Free.
+    assert!(header.try_reserve());
+    header.set_state(State::Draining);
+    assert_eq!(header.generation(), 0);
+    assert!(header.try_release_drained());
+    assert_eq!(header.state(), State::Free);
     assert_eq!(header.generation(), 1);
 
-    assert!(header.try_release());
+    // The reader-pinned variant of the same event: AwaitingRelease -> Free
+    // bumps too, which is what covers the guard-drop free that never
+    // passes through `Segments::recycle`.
     assert!(header.try_reserve());
+    header.set_state(State::AwaitingRelease);
+    assert_eq!(header.generation(), 1);
+    assert!(header.try_release_condemned());
+    assert_eq!(header.state(), State::Free);
+    assert_eq!(header.generation(), 2);
+
+    // Losing the release CAS must not bump: only the winner does, which is
+    // what keeps the condemned handoff exactly-one-free *and* exactly-one-bump.
+    assert!(!header.try_release_condemned());
+    assert!(!header.try_release_drained());
     assert_eq!(header.generation(), 2);
 }
 

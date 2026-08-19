@@ -150,7 +150,7 @@ impl SegmentPool {
 /// 24       4    ttl           (AtomicU32, seconds)
 /// 28       4    ref_count     (AtomicU32, active readers)
 /// 32       8    metadata      (AtomicU64: state + prev + next)
-/// 40       2    generation    (AtomicU16, bumped on reserve)
+/// 40       2    generation    (AtomicU16, bumped when a used incarnation ends)
 /// 42       1    pool          (AtomicU8, SegmentPool)
 /// 43       1    (implicit alignment pad before active_writers)
 /// 44       4    active_writers (AtomicU32, in-flight reserve/write pins)
@@ -305,8 +305,12 @@ impl SegmentHeader {
         self.live_items.store(0, Ordering::Relaxed);
     }
 
-    /// Get the generation counter. Incremented each time the segment is
-    /// reserved from the free queue; wraps at `u16::MAX`.
+    /// Get the generation counter. Incremented once per segment
+    /// *lifecycle*: on the transition that ends a used incarnation
+    /// (`Draining -> Free` via [`Self::try_release_drained`], or
+    /// `AwaitingRelease -> Free` via [`Self::try_release_condemned`]), and
+    /// never on reserve or on the never-written release
+    /// ([`Self::try_release`]). Wraps at `u16::MAX`.
     #[inline]
     pub fn generation(&self) -> u16 {
         self.generation.load(Ordering::Relaxed)
@@ -389,10 +393,15 @@ impl SegmentHeader {
 
     /// Reserve a Free segment for reuse (Free -> Reserved, links cleared).
     ///
-    /// On success, resets the write statistics, stamps creation/merge
-    /// times, and bumps the generation counter so that CAS tokens issued
-    /// against the previous use of this segment can never match items
-    /// written after it is recycled.
+    /// On success, resets the write statistics and stamps creation/merge
+    /// times. It deliberately does NOT bump the generation: the counter
+    /// advances when a *used* incarnation ends (see
+    /// [`Self::try_release_drained`] and [`Self::try_release_condemned`]),
+    /// which already happened before this segment could reach the free
+    /// queue. Bumping here as well would double-count, and — because
+    /// [`Self::try_release`] returns a never-written segment straight back
+    /// to Free — would also charge a generation to every chain-extension
+    /// election loser, decoupling the counter from segment lifecycles.
     pub fn try_reserve(&self) -> bool {
         if !self.cas_metadata(
             State::Free,
@@ -422,12 +431,20 @@ impl SegmentHeader {
         self.reset_write_stats();
         self.mark_created();
         self.mark_merged();
-        self.generation.fetch_add(1, Ordering::Relaxed);
         true
     }
 
     /// Return an unused segment to Free (Reserved|Linking -> Free).
-    /// Used by allocation error paths before a segment becomes visible.
+    /// Used by the chain-extension election-loser paths and allocation
+    /// error paths, before a segment becomes visible.
+    ///
+    /// **The deliberate non-bumping exception.** Unlike the other two
+    /// release transitions ([`Self::try_release_drained`] and
+    /// [`Self::try_release_condemned`]) this one does NOT advance the
+    /// generation, because the incarnation it ends was never written into:
+    /// no location was ever published naming it, so there is nothing for a
+    /// new generation to invalidate. The distinct name and distinct source
+    /// states are what make the exception visible at the call site.
     pub fn try_release(&self) -> bool {
         self.cas_metadata(
             State::Reserved,
@@ -444,6 +461,33 @@ impl SegmentHeader {
         )
     }
 
+    /// Free a fully drained, unpinned segment (Draining -> Free, links
+    /// cleared). Called by `Segments::recycle`, which owns the segment
+    /// exclusively by virtue of the `Draining` claim.
+    ///
+    /// One of the two transitions that end a *used* incarnation, so it
+    /// **bumps the generation** on success; the other is
+    /// [`Self::try_release_condemned`] (the reader-pinned variant of the
+    /// same event). Every location published into this incarnation becomes
+    /// stale here, and the bump is what a holder of one can detect.
+    ///
+    /// The bump lands after the CAS but before the caller can return the
+    /// id to a queue, so no reserver can win this segment and start
+    /// publishing at the old generation.
+    pub fn try_release_drained(&self) -> bool {
+        if !self.cas_metadata(
+            State::Draining,
+            State::Free,
+            Some(None),
+            Some(None),
+            Ordering::AcqRel,
+        ) {
+            return false;
+        }
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     /// Try to free a condemned segment (AwaitingRelease -> Free).
     ///
     /// Returns true iff this caller won the transition — the CAS
@@ -453,6 +497,16 @@ impl SegmentHeader {
     /// increment. The caller that wins owns the segment until it pushes
     /// it, and must both settle its accounting (`reset_write_stats`) and
     /// return it to the free queue.
+    ///
+    /// The second of the two transitions that end a *used* incarnation
+    /// (see [`Self::try_release_drained`]), so it **bumps the generation**
+    /// on success. That single line covers all three condemned-free paths
+    /// — the last reader's guard drop (`guard.rs`), `Segments::condemn`'s
+    /// race-fix recheck, and #63's in-flight `ReleaseCondemned` arm —
+    /// because every one of them reaches Free through this transition and
+    /// the CAS admits exactly one winner. Putting the bump in the queue
+    /// helper instead would miss the guard drop, which holds only a raw
+    /// free-queue pointer and pushes to it directly.
     ///
     /// SeqCst: this participates in the release-side Dekker pair (guard
     /// drop decrements ref_count SeqCst, then loads the state; the
@@ -473,9 +527,15 @@ impl SegmentHeader {
             prev: None,
             tag: 0,
         };
-        self.metadata
+        if self
+            .metadata
             .compare_exchange(current, new.pack(), Ordering::SeqCst, Ordering::Acquire)
-            .is_ok()
+            .is_err()
+        {
+            return false;
+        }
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Condemn a drained segment (Draining -> AwaitingRelease, links
@@ -488,8 +548,13 @@ impl SegmentHeader {
     /// identity: a thread stalled between that load and its CAS can win
     /// the transition against a *later* incarnation of the same segment
     /// that still has live readers, freeing it under them and stealing its
-    /// handoff. `try_reserve` bumps the generation, so a stalled token no
-    /// longer matches once the segment has been recycled.
+    /// handoff. The generation advances on every transition that ends a
+    /// *used* incarnation ([`Self::try_release_drained`] and
+    /// [`Self::try_release_condemned`]), so the stamp read here is constant
+    /// for the whole of one incarnation — the `Draining` claim this CAS
+    /// consumes is what blocks both of those — and differs from the stamp of
+    /// the next one. A stalled token therefore no longer matches once the
+    /// segment has been recycled.
     ///
     /// The tag rides in `Metadata` so `pack`/`unpack` round-trip it:
     /// `update_links` is a read-modify-write through `Metadata`, reachable
