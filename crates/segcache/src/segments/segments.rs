@@ -2248,7 +2248,6 @@ mod spare_tests {
     // tests. Uses test-only accessors, so it is gated with the module.
     #[test]
     fn merge_evict_fallback_drop_fixes_head_on_condemned_segment() {
-        use crate::sync::Ordering;
         use crate::Segcache;
         use core::num::NonZeroU32;
         use std::time::Duration;
@@ -2353,6 +2352,146 @@ mod spare_tests {
             free_before + 1,
             "no leak: the condemned segment returns to the pool"
         );
+    }
+
+    // ISSUE #64, DEFECT 1 — deterministic reproduction.
+    //
+    // `AwaitingRelease` is readable, so a reader that resolved a location
+    // BEFORE the drain and then stalled can take a NEW pin after the
+    // condemn. The reader count therefore returns to non-zero after
+    // reaching zero, and the last reader's guard drop — which decided it
+    // was last from `prev == 1` before the new pin landed — frees the
+    // segment out from under that live pin.
+    //
+    // The interleaving is driven by hand rather than by threads: the guard
+    // drop is exactly `release_reader_for_guard()` followed by
+    // `try_release_condemned()`, so leaking the Item with `mem::forget`
+    // and calling those two halves separately places the stalled reader's
+    // pin precisely in the gap between them. No scheduler involved.
+    #[test]
+    fn condemned_segment_is_freed_under_a_live_reader_pin() {
+        use crate::sync::Ordering;
+        use crate::Segcache;
+        use core::num::NonZeroU32;
+        use std::time::Duration;
+
+        const ITEMS_PER_SEGMENT: usize = 4;
+        const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
+        let value: &[u8] = b"x";
+        let item_size = keyvalue::item_size(KEY_LEN, &Value::Bytes(value), 0);
+        let magic_overhead: usize = if cfg!(feature = "integrity") { 8 } else { 0 };
+        let segment_size = (magic_overhead + item_size * ITEMS_PER_SEGMENT) as i32;
+        let total_segments = 5usize;
+
+        let cache = Segcache::builder()
+            .segment_size(segment_size)
+            .heap_size(segment_size as usize * total_segments)
+            .hash_power(16)
+            .eviction(Policy::Merge {
+                max: 8,
+                merge: 4,
+                compact: 0,
+            })
+            .build()
+            .expect("failed to create cache");
+
+        let ttl = Duration::from_secs(3600);
+        for i in 0..10 {
+            let key = format!("k{i:06}");
+            assert_eq!(key.len(), KEY_LEN);
+            cache
+                .insert(key.as_bytes(), value, None, ttl)
+                .expect("fill inserts must succeed");
+        }
+
+        // Segment 1 is the held-back merge spare; segment 2 is the chain
+        // head and holds the first key.
+        let head = NonZeroU32::new(2).unwrap();
+        assert_eq!(cache.segments.header(head).state(), State::Sealed);
+
+        // Reader B's stalled lookup: it has already resolved `k000000` to
+        // (head, first-item offset) and has NOT yet called
+        // `acquire_item_at`. This is the location it will pin with.
+        let stalled_offset = magic_overhead;
+
+        // Reader A holds a live pin via the Item's SegmentGuard.
+        let a = cache.get(b"k000000").expect("head item must resolve");
+        assert_eq!(a.value(), b"x");
+        assert_eq!(cache.segments.header(head).ref_count(), 1);
+
+        // Drain and condemn the head while A pins it.
+        assert!(cache.segments.claim_for_drain_for_test(head));
+        assert_eq!(
+            cache
+                .segments
+                .finalize_drained_for_test(head, &cache.hashtable),
+            ClearOutcome::Deferred,
+            "a pinned segment must be condemned, not recycled"
+        );
+        assert_eq!(
+            cache.segments.header(head).state(),
+            State::AwaitingRelease
+        );
+        // The hashtable is fully drained: no NEW lookup can route here.
+        assert!(cache.get(b"k000000").is_none());
+
+        // --- A's guard drop, phase 1: the SeqCst decrement. Count -> 0.
+        std::mem::forget(a);
+        let prev = cache.segments.header(head).release_reader_for_guard();
+        assert_eq!(prev, 1, "A must observe itself as the last reader");
+        assert_eq!(cache.segments.header(head).ref_count(), 0);
+
+        // --- B resumes HERE, in the gap between A's decrement and A's
+        // release CAS, and pins with its pre-drain location.
+        let pinned = cache.segments.acquire_item_at(head, stalled_offset);
+        let b_pinned = pinned.is_some();
+        eprintln!(
+            "B's post-condemn pin: {} (ref_count now {})",
+            if b_pinned { "SUCCEEDED" } else { "failed" },
+            cache.segments.header(head).ref_count()
+        );
+
+        // --- A's guard drop, phase 2: the release CAS.
+        let won = cache.segments.header(head).try_release_condemned();
+        assert!(won, "A wins the AwaitingRelease -> Free transition");
+        assert_eq!(cache.segments.header(head).state(), State::Free);
+        eprintln!(
+            "after A's release CAS: state={:?} ref_count={}",
+            cache.segments.header(head).state(),
+            cache.segments.header(head).ref_count()
+        );
+
+        // The next incarnation: reserve the segment back out of the pool
+        // while B's pin is still outstanding. (The free queue is FIFO, so
+        // pull until this id comes back around.)
+        cache.segments.free_queue.push(head.get());
+        let mut reused = None;
+        for _ in 0..16 {
+            match cache.segments.reserve_free() {
+                Some(id) if id == head => {
+                    reused = Some(id);
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        let reused = reused.expect("the freed segment must be reservable again");
+        let phantom = cache.segments.header(reused).ref_count();
+        eprintln!(
+            "next incarnation of segment {reused}: state={:?} ref_count={phantom}",
+            cache.segments.header(reused).state(),
+        );
+
+        assert!(
+            !b_pinned,
+            "a NEW reader pin must not succeed on a condemned segment"
+        );
+        assert_eq!(
+            phantom, 0,
+            "the next incarnation must not inherit a phantom reader count"
+        );
+        drop(pinned);
     }
 }
 
