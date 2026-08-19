@@ -7,16 +7,13 @@ pub const HEADER_SIZE: usize = 12;
 pub const FLAG_CHAIN_ROOT: u16 = 0b1;
 const KNOWN_FLAGS: u16 = FLAG_CHAIN_ROOT;
 
-/// Type of data stored in a ziplist block.
+/// Logical collection type of a block. Fixed at creation; blocks are never
+/// converted between types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
-    /// List type
     List = 0,
-    /// Hash type
     Hash = 1,
-    /// Set type
     Set = 2,
-    /// Sorted set type
     Zset = 3,
 }
 
@@ -37,15 +34,16 @@ impl TryFrom<u8> for Type {
 /// Block header containing type, format, flags, entry count, and tail offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHeader {
-    /// The type of data in this block
     pub type_: Type,
-    /// Format version for this type
+    /// Type-owned format byte; `0` = the type's canonical v1 layout.
     pub format: u8,
-    /// Flags (e.g., chain root indicator)
+    /// Orthogonal flag bits; bit 0 = chain-root ([`FLAG_CHAIN_ROOT`]),
+    /// reserved. All other bits must be zero.
     pub flags: u16,
-    /// Number of entries in this block
     pub nentry: u32,
-    /// Offset to the end of the block (tail)
+    /// Offset of the *last entry's first byte*; [`HEADER_SIZE`] when the
+    /// block is empty. Not the end of the block — used length is
+    /// `tail_off` plus the last entry's encoded length.
     pub tail_off: u32,
 }
 

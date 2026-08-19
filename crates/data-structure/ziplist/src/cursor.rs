@@ -42,14 +42,8 @@ impl Cursor {
     /// Returns a cursor to the first entry in the block, or `None` if the
     /// block is empty.
     ///
-    /// # Preconditions
-    ///
-    /// `buf` MUST be sliced to the block's *used* length — header plus
-    /// entries, ending exactly at the end of the entry at `hdr.tail_off` —
-    /// never the full capacity of a larger backing buffer. Bytes beyond
-    /// the used length are not part of this walk's contract; see the
-    /// [module docs](self) for why passing an over-long `buf` is unsafe
-    /// for correctness (though not memory-unsafe).
+    /// `buf` MUST be sliced to the block's used length, never the backing
+    /// buffer's full capacity (see the [module docs](self)).
     pub fn first(buf: &[u8], hdr: &BlockHeader) -> Option<Cursor> {
         if hdr.nentry == 0 {
             return None;
@@ -60,10 +54,8 @@ impl Cursor {
     /// Returns a cursor to the last entry in the block, or `None` if the
     /// block is empty.
     ///
-    /// # Preconditions
-    ///
-    /// Same as [`Cursor::first`]: `buf` MUST be sliced to the block's used
-    /// length, not the backing buffer's full capacity.
+    /// `buf` MUST be sliced to the block's used length (see the
+    /// [module docs](self)).
     pub fn last(buf: &[u8], hdr: &BlockHeader) -> Option<Cursor> {
         if hdr.nentry == 0 {
             return None;
@@ -82,21 +74,10 @@ impl Cursor {
     /// Returns a cursor to the entry following this one, or `None` if this
     /// is the last entry.
     ///
-    /// # Preconditions
-    ///
-    /// `buf` MUST be sliced to the block's used length (through the end of
-    /// the entry at `hdr.tail_off`), never a larger backing capacity. This
-    /// method has no `hdr` parameter, so it cannot compare against
-    /// `tail_off` itself: "no next entry" is detected only by `decode`
-    /// failing at `off + len`, which happens when that offset runs past
-    /// `buf`'s end, or lands on bytes that don't decode as a valid entry
-    /// (e.g. zero padding). If `buf` extends past the block's real content
-    /// and happens to contain bytes there that decode successfully (stale
-    /// or planted entry bytes, as a `BlockMut`'s backing buffer may have
-    /// after a shrinking op), `next` cannot tell the difference and will
-    /// return that stale entry instead of `None`. Callers MUST slice `buf`
-    /// to the block's used length before walking, to keep this
-    /// method's "one past the tail" contract truthful.
+    /// `buf` MUST be sliced to the block's used length — with no `hdr`
+    /// parameter, "one past the tail is `None`" holds only because `decode`
+    /// fails at `buf`'s end, and an over-long `buf` can return a stale
+    /// entry instead (see the [module docs](self)).
     pub fn next(&self, buf: &[u8]) -> Option<Cursor> {
         let next_off = self.off.checked_add(self.len)?;
         Self::at(buf, next_off)
@@ -105,14 +86,9 @@ impl Cursor {
     /// Returns a cursor to the entry preceding this one, or `None` if this
     /// is the first entry.
     ///
-    /// # Preconditions
-    ///
-    /// `buf` MUST be sliced to the block's used length, same as
-    /// [`Cursor::first`]/[`Cursor::next`]. Unlike `next`, `prev` does take
-    /// `hdr` and defensively checks `self.off` against `hdr.tail_off`, but
-    /// that only guards against a cursor positioned past the declared
-    /// tail — it does not, and cannot, validate that `buf` itself was
-    /// sliced correctly.
+    /// `buf` MUST be sliced to the block's used length (see the
+    /// [module docs](self)); the `tail_off` check here guards a misplaced
+    /// cursor, not a mis-sliced `buf`.
     pub fn prev(&self, buf: &[u8], hdr: &BlockHeader) -> Option<Cursor> {
         if self.off <= HEADER_SIZE || self.off as u32 > hdr.tail_off {
             return None;
@@ -135,13 +111,8 @@ impl Cursor {
 /// Returns an error if `idx >= hdr.nentry`, or if the walk encounters a
 /// corrupt or truncated entry along the way.
 ///
-/// # Preconditions
-///
-/// `buf` MUST be sliced to the block's used length, same as
-/// [`Cursor::first`]/[`Cursor::next`]/[`Cursor::prev`] — see the
-/// [module docs](self). Because `locate` may walk forward via
-/// `Cursor::next`, an over-long `buf` can make it return a cursor onto
-/// stale bytes past the real tail instead of an error.
+/// `buf` MUST be sliced to the block's used length (see the
+/// [module docs](self)).
 pub fn locate(buf: &[u8], hdr: &BlockHeader, idx: u32) -> Result<Cursor, DecodeError> {
     if idx >= hdr.nentry {
         return Err(DecodeError::Corrupt);

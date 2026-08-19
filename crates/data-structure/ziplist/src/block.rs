@@ -104,7 +104,9 @@ impl<'a> Block<'a> {
 /// Where to insert a new entry relative to an existing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertPos {
-    /// Insert immediately before the entry the cursor points at.
+    /// Insert immediately before the entry the cursor points at. The
+    /// cursor MUST come from the block's current state (see
+    /// [`BlockMut`]'s docs).
     Before(Cursor),
     /// Insert after the last entry (or as the only entry, if empty).
     Tail,
@@ -113,6 +115,11 @@ pub enum InsertPos {
 /// A validated, mutable view over a ziplist block backed by a fixed-size
 /// buffer. The buffer's length is the block's capacity; `used_len()` is how
 /// much of it is currently occupied by the header and entries.
+///
+/// Every mutation shifts offsets: a [`Cursor`] obtained before a mutation
+/// MUST NOT be passed to any later op — re-derive cursors from the current
+/// state. A stale cursor's offsets are not detected and can splice at the
+/// wrong position or panic on an out-of-range `copy_within`.
 #[derive(Debug)]
 pub struct BlockMut<'a> {
     buf: &'a mut [u8],
@@ -167,7 +174,8 @@ impl<'a> BlockMut<'a> {
     }
 
     /// Removes the entry at `cur`. Removal always fits (it can only shrink
-    /// the block), so this cannot fail.
+    /// the block), so this cannot fail. `cur` MUST come from the block's
+    /// current state (see the type docs).
     pub fn remove_at(&mut self, cur: Cursor) -> Fit {
         self.splice(cur.off, cur.len, None)
             .expect("removal cannot need more bytes than it frees")
@@ -175,6 +183,7 @@ impl<'a> BlockMut<'a> {
 
     /// Replaces the entry at `cur` with `val`. On failure, returns the
     /// exact total block length needed and leaves the buffer unmodified.
+    /// `cur` MUST come from the block's current state (see the type docs).
     pub fn replace_at(&mut self, cur: Cursor, val: &EntryVal) -> Result<Fit, NeedBytes> {
         self.splice(cur.off, cur.len, Some(val))
     }

@@ -2,7 +2,7 @@
 //!
 //! A list's body is just the block's entry sequence in list order (index 0
 //! at the head, `nentry - 1` at the tail); no extra pairing or sort
-//! convention is layered on top the way `hash`/`set`/`zset` will need.
+//! convention is layered on top the way `hash`/`set`/`zset` do.
 //! `index`/`range`/`trim` implement Redis's inclusive, negative-from-tail
 //! index semantics: `i < 0` normalizes to `i + nentry` before use, and an
 //! out-of-range `index` is `Ok(None)` rather than an error.
@@ -21,27 +21,17 @@
 //!
 //! # `pop_front`/`pop_back` take a callback, not a plain return
 //!
-//! A naive `pop_front(&mut self) -> Option<EntryVal>` can't be implemented
-//! soundly here: `EntryVal::Str` borrows the block's backing bytes, but
-//! removing the entry (`BlockMut::remove_at`) memmoves those same bytes
-//! (`copy_within`), so any borrow of the popped entry's bytes must end
-//! *before* the removal — yet the value has to be read *before* removal
-//! too, since removal is what invalidates it. `forbid(unsafe_code)` and
-//! `no_std` (no allocation to copy the bytes into) rule out the usual
-//! escapes. A callback resolves this cleanly and with zero copies: the
-//! popped `EntryVal` is handed to `f` while the borrow is still valid, and
-//! only once `f` returns (and its borrow has ended) does the actual
-//! `remove_at` run.
+//! A plain `pop_front(&mut self) -> Option<EntryVal>` cannot compile here:
+//! `EntryVal::Str` borrows the block's backing bytes, and the removal's
+//! memmove invalidates that borrow — but the value must be read before the
+//! removal, and `forbid(unsafe_code)` + `no_std` leave no copy to hand out
+//! instead. The callback keeps it zero-copy: `f` sees the `EntryVal` while
+//! its borrow is valid, and `remove_at` runs only after `f` returns.
 //!
-//! `f` returns an owned `R`, not `()`: because the `EntryVal` parameter's
-//! lifetime can't be tied to anything that survives the call (it's
-//! necessarily elided/higher-ranked), a callback that returns nothing
-//! would leave the caller unable to extract *anything* derived from the
-//! value — not even an owned `u64` copied out of `EntryVal::Uint` — since
-//! the closure body is the only place that lifetime is ever nameable.
-//! Letting `f` return `R` (e.g. a copied `u64`, or `()` after writing the
-//! bytes somewhere inside the closure, such as a protocol response buffer)
-//! is what makes the callback actually usable.
+//! `f` returns an owned `R` because the whole `EntryVal` (carrying its
+//! higher-ranked lifetime) cannot be assigned out of the closure; deriving
+//! an owned result inside the closure and returning it is the ergonomic
+//! escape (a copied `u64`, or `()` after encoding into a response buffer).
 
 use crate::block::{Block, BlockMut, InsertPos};
 use crate::cursor::{locate, Cursor};

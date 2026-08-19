@@ -6,6 +6,11 @@
 //! This crate provides encoding and decoding facilities for ziplist blocks,
 //! a compact binary format for storing collections (lists, hashes, sets,
 //! sorted sets) with minimal memory overhead.
+//!
+//! The normative format reference — block layout, entry tag tiers, backlen
+//! encoding, per-type body conventions, and the format-evolution rule — is
+//! `docs/ziplist.md` at the repository root; the byte layouts it freezes
+//! are pinned by `tests/golden.rs`.
 
 pub mod block;
 pub mod cursor;

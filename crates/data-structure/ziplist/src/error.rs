@@ -16,10 +16,11 @@ pub enum DecodeError {
     Corrupt,
 }
 
-/// Error indicating more bytes are needed.
+/// A write op did not fit. Carries the exact total block length (bytes)
+/// the op would need; the buffer was left byte-for-byte unmodified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NeedBytes(pub usize);
 
-/// Unit type indicating successful operation or fit.
+/// Marker: the mutation fit within the buffer's capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fit;

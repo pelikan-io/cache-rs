@@ -17,9 +17,7 @@ use core::cmp::Ordering;
 /// A decoded entry value: either an unsigned integer or a string of bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryVal<'a> {
-    /// An unsigned 64-bit integer value.
     Uint(u64),
-    /// A string of raw bytes.
     Str(&'a [u8]),
 }
 
@@ -164,12 +162,8 @@ fn decode_varint_len(buf: &[u8], off: usize) -> Result<(usize, usize), DecodeErr
 /// except the leftmost (first written) has bit7 set. Returns the number of
 /// bytes written.
 pub(crate) fn encode_backlen(len: usize, out: &mut [u8]) -> usize {
-    // `len` is a `tag_plus_data` span, which never exceeds a block's
-    // `tail_off` and is therefore u32-bounded by the header format
-    // (`header.rs`); 0x0000_FFFF_FFFF is 2^32 - 1, i.e. u32::MAX, which is
-    // comfortably inside the 35-bit (5-group) ceiling this encoding can
-    // express and is the true maximum this crate can ever be asked to
-    // encode.
+    // Bound is u32::MAX: a tag_plus_data span is u32-bounded by the header
+    // format (`tail_off: u32`), inside the 5-group/35-bit ceiling.
     debug_assert!(len > 0 && len <= 0x0000_FFFF_FFFF);
     let mut groups = [0u8; 5];
     let mut n = 0;
