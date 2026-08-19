@@ -441,6 +441,13 @@ impl<'a> Segment<'a> {
 
             debug_assert!(item.klen() > 0, "invalid klen: ({})", item.klen());
 
+            // F1 (single decrement): only the unlinker decrements. A
+            // `remove` returning false therefore has to mean another
+            // unlinker/replacer owns this entry — which holds because
+            // `try_unlink_in_bucket` retries the same slot across a
+            // racing reader's freq-bump CAS instead of abandoning the
+            // entry (table.rs). Without that retry a spurious false here
+            // would recycle the segment with the entry still published.
             let loc = pack_location(self.id(), offset as u64);
             let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
             if !deleted && hashtable.remove(item.key(), loc) {

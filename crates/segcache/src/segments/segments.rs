@@ -804,9 +804,13 @@ impl Segments {
             // observed Live before our CAS is counted here; any that increments
             // after sees Draining and bails. Wait for the counted ones to finish
             // define+publish before we parse the item stream (item 7d, H1/H2).
-            // Bounded: a pinned writer is straight-line define+publish. The
-            // snooze yields after a short spin so a descheduled pin holder
-            // gets CPU on an oversubscribed host.
+            // Bounded, but no longer straight-line: a pinned writer's
+            // publish can block on the hashtable's insert-stripe mutex
+            // (fresh-key entry creation). Still no cycle — that stripe is
+            // a LEAF lock, taken only around bucket-word CASes and
+            // verifier reads, never while holding or waiting on anything
+            // here. The snooze yields after a short spin so a descheduled
+            // pin holder gets CPU on an oversubscribed host.
             let backoff = Backoff::new();
             while self.headers[id_idx].active_writers() != 0 {
                 backoff.snooze();

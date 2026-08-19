@@ -730,6 +730,13 @@ impl MultiChoiceHashtable {
                     // moved this entry and `location`'s bytes were recycled,
                     // so verify falsely reports "different key". Re-validate
                     // before concluding.
+                    //
+                    // Accepted ABA residual: a byte-identical packed
+                    // re-issued between the two loads would wrongly
+                    // `break`. That needs a full unlink -> recycle ->
+                    // republish into the SAME slot with the same freq and
+                    // the same location value between two adjacent loads —
+                    // the same class the `cas_location` retry loops accept.
                     if bucket.items[slot_index].load(Ordering::Acquire) == packed {
                         break; // slot unchanged — genuinely a different key
                     }
@@ -831,32 +838,43 @@ impl MultiChoiceHashtable {
     }
 
     /// Try to unlink an item from a bucket.
+    ///
+    /// Same-slot CAS retry (item 7f, F4), and for the same reason as
+    /// `try_replace_existing`: a warm reader bumps the frequency counter
+    /// with a CAS on this very word (`search_bucket_for_get`, on every
+    /// hit while freq <= 16), so a CAS failure here does NOT imply
+    /// another mutator took the entry. Advancing to the next slot on such
+    /// a failure would abandon a live entry while reporting `false` —
+    /// which `Segment::clear` reads as "another unlinker owns it",
+    /// letting a segment be recycled with a still-published entry.
+    ///
+    /// Termination: every retry is paid for by another thread's
+    /// successful CAS on this word, and freq bumps saturate (probabilistic
+    /// above 16, hard cap 127), so the spin is bounded.
     fn try_unlink_in_bucket(&self, bucket_index: usize, tag: u16, expected: Location) -> bool {
         let bucket = self.bucket(bucket_index);
 
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
-            let speculative = bucket.items[slot_index].load(Ordering::Relaxed);
-
-            if speculative == 0 || Hashbucket::is_ghost(speculative) {
-                continue;
-            }
-
-            if Hashbucket::tag(speculative) == tag {
+            loop {
                 let packed = bucket.items[slot_index].load(Ordering::Acquire);
-                if packed == 0 || Hashbucket::is_ghost(packed) {
-                    continue;
+
+                if packed == 0
+                    || Hashbucket::is_ghost(packed)
+                    || Hashbucket::tag(packed) != tag
+                    || Hashbucket::location(packed) != expected
+                {
+                    break; // not our entry (any more) — next slot
                 }
 
-                if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
-                    match bucket.items[slot_index].compare_exchange(
-                        packed,
-                        0,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => return true,
-                        Err(_) => continue,
-                    }
+                match bucket.items[slot_index].compare_exchange(
+                    packed,
+                    0,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    // Re-read THIS slot: most likely just a freq bump.
+                    Err(_) => continue,
                 }
             }
         }
@@ -865,33 +883,38 @@ impl MultiChoiceHashtable {
     }
 
     /// Try to convert an item to ghost in a bucket.
+    ///
+    /// Same-slot CAS retry, same rationale and termination argument as
+    /// `try_unlink_in_bucket`: a racing freq bump must not cost us the
+    /// entry. The ghost word is recomputed from the FRESH packed on every
+    /// attempt so a bump that landed in between is preserved rather than
+    /// rolled back.
     fn try_to_ghost_in_bucket(&self, bucket_index: usize, tag: u16, expected: Location) -> bool {
         let bucket = self.bucket(bucket_index);
 
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
-            let speculative = bucket.items[slot_index].load(Ordering::Relaxed);
-
-            if speculative == 0 || Hashbucket::is_ghost(speculative) {
-                continue;
-            }
-
-            if Hashbucket::tag(speculative) == tag {
+            loop {
                 let packed = bucket.items[slot_index].load(Ordering::Acquire);
-                if packed == 0 || Hashbucket::is_ghost(packed) {
-                    continue;
+
+                if packed == 0
+                    || Hashbucket::is_ghost(packed)
+                    || Hashbucket::tag(packed) != tag
+                    || Hashbucket::location(packed) != expected
+                {
+                    break; // not our entry (any more) — next slot
                 }
 
-                if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == expected {
-                    let ghost = Hashbucket::to_ghost(packed);
-                    match bucket.items[slot_index].compare_exchange(
-                        packed,
-                        ghost,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => return true,
-                        Err(_) => continue,
-                    }
+                let ghost = Hashbucket::to_ghost(packed);
+
+                match bucket.items[slot_index].compare_exchange(
+                    packed,
+                    ghost,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    // Re-read THIS slot: most likely just a freq bump.
+                    Err(_) => continue,
                 }
             }
         }
@@ -903,6 +926,15 @@ impl MultiChoiceHashtable {
     /// `try_replace_existing`: the success ordering below is Release, which
     /// orders the new item's reserve/define byte writes ahead of the
     /// location becoming visible to readers.
+    ///
+    /// Same-slot CAS retry, mirroring `cas_location_at` (the direct-slot
+    /// sibling of this probe): the new packed value is recomputed from
+    /// the fresh freq on every attempt, so a racing reader's freq bump
+    /// costs a retry rather than the relocation — abandoning it here
+    /// would abort a merge mid-candidate.
+    ///
+    /// Termination: as in `try_unlink_in_bucket` — each retry is paid for
+    /// by another thread's successful CAS, and freq bumps saturate.
     fn try_cas_in_bucket(
         &self,
         bucket_index: usize,
@@ -914,32 +946,33 @@ impl MultiChoiceHashtable {
         let bucket = self.bucket(bucket_index);
 
         for slot_index in 0..Hashbucket::NUM_ITEM_SLOTS {
-            let speculative = bucket.items[slot_index].load(Ordering::Relaxed);
-
-            if speculative == 0 || Hashbucket::is_ghost(speculative) {
-                continue;
-            }
-
-            if Hashbucket::tag(speculative) == tag {
+            loop {
                 let packed = bucket.items[slot_index].load(Ordering::Acquire);
-                if packed == 0 || Hashbucket::is_ghost(packed) {
-                    continue;
+
+                if packed == 0
+                    || Hashbucket::is_ghost(packed)
+                    || Hashbucket::tag(packed) != tag
+                    || Hashbucket::location(packed) != old_location
+                {
+                    break; // not our entry (any more) — next slot
                 }
 
-                if Hashbucket::tag(packed) == tag && Hashbucket::location(packed) == old_location {
-                    let freq = if preserve_freq {
-                        Hashbucket::freq(packed)
-                    } else {
-                        1
-                    };
-                    let new_packed = Hashbucket::pack(tag, freq, new_location);
+                let freq = if preserve_freq {
+                    Hashbucket::freq(packed)
+                } else {
+                    1
+                };
+                let new_packed = Hashbucket::pack(tag, freq, new_location);
 
-                    if bucket.items[slot_index]
-                        .compare_exchange(packed, new_packed, Ordering::Release, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        return true;
-                    }
+                match bucket.items[slot_index].compare_exchange(
+                    packed,
+                    new_packed,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    // Re-read THIS slot: most likely just a freq bump.
+                    Err(_) => continue,
                 }
             }
         }
@@ -1172,7 +1205,11 @@ impl Hashtable for MultiChoiceHashtable {
         // bucket-word CAS + verifier reads — it never takes another lock,
         // pin, or wait.
         // LOCK: insert-stripe
-        let _guard = self.stripe(hash).lock().unwrap();
+        // Poison recovery: the stripe guards `()` — every mutation under
+        // it is a single slot CAS, so a panicking inserter leaves the
+        // table consistent and poisoning must not permanently kill
+        // 1/NUM_STRIPES of the keyspace.
+        let _guard = self.stripe(hash).lock().unwrap_or_else(|e| e.into_inner());
 
         // Re-check under the lock: a racing fresh insert may have
         // published while we waited.
@@ -1685,6 +1722,60 @@ mod tests {
             1,
             "cross-bucket replace must not leave a duplicate"
         );
+    }
+
+    // Native-code tripwire for the freq-bump-vs-unlink race: a warm
+    // reader CASes the slot word on every hit, so a bump landing between
+    // `try_unlink_in_bucket`'s load and its CAS must not cost the unlink
+    // its entry. `remove` returning false there would tell
+    // `Segment::clear` that another unlinker owns a still-published
+    // entry, letting the segment be recycled under it.
+    //
+    // The deterministic guarantee is the loom model
+    // (`loom_remove_vs_freq_bump_unlinks`), which enumerates the
+    // interleaving; this test only reproduces it probabilistically on
+    // real hardware across many trials.
+    #[test]
+    fn test_remove_survives_concurrent_freq_bumps() {
+        use std::sync::{Arc, Barrier};
+
+        const TRIALS: usize = 2000;
+        const BURST: usize = 64;
+
+        for trial in 0..TRIALS {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let key = format!("bumped-{trial}").into_bytes();
+            let loc = Location::new(1);
+
+            let mut verifier = MockVerifier::new();
+            verifier.add(&key, loc, false);
+            let verifier = Arc::new(verifier);
+
+            ht.insert(&key, loc, &*verifier).unwrap();
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            std::thread::scope(|scope| {
+                {
+                    let ht = ht.clone();
+                    let verifier = verifier.clone();
+                    let barrier = barrier.clone();
+                    let key = key.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..BURST {
+                            let _ = ht.lookup(&key, &*verifier);
+                        }
+                    });
+                }
+
+                barrier.wait();
+                assert!(
+                    ht.remove(&key, loc),
+                    "trial {trial}: a racing freq bump defeated the unlink"
+                );
+            });
+        }
     }
 }
 
@@ -2217,6 +2308,46 @@ mod loom_tests {
             assert_eq!(
                 live, 1,
                 "fresh-key race must resolve to exactly one live entry"
+            );
+        });
+    }
+
+    // A warm reader's frequency bump must never make an unlink lose its
+    // entry. `search_bucket_for_get` CASes the slot word on every hit
+    // (freq <= 16 bumps unconditionally), so a bump landing between
+    // `try_unlink_in_bucket`'s load and its CAS fails that CAS for a
+    // reason that has nothing to do with ownership. Abandoning the slot
+    // there would leave a live published entry behind while `remove`
+    // reports false -- which `Segment::clear` reads as "another unlinker
+    // owns it", recycling a segment whose entry is still reachable.
+    // The same-slot retry makes `remove` return true regardless of where
+    // the bump interleaves.
+    #[test]
+    fn loom_remove_vs_freq_bump_unlinks() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let verifier = Arc::new(AlwaysVerifier);
+
+            let loc = Location::new(42);
+            ht.insert(b"key", loc, &*verifier).unwrap();
+
+            let ht1 = ht.clone();
+            let v1 = verifier.clone();
+            let reader = thread::spawn(move || ht1.lookup(b"key", &*v1));
+
+            let ht2 = ht.clone();
+            let remover = thread::spawn(move || ht2.remove(b"key", loc));
+
+            let _ = reader.join().unwrap();
+            let removed = remover.join().unwrap();
+
+            assert!(
+                removed,
+                "unlink must not be defeated by a racing freq bump on the same slot"
+            );
+            assert!(
+                ht.lookup(b"key", &*verifier).is_none(),
+                "entry must be gone once remove reported success"
             );
         });
     }

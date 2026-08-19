@@ -299,7 +299,13 @@ impl Segcache {
                     // narrow, accepted gap: if a drain claims that
                     // segment between the unlink and the pin attempt
                     // below, the pin fails and the drain owns the
-                    // segment's accounting wholesale).
+                    // segment's accounting wholesale). The same gap has a
+                    // second face: the pin can also SUCCEED on a
+                    // recycled-and-reused incarnation of that segment id,
+                    // because a `Location` carries no generation — the
+                    // decrement then lands on the wrong incarnation.
+                    // Same accepted class, tracked as a follow-up
+                    // (generation-tagged locations).
                     match self
                         .hashtable
                         .insert(reserved.item().key(), new_location, &verifier)
