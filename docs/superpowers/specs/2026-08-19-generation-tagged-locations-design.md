@@ -63,6 +63,10 @@ The transitions, by contrast, are already header methods and every free path mus
 
 The distinction is then carried by which transition a path performs, which the state machine already forces it to get right, rather than by which queue helper it remembers to call.
 
+Confirmed from #63's patch rather than assumed: its `ReleaseCondemned` variant is only constructible as the success value of `try_release_condemned()` (`header.rs:444-447` on that branch), so the transition covers it with no separate enumeration.
+
+**Metrics consolidation is deliberately NOT taken here.** The same fact — three condemned paths sharing one transition — means `SEGMENT_RETURN`/`SEGMENT_FREE` could move from the per-site copies into `try_release_condemned`, which is what would have prevented #63's arm shipping without them. But #63 adds those increments at its own arm and ships first, so consolidating here would double-count against it. Sequence: #63 lands with per-site increments; a follow-up consolidates and deletes the copies. Whoever is second checks.
+
 Verified against every production reader of `generation`, all of which keep their meaning:
 
 | Reader | Purpose | Under the change |
