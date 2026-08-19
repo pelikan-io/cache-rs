@@ -1690,13 +1690,16 @@ mod tests {
         let stale_token = h.metadata.load(Ordering::SeqCst);
 
         // --- Meanwhile N is released by someone else (the condemner's
-        // race-fix recheck) and returns to the pool.
+        // race-fix recheck) and returns to the pool. That release is what
+        // bumps the generation (#50 moved the bump off `try_reserve` and onto
+        // the transitions that END a used incarnation), so N+1's condemn will
+        // stamp a different tag than N's did.
         assert!(h.try_release_condemned());
         assert_eq!(h.state(), State::Free);
 
-        // --- Incarnation N+1: the same segment is reserved again (which
-        // bumps the generation), filled, drained, and condemned again —
-        // this time with a live reader still pinning and reading it.
+        // --- Incarnation N+1: the same segment is reserved again, filled,
+        // drained, and condemned again — this time with a live reader still
+        // pinning and reading it.
         assert!(h.try_reserve());
         h.set_state(State::Draining);
         h.ref_count.fetch_add(1, Ordering::SeqCst);
