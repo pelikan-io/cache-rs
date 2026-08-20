@@ -89,10 +89,24 @@ impl Location {
     /// equals it needs `MAX_SEGMENT_ID` in the id field, which no heap can
     /// issue, so no `pack_location` of a real item can ever alias the sentinel.
     /// At the current widths that is 262,142 segments — 256 GiB of heap at
-    /// 1 MiB segments, 2 TiB at the 8 MiB maximum.
+    /// 1 MiB segments, 2 TiB at the 8 MiB maximum
+    /// ([`Self::MAX_SEGMENT_BYTES`], enforced by `SegmentsBuilder::build`).
     /// `Segments` construction refuses a larger heap rather than relying on
     /// "an 8 MiB segment whose last 8 bytes hold an item is implausible".
     pub(crate) const MAX_SEGMENTS: u32 = Self::MAX_SEGMENT_ID - 1;
+
+    /// Largest segment size, in bytes, whose every 8-aligned byte offset the
+    /// 20-bit offset field can encode.
+    ///
+    /// `pack_location` stores `byte_offset >> 3` behind only a debug_assert,
+    /// so past this size the field would silently wrap in release builds: an
+    /// item at byte offset `MAX_SEGMENT_BYTES + X` packs identically to one at
+    /// offset `X` in the same incarnation, and two live items share one
+    /// location. `SegmentsBuilder::build` refuses a larger `segment_size`
+    /// (`SegmentsError::SegmentTooLarge`) so that wrap is unreachable.
+    /// Derived from [`OFFSET_BITS`], so retuning the field split moves the
+    /// enforced ceiling with it. 8 MiB at the current widths.
+    pub(crate) const MAX_SEGMENT_BYTES: usize = 1 << (OFFSET_BITS + 3);
 
     /// Sentinel value indicating a ghost entry (recently evicted).
     /// All 44 location bits set to 1. Unreachable as a real location: see

@@ -3164,4 +3164,63 @@ mod capacity_tests {
             "the extreme location of the largest buildable heap aliased GHOST: {loc:?}"
         );
     }
+
+    /// The offset field's ceiling, exact at the boundary: the largest segment
+    /// whose every 8-aligned offset the 20-bit field can encode builds, and
+    /// one 8-byte step past it is refused. Without the refusal, an item at
+    /// byte offset `MAX_SEGMENT_BYTES + X` packs the same location as an item
+    /// at offset `X` in the same incarnation — two live items sharing one
+    /// identity — and release builds have no other check (`pack_location`
+    /// only debug_asserts).
+    #[test]
+    fn accepts_a_segment_at_exactly_the_offset_field_limit() {
+        let result = SegmentsBuilder::default()
+            .segment_size(Location::MAX_SEGMENT_BYTES as i32)
+            .heap_size(Location::MAX_SEGMENT_BYTES)
+            .build();
+        let segments = match result {
+            Ok(s) => s,
+            Err(e) => panic!("must build: {e}"),
+        };
+        assert_eq!(segments.segment_size(), Location::MAX_SEGMENT_BYTES as i32);
+    }
+
+    #[test]
+    fn rejects_a_segment_one_step_larger_than_the_offset_field_limit() {
+        let over = Location::MAX_SEGMENT_BYTES + 8;
+        let Err(err) = SegmentsBuilder::default()
+            .segment_size(over as i32)
+            .heap_size(over)
+            .build()
+        else {
+            panic!("an oversized segment must fail to build");
+        };
+        assert!(
+            matches!(
+                err,
+                SegmentsError::SegmentTooLarge { segment_size, limit }
+                    if segment_size == over && limit == Location::MAX_SEGMENT_BYTES
+            ),
+            "unexpected error: {err}"
+        );
+        // The message names both the limit and the lever.
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&Location::MAX_SEGMENT_BYTES.to_string()),
+            "{msg}"
+        );
+        assert!(msg.contains("segment_size"), "{msg}");
+    }
+
+    /// The user-visible number, stated once in absolute terms, like
+    /// `the_capacity_limit_is_the_documented_number` above: the docs promise
+    /// an 8 MiB maximum, and this is what ties that prose to the code.
+    #[test]
+    fn the_segment_size_limit_is_the_documented_number() {
+        assert_eq!(
+            Location::MAX_SEGMENT_BYTES,
+            8 * 1024 * 1024,
+            "2^20 offsets x 8-byte alignment = 8 MiB"
+        );
+    }
 }

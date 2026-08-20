@@ -807,7 +807,13 @@ impl SegmentHeader {
     /// AcqRel: writer↔writer coordination on the offset word only — no
     /// Dekker pairing with the reader path, so SeqCst is not warranted.
     pub fn try_reserve_space(&self, size: i32, capacity: i32) -> Option<i32> {
-        debug_assert!(size >= 0, "reservation size must be non-negative");
+        // Strictly positive: a zero-size grant on a full segment would
+        // return `offset == capacity`, the one offset past the end that a
+        // maximum-size segment could still pack — wrapping the location
+        // offset field that `SegmentsBuilder::build`'s size cap exists to
+        // protect. No caller can pass 0 today (item sizes are >= 8 by
+        // construction); this closes the boundary structurally.
+        debug_assert!(size > 0, "reservation size must be positive");
         let mut current = self.write_offset.load(Ordering::Acquire);
         loop {
             let new = current.checked_add(size)?;
