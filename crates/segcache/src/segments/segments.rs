@@ -356,7 +356,26 @@ impl Segments {
     /// bounds-checked it) can re-check without re-unpacking.
     #[inline]
     fn tag_matches(&self, location: Location, seg_id: NonZeroU32) -> bool {
-        location.tag() == crate::hashtable::location::tag_for_generation(self.generation(seg_id))
+        Self::tag_matches_header(location, self.header(seg_id))
+    }
+
+    /// The same comparison against a header the caller already holds.
+    ///
+    /// Identical to [`Self::tag_matches`] in every respect that matters — same
+    /// field of the same header, read at the same point — but it skips
+    /// re-deriving the header's address from `self`, which is not free on the
+    /// pinned read path. `acquire_item_at` reaches its tag check with the
+    /// header address already in a register, yet routing through `self` forces
+    /// a reload of the `headers` slice pointer (the SeqCst atomics in the pin
+    /// clobber LLVM's view of memory, so the earlier load cannot be reused) and
+    /// a second bounds check on an index that was already checked. That is a
+    /// two-deep dependent load chain in front of the generation load, and it
+    /// sits after the pin's acquiring re-check, which forbids the CPU from
+    /// starting it early. Passing the header in collapses the chain to the one
+    /// load the check actually needs.
+    #[inline]
+    fn tag_matches_header(location: Location, header: &SegmentHeader) -> bool {
+        location.tag() == crate::hashtable::location::tag_for_generation(header.generation())
     }
 
     // ── Item access ──────────────────────────────────────────────────
@@ -442,7 +461,12 @@ impl Segments {
         // Incarnation check UNDER the guard (see above). Returning here drops
         // `guard`, releasing the reader — including the condemned-segment
         // handoff, exactly as a caller-side drop would.
-        if !self.tag_matches(location, seg_id) {
+        //
+        // Against `header` rather than `seg_id`: the two read the same field of
+        // the same header at the same point in the protocol, but the `seg_id`
+        // form re-derives an address this frame already holds (see
+        // `tag_matches_header`).
+        if !Self::tag_matches_header(location, header) {
             return None;
         }
 
