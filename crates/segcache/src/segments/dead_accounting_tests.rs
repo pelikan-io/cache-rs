@@ -5,7 +5,8 @@
 //! `dead_items`/`dead_bytes` header counters that `SegmentHeader` carries:
 //! `Segment::remove_item_at` charges an item's space to its segment, and
 //! `SegmentHeader::reset_write_stats` reclaims the whole charge when the
-//! segment is recycled/re-reserved/freed-by-guard-drop.
+//! segment is recycled, re-reserved, or freed on the condemned path (by
+//! whichever of the three claimants wins the AwaitingRelease -> Free CAS).
 //!
 //! Both relocation sites (`Segment::copy_into` for merge drains,
 //! `Segments::s3fifo_promote_from` for S3-FIFO promotions) run
@@ -306,11 +307,34 @@ fn recycle_reclaims_dead_space_exactly_once() {
     );
     assert_eq!(cache.segments.header(src_id).dead_bytes(), 0);
 
-    // Second reset (the reserve-time one) must be a no-op.
-    let reserved = cache
-        .segments
-        .reserve_free()
-        .expect("the recycled segment is available again");
-    assert_eq!(cache.segments.header(reserved).dead_items(), 0);
-    assert_eq!(cache.segments.header(reserved).dead_bytes(), 0);
+    // Second reset (the reserve-time one) must be a no-op, and it has to run
+    // on THIS segment to prove anything: `reserve_free()` steals from the
+    // front of the free queue and hands back whichever virgin segment is
+    // there (observed: a different id, never recycled, never charged), so
+    // asserting zeroes on that one is vacuous.
+    //
+    // `reset_write_stats` `swap(0)`s the per-segment counters and subtracts
+    // from the global gauges only what it took, so the zero just asserted
+    // above is precisely what makes this second pass subtract nothing; the
+    // read after the reserve confirms it neither resurrected a charge nor
+    // left one behind for the next tenant.
+    assert_eq!(
+        cache.segments.header(src_id).state(),
+        State::Free,
+        "the recycled segment must be Free and therefore reservable"
+    );
+    assert!(
+        cache.segments.header(src_id).try_reserve(),
+        "the recycled segment must be reservable again"
+    );
+    assert_eq!(
+        (
+            cache.segments.header(src_id).dead_items(),
+            cache.segments.header(src_id).dead_bytes()
+        ),
+        (0, 0),
+        "the reserve-time reset found dead space still charged to a segment \
+         `recycle` had already reclaimed — the gauges are being subtracted \
+         twice and will run negative"
+    );
 }

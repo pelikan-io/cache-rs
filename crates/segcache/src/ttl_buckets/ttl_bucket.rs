@@ -261,8 +261,11 @@ impl TtlBucket {
 
                 freed += 1;
             } else {
-                // Condemn: unlinked immediately, freed by the last
-                // reader's guard drop (or by the race-fix recheck).
+                // Condemn: unlinked immediately, freed by whichever of the
+                // three claimants wins the AwaitingRelease -> Free CAS (the
+                // last reader's guard drop, the race-fix recheck below, or
+                // the backout of an acquire that failed after its
+                // increment).
                 match segments.condemn(seg_id, next, prev) {
                     ClearOutcome::Freed => freed += 1,
                     ClearOutcome::Deferred => {

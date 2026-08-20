@@ -4,8 +4,9 @@
 //! fragmentation — not "how many items have ever died". `Segment::remove_item_at`
 //! charges a retired item's space to its segment;
 //! `SegmentHeader::reset_write_stats` gives the whole charge back when the
-//! segment is reclaimed (recycle, re-reserve, or the last reader's guard drop
-//! on a condemned segment); a RELOCATION (merge copy-out, S3-FIFO promotion)
+//! segment is reclaimed (recycle, re-reserve, or whichever of the three
+//! claimants wins the AwaitingRelease -> Free CAS on a condemned segment);
+//! a RELOCATION (merge copy-out, S3-FIFO promotion)
 //! is neutral, because a moved item did not die.
 //!
 //! This file pins the three consequences that are visible from outside the

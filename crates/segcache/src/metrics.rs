@@ -202,13 +202,25 @@ pub static ITEM_CURRENT_BYTES: Gauge = Gauge::new();
 // sitting in segments, i.e. fragmentation. `Segment::remove_item_at` charges
 // a retired item's space to its segment (and to these gauges);
 // `SegmentHeader::reset_write_stats` reclaims the whole segment's charge when
-// it is recycled, re-reserved, or freed by the last reader of a condemned
-// segment. A RELOCATION (merge copy-out, S3-FIFO promotion) is neutral: the
-// item moved rather than died, so the site takes its charge straight back off.
+// the segment is reset. Every path that takes a segment out of service resets
+// it: `recycle`, `try_reserve`, and all three claimants of the
+// AwaitingRelease -> Free CAS on a condemned segment (the last reader's guard
+// drop, `condemn`'s race-fix recheck, and the backout of an acquire that
+// failed after its increment). A RELOCATION (merge copy-out, S3-FIFO
+// promotion) is neutral: the item moved rather than died, so the site takes
+// its charge straight back off.
 //
-// They are therefore NOT cumulative death totals, and they go down as well as
-// up. Rate/total consumers want `item_evict` + `item_expire` + `item_delete`
-// + `item_replace` instead.
+// MIGRATION. These were cumulative counters before; they are gauges now, and
+// they go down as well as up. There is no drop-in replacement for the old
+// reading:
+//
+// - `item_evict + item_expire + item_delete + item_replace` is the CORRECTED
+//   cumulative death total, not the old value. The old counter was also bumped
+//   by the two relocation sites (`copy_into`, `s3fifo_promote_from`), which
+//   have no per-cause counter of their own, so it ran high by roughly
+//   `item_relink`.
+// - `item_dead_bytes` has NO cumulative replacement at all: there is no
+//   per-cause `*_bytes` counter to sum.
 #[metric(
     name = "item_dead",
     description = "current number of dead items occupying space in segments",

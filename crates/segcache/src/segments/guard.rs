@@ -63,10 +63,12 @@ impl Drop for SegmentGuard {
             // queue ourselves.
             //
             // Settle the segment's accounting FIRST. The CAS we just won is
-            // exclusive (exactly one of us and the condemner's race-fix
-            // recheck can win it) and nothing can find the segment until we
-            // push it, so we are its sole owner here — the same ownership
-            // `recycle` has when it calls this. Without it a condemned
+            // exclusive (exactly one of the three claimants listed in the
+            // struct doc above can win it) and nothing can find the segment
+            // until we push it, so
+            // we are its sole owner here — the same ownership `recycle` has
+            // when it calls this. The other two claimants settle the same
+            // way, at their own `return_segment`. Without it a condemned
             // segment carries its unpinned-unlink residue AND its whole dead
             // total onto the free queue, unreconciled until some later
             // `try_reserve` happens to pick it up: `item_current` would sit

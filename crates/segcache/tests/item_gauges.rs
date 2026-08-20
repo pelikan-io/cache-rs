@@ -7,8 +7,9 @@
 //! `Segments::s3fifo_promote_from`) must be gauge-NEUTRAL because a
 //! relocation MOVES an item rather than killing one, and residue left by
 //! unpinned unlinks is reconciled by `SegmentHeader::reset_write_stats`
-//! when the segment recycles (or is freed by the last reader of a condemned
-//! segment). If any of those sites is wrong, the error is
+//! when the segment recycles, is re-reserved, or is freed by whichever of
+//! the three claimants wins the AwaitingRelease -> Free CAS on a condemned
+//! segment. If any of those sites is wrong, the error is
 //! permanent and cumulative — so after a storm that drains every segment,
 //! the gauges must be back at exactly zero.
 //!

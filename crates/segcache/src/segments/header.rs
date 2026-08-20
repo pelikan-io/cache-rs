@@ -241,8 +241,12 @@ impl SegmentHeader {
     /// Reset the write statistics (write offset, live bytes, live items)
     /// to their initial values. Callers must hold exclusive ownership of
     /// the segment's data — a `Draining` claim with the reader count
-    /// observed zero (`recycle`), or a just-won `Free -> Reserved` CAS
-    /// (`try_reserve`) — since a reset under live readers would corrupt
+    /// observed zero (`recycle`), a just-won `Free -> Reserved` CAS
+    /// (`try_reserve`), or a just-won `AwaitingRelease -> Free` CAS on a
+    /// condemned segment whose last pin is gone, which any of its three
+    /// claimants may be (the last reader's guard drop, `condemn`'s
+    /// race-fix recheck, or the backout of an acquire that failed after
+    /// its increment) — since a reset under live readers would corrupt
     /// their offset math.
     ///
     /// With `metrics`, any residual live items/bytes being zeroed here are
@@ -409,10 +413,12 @@ impl SegmentHeader {
         // segment — cannot decrement the segment's counters, and the drain
         // sweep skips the already-unlinked item, so a segment can
         // legitimately reach Free with transiently over-counted
-        // `write_offset`/`live_bytes`/`live_items`. `recycle` resets them
-        // on the common path; a condemned segment (freed by its last
-        // reader's guard drop) carries them until here. The stores below
-        // are the authoritative reset either way.
+        // `write_offset`/`live_bytes`/`live_items`. Every path that frees a
+        // segment already resets it — `recycle` on the common path, and all
+        // three claimants of the AwaitingRelease -> Free CAS on the
+        // condemned path — so this one is normally a no-op; it stays because
+        // `reset_write_stats` is idempotent and because a segment's next
+        // tenant must not have to trust a caller to have done it.
         self.reset_write_stats();
         self.mark_created();
         self.mark_merged();
@@ -441,9 +447,12 @@ impl SegmentHeader {
     /// Try to free a condemned segment (AwaitingRelease -> Free).
     ///
     /// Returns true iff this caller won the transition — the CAS
-    /// uniqueness is what guarantees exactly-one-free between the last
-    /// reader's guard drop and the condemner's race-fix recheck. The
-    /// caller that wins must return the segment to the free queue.
+    /// uniqueness is what guarantees exactly-one-free among the three
+    /// claimants: the last reader's guard drop, the condemner's race-fix
+    /// recheck, and the backout of an acquire that failed after its
+    /// increment. The caller that wins owns the segment until it pushes
+    /// it, and must both settle its accounting (`reset_write_stats`) and
+    /// return it to the free queue.
     ///
     /// SeqCst: this participates in the release-side Dekker pair (guard
     /// drop decrements ref_count SeqCst, then loads the state; the
@@ -797,8 +806,9 @@ impl SegmentHeader {
     //
     // The space held by items that were retired from this segment and has
     // not been reclaimed yet. It is reclaimed wholesale when the segment is
-    // reset (`reset_write_stats`, from recycle / try_reserve / the condemned
-    // guard-drop free), which is what lets the global gauges these mirror be
+    // reset (`reset_write_stats`, from recycle / try_reserve / whichever of
+    // the three claimants wins the AwaitingRelease -> Free CAS on a condemned
+    // segment), which is what lets the global gauges these mirror be
     // true occupancy gauges rather than monotone totals. NOT derivable from
     // `write_offset - live_bytes`: `Segment::clear` rewinds `write_offset`
     // to `live_bytes` on the way out, and a relocation lowers `live_bytes`
