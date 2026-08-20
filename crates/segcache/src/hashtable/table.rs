@@ -3159,6 +3159,143 @@ mod loom_tests {
     }
 
     // =====================================================================
+    // Incarnation tag: recycle-and-refill at the same address (#50)
+    // =====================================================================
+
+    /// The tag's own model: a location whose incarnation ended must not
+    /// address the incarnation that took its place, even when every other
+    /// defence has been stripped away by the trace itself.
+    ///
+    /// **Why the other oracle models above cannot cover this.** They relocate
+    /// the key to a DIFFERENT cell, so the stale location ends up holding
+    /// another key and the verifier alone rejects it. Here the segment is
+    /// recycled and refilled with the SAME key at the SAME address — a
+    /// commonplace trace, not a contrivance: segments are append-only from a
+    /// fixed start, so under uniform item sizes the n-th item of every
+    /// incarnation lands at exactly that offset (design §"Why 6 bits"). The
+    /// bytes really are this key's again, `verify` says yes, and the 12-bit
+    /// hash tag matches because it is the same key. The incarnation tag is
+    /// the only thing left that can tell the two locations apart.
+    ///
+    /// **The racer is real, and it is unpinned.** `Segcache::delete`'s
+    /// pin-fail arm unlinks the entry it looked up WITHOUT a remover pin —
+    /// nothing stops the segment being drained, recycled and refilled between
+    /// its lookup and its `remove`. Its generation snapshot narrows that
+    /// window but does not close it (the window from the generation load to
+    /// the remove CAS is exactly what the comment there calls residual), so
+    /// this model deliberately omits the snapshot: the assertion is that the
+    /// TAG ALONE suffices, which is the claim design §"Why 6 bits" makes for
+    /// every unpinned unlink.
+    ///
+    /// Two independent invariants:
+    ///
+    /// 1. **exactly one claimant of the outgoing entry.** One entry exists at
+    ///    incarnation 0 and both threads target it; if both report success,
+    ///    one of them unlinked something that was not the entry it named.
+    /// 2. **the refilled entry survives, in every interleaving**, and every
+    ///    location-keyed consumer refuses the stale location afterwards
+    ///    (`get_item_frequency` is the drain's own liveness check,
+    ///    `cas_location` the relink, `convert_to_ghost` the S3-FIFO eviction,
+    ///    `remove` the unlink). An acked delete may destroy its own
+    ///    incarnation's entry; it may never destroy the next one's.
+    ///
+    /// **Proven to fail against neutered code**, per #67's discipline. The
+    /// neutering is `location::tag_for_generation` returning a constant —
+    /// the one projection every incarnation check funnels through, so
+    /// collapsing it is exactly "the tag distinguishes nothing". Each layer
+    /// was then peeled to show the next is non-vacuous too:
+    ///
+    /// 1. the premise guard fires first, on `left: Location(0x00004000000),
+    ///    right: Location(0x00004000000)` — the two incarnations became one
+    ///    word, which is the neutering announcing itself;
+    /// 2. with the premise guard removed, the consumer sweep fires: *"the
+    ///    drain's liveness check must report a stale location ABSENT"*;
+    /// 3. with those removed, invariant 1 fires on `left: true, right: true`
+    ///    — loom finds the interleaving where the delete's `remove` lands
+    ///    AFTER the republish and takes the fresh entry;
+    /// 4. with that removed too, invariant 2 fires with the refilled entry
+    ///    gone (`left: None`).
+    #[test]
+    fn loom_stale_incarnation_unlink_cannot_take_the_refilled_entry() {
+        loom::model(|| {
+            let ht = Arc::new(MultiChoiceHashtable::new(7));
+            let oracle = Arc::new(KeyOracle::new());
+
+            // The same address in two successive incarnations of one segment.
+            let stale = KeyOracle::location_in(SRC, 0);
+            let refilled = KeyOracle::location_in(SRC, 1);
+            assert_ne!(
+                stale, refilled,
+                "the two incarnations must be distinguishable, or this model \
+                 asserts nothing"
+            );
+
+            oracle.place(SRC, KEY);
+            ht.insert(KEY, stale, &*oracle).expect("seed insert");
+
+            // `Segcache::delete`: looked the key up, failed to pin its
+            // segment, and fell through to the unpinned unlink holding the
+            // location it read before any of the below happened.
+            let deleter = {
+                let ht = ht.clone();
+                thread::spawn(move || ht.remove(KEY, stale))
+            };
+
+            // Drain -> recycle -> re-reserve -> refill, in production order.
+            let recycler = {
+                let ht = ht.clone();
+                let oracle = oracle.clone();
+                thread::spawn(move || oracle.recycle_and_refill(&ht, SRC, 0))
+            };
+
+            let unlinked = deleter.join().unwrap();
+            let swept = recycler.join().unwrap();
+
+            assert_ne!(
+                unlinked, swept,
+                "exactly one of the delete's unpinned unlink and the drain's \
+                 sweep may claim the outgoing incarnation's entry (both \
+                 succeeding means one of them matched a location it does not \
+                 name — the ABA the incarnation tag exists to close)"
+            );
+            assert_eq!(
+                ht.lookup_no_freq_update(KEY, &*oracle).map(|(loc, _)| loc),
+                Some(refilled),
+                "the refilled entry must survive: an unlink holding a location \
+                 from the PREVIOUS incarnation must not take it, however \
+                 exactly its address and its key bytes match"
+            );
+
+            // Every location-keyed consumer refuses the stale location once
+            // the race has settled. The verifier cannot help any of them —
+            // the bytes at that address really are this key's.
+            assert!(
+                ht.get_item_frequency(KEY, stale).is_none(),
+                "the drain's liveness check must report a stale location \
+                 ABSENT, or a merge relocates the next incarnation's item"
+            );
+            assert!(
+                !ht.cas_location(KEY, stale, KeyOracle::location(DST), true),
+                "a relink CAS against a stale location must lose"
+            );
+            assert!(
+                !ht.convert_to_ghost(KEY, stale),
+                "an eviction must not ghost an entry it names by a dead \
+                 incarnation"
+            );
+            assert!(
+                !ht.remove(KEY, stale),
+                "a second unpinned unlink must still be refused"
+            );
+            assert_eq!(
+                KeyOracle::drain_live_entries(&ht),
+                1,
+                "one key must leave exactly one live entry"
+            );
+        });
+    }
+
+    // =====================================================================
     // get_pinned's post-pin revalidation retry (#65)
     // =====================================================================
 
