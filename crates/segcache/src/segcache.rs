@@ -391,11 +391,52 @@ impl Segcache {
     /// is a MISS, and nothing about it is transient: no drain is going to finish
     /// and fix it. Retrying is still right — the entry is stale by definition,
     /// so either a writer has already published a fresh location or the key is
-    /// gone — but it MUST be bounded, or a hashtable entry that somehow stays
-    /// stale (nothing left to republish it, nothing left to unlink it) spins the
-    /// unbounded arm above forever. Bounding it is the whole reason the tag is
-    /// consulted here rather than left to the post-pin revalidation, which would
-    /// also reject the location but only after routing it through this arm.
+    /// gone — and it is retried under a BOUND, which is the whole reason the tag
+    /// is consulted here rather than left to the post-pin revalidation (that
+    /// would also reject the location, but only after routing it through the
+    /// unbounded arm above).
+    ///
+    /// **What the bound is actually for.** The design justified it as "a stale
+    /// tag must be retried under a bound or a permanently stale entry spins that
+    /// arm forever". No such entry is reachable through the public API, by two
+    /// invariants that meet:
+    ///
+    /// - *nothing publishes at a dead generation.* Every location the hashtable
+    ///   ever holds is packed from a generation read while holding something
+    ///   that blocks the two `-> Free` transitions: `try_alloc_item` reads it
+    ///   after `try_pin_writer` and hands it out inside the `ReservedItem`,
+    ///   whose `WriterPin` is held across the publish (`insert`, `replace_at`);
+    ///   the two relink sites read it off a segment they have claimed
+    ///   (`Draining` source, `Relinking` destination — `pack_location`'s stated
+    ///   precondition).
+    /// - *nothing survives the bump.* Both bumps are reached only through
+    ///   `finalize_drained`, which runs `Segment::clear` first, and `clear`
+    ///   sweeps every item boundary in `[0, write_offset)` — exactly the set of
+    ///   offsets a published location can name — unlinking each entry still
+    ///   there. (`try_unlink_in_bucket` retries its slot across a racing
+    ///   frequency bump for precisely this reason: a spurious `false` would
+    ///   "recycle the segment with the entry still published".) And
+    ///   `claim_for_drain` waits out every writer and remover before the sweep,
+    ///   so no in-flight publish can land behind it.
+    ///
+    /// So at the instant a generation advances, no entry names the outgoing
+    /// incarnation, and a fresh lookup can only hand back a location that was
+    /// live when it was read. Each firing of this arm is therefore PAID FOR by a
+    /// drain+recycle completing inside one lookup -> pin window — real
+    /// system-wide progress, the same termination argument as the revalidation
+    /// mismatch it shares a budget with. The loop is lock-free and terminates
+    /// without the bound; the bound buys STARVATION-freedom (a `get` costs at
+    /// most `REVALIDATE_RETRIES` pins under any recycle storm), and it is what
+    /// makes a directly PLANTED stale entry terminate — a state reachable only
+    /// from inside the crate, which is how
+    /// `incarnation_tests::stale_location_is_rejected_by_every_consumer` gets to
+    /// assert this arm's policy at all.
+    ///
+    /// The three write-path loops that also retry a refused pin
+    /// (`cas`, `numeric_update`, `try_into_numeric`) do NOT share this bound and
+    /// do not triage the two failures at all — they retry both unboundedly. That
+    /// is sound for the reason above and NOT parity with this function; each says
+    /// so at its own snooze.
     ///
     /// It shares `attempts` — and therefore `REVALIDATE_RETRIES` — with
     /// `follow_republished` rather than carrying `RESERVE_RETRIES`. The two
@@ -1196,8 +1237,19 @@ impl Segcache {
                 // Transient drain window, or a location whose incarnation is
                 // gone (`acquire_item_at` refuses the pin — see
                 // `Segments::resolve`); either way the fresh lookup on retry
-                // resolves the live location or reports the key gone. Not
-                // counted against `attempts`, same as `get_pinned`.
+                // resolves the live location or reports the key gone.
+                //
+                // NOT counted against `attempts`, and — unlike `get_pinned`
+                // — not counted against anything else either: this loop does
+                // not triage the two failures, so it has no bounded arm to
+                // charge. Sound because neither can spin. A drain is bounded,
+                // straight-line work; and a fresh lookup cannot keep handing
+                // back a dead incarnation, because no hashtable entry
+                // survives its segment's generation bump (the reachability
+                // argument is written out on `relookup_after_pin_failure`),
+                // so every stale pin failure is paid for by a real recycle.
+                // `attempts`/`RESERVE_RETRIES` below bounds the OTHER face of
+                // this window — a key being republished under us.
                 backoff.snooze();
                 continue;
             };
@@ -1337,27 +1389,40 @@ impl Segcache {
             // after its liveness check, the relink CAS simply fails and the
             // copy aborts — an eviction-legal drop, not corruption.
             //
-            // ABA guard: `location` is (segment, offset) with NO generation,
-            // and `hashtable.remove` matches (tag, location) without
-            // re-verifying key bytes — the pinned path below is exempt only
+            // ABA guard: `location` is (segment, incarnation tag, offset),
+            // and `hashtable.remove` matches (hash tag, location) — the whole
+            // 44-bit location word, incarnation included — without
+            // re-verifying key bytes. The pinned path below is exempt only
             // because its pin freezes the segment against recycling (the
             // location-uniqueness precondition documented on
             // `cas_location_at`). Unpinned, the segment could have been
             // drained, recycled, and refilled since the lookup, with a
-            // colliding-tag key freshly written at this exact offset. Two
-            // defenses: (1) refuse the unpinned unlink when the generation
-            // moved since the lookup — the entry is stale either way; (2)
-            // after a successful unlink, re-verify the key stopped
+            // colliding-tag key freshly written at this exact offset. Three
+            // defenses, the first structural: (0) the incarnation tag — a
+            // refill republishes at the NEXT generation, so `remove`'s
+            // location compare simply does not match it, and an ALIASING
+            // republish needs 64 full lifecycles of this id rather than one
+            // (the tag is 6 bits); (1) refuse the unpinned unlink when the
+            // generation moved since the lookup — the entry is stale either
+            // way; (2) after a successful unlink, re-verify the key stopped
             // resolving, retrying if it did not — so an acked delete NEVER
             // leaves the key reachable (a retry against a concurrent
             // re-insert deletes the newer value: a legal linearization of
-            // concurrent set+delete). The residual window (generation load
-            // to remove-CAS) requires a full drain+recycle+refill+publish
+            // concurrent set+delete).
+            //
+            // The residual below predates (0), so it is now CONSERVATIVE
+            // rather than tight — kept because its conclusion is the part
+            // that matters. The residual window (generation load to
+            // remove-CAS) requires a full drain+recycle+refill+publish
             // plus a 12-bit tag collision in an overlapping bucket to land
-            // within a few instructions; its worst case is a spurious
-            // unlink of ONE colliding key — observably an eviction, which a
-            // cache may always perform — never corruption (the unlink
-            // touches no segment state).
+            // within a few instructions — and, with (0), 64 such lifecycles
+            // rather than one. Its worst case is a spurious unlink of ONE
+            // colliding key — observably an eviction, which a cache may
+            // always perform — never corruption (the unlink touches no
+            // segment state). `table.rs`'s
+            // `loom_stale_incarnation_unlink_cannot_take_the_refilled_entry`
+            // models exactly this race with defense (1) deliberately absent,
+            // so (0)'s own contribution is asserted rather than assumed.
             let Some(pin) = self.segments.try_pin_remover(seg_id) else {
                 if self.segments.generation(seg_id) == observed_gen
                     && self.hashtable.remove(key, location)
@@ -1534,6 +1599,13 @@ impl Segcache {
                 // is refused — see `Segments::resolve`) — back off and retry
                 // from the lookup, giving the drain a chance to finish
                 // instead of busy-waiting through its whole window.
+                //
+                // Unbounded, and NOT the bounded arm `get_pinned` gives a
+                // stale incarnation: this loop does not triage the two. Safe
+                // for both — a drain is bounded work, and a fresh lookup
+                // cannot keep resolving to a dead incarnation, because no
+                // hashtable entry survives its segment's generation bump (see
+                // `relookup_after_pin_failure` for the invariants).
                 None => {
                     backoff.snooze();
                     continue;
@@ -1645,6 +1717,14 @@ impl Segcache {
             let Some((raw, guard)) = self.segments.acquire_item_at(location) else {
                 // Transient drain window, or a stale incarnation whose pin is
                 // refused (`Segments::resolve`) — retry from the lookup.
+                //
+                // Unbounded, for both, and NOT parity with `get_pinned`
+                // (which bounds its stale arm): this loop does not triage the
+                // two failures. Neither can spin — a drain is bounded work,
+                // and no hashtable entry survives its segment's generation
+                // bump, so a fresh lookup cannot keep returning a dead
+                // incarnation (see `relookup_after_pin_failure`). `attempts`
+                // below bounds the separate churn face of this window.
                 backoff.snooze();
                 continue;
             };

@@ -32,11 +32,20 @@ fn sizes() {
 // incarnation that published it.
 //
 // Written as a table over the transitions rather than as a walk through one
-// segment's life, for two reasons. It reads against the state diagram in
-// `state.rs` line by line, and a transition added later without a row here
-// is visibly missing — which is exactly the gap that let a textual merge
-// move the `generation.fetch_add` off `try_release_condemned` and onto
-// `cas_condemn` with the entire suite, loom included, still green.
+// segment's life, so that it reads against the state diagram in `state.rs`
+// line by line. What it CATCHES is the bump MOVING: onto an edge that must
+// not spend a generation, or off one that must — which is exactly the gap
+// that let a textual merge move the `generation.fetch_add` off
+// `try_release_condemned` and onto `cas_condemn` with the entire suite, loom
+// included, still green.
+//
+// What it does NOT catch, stated plainly so nobody trusts it further than it
+// goes: a NEW `SegmentHeader` transition added without a row here. Nothing
+// enumerates the header's transitions at runtime, so the `table.len()`
+// assertion below can only compare a literal against a literal — it fires
+// when someone edits the table, which makes an intentional change deliberate,
+// and is silent about an omission. Reviewing a new transition into this table
+// is a human step; #80 tracks a check that could enforce it.
 //
 // Calibration, measured rather than asserted: with that defect reinstated
 // and ONLY this test skipped, 151 lib tests and all 31 loom models still
@@ -137,8 +146,10 @@ fn generation_advances_on_exactly_the_two_transitions_that_end_a_used_incarnatio
     assert_eq!(
         table.len(),
         6,
-        "a segment-state transition was added or removed without updating this \
-         table; the table exists so that omission is visible"
+        "this table was edited; every row is load-bearing, so re-derive the \
+         `bumps` column against `state.rs`'s diagram before changing the count. \
+         (This compares a literal against a literal: it cannot see a NEW \
+         `SegmentHeader` transition that never got a row — see the note above.)"
     );
 
     for t in table {
