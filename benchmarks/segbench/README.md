@@ -20,7 +20,7 @@ cargo build --release -p segbench
 # a whole sweep
 CPUS=8-15 ./benchmarks/segbench/sweep_scaling.sh
 CPUS=8-15 ./benchmarks/segbench/sweep_locality.sh
-python3 benchmarks/segbench/aggregate.py benchmarks/segbench/results/*.csv
+./target/release/segbench aggregate benchmarks/segbench/results/*.csv
 ```
 
 Each run prints one CSV row: `threads,write_pct,dist,mode,mops`. Sweep scripts
@@ -69,8 +69,8 @@ reservation contention.
 
 Compare a series against **its own** single-thread median, not against another
 series' absolute Mops/s — the distributions have different per-op sampling costs
-that have nothing to do with the engine. `aggregate.py` computes speedups that
-way.
+that have nothing to do with the engine. `segbench aggregate` computes speedups
+that way, and prints JSON to stdout.
 
 Findings from the sweeps committed under `results/` are written up in
 [`docs/journal/2026-08-25-segcache-read-write-scaling.md`](../../docs/journal/2026-08-25-segcache-read-write-scaling.md).

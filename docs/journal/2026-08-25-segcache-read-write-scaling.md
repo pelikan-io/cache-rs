@@ -35,8 +35,8 @@ turned out to hide the result.
 
 ## Scope
 
-New workspace member `benchmarks/segbench` (harness, sweep scripts, aggregator,
-raw CSVs) and this entry. `crossbeam-channel` and `rand_distr` added to
+New workspace member `benchmarks/segbench` (harness, `segbench aggregate`
+subcommand, sweep scripts, raw CSVs) and this entry. `crossbeam-channel` and `rand_distr` added to
 `[workspace.dependencies]`; `segcache` added as a workspace path dependency. No
 existing crate touched, and no engine behavior changed.
 
@@ -51,7 +51,7 @@ interleaved repeats, median. Run-to-run spread is under 2% at every point.
 ```
 CPUS=8-15 ./benchmarks/segbench/sweep_scaling.sh
 CPUS=8-15 ./benchmarks/segbench/sweep_locality.sh
-python3 benchmarks/segbench/aggregate.py benchmarks/segbench/results/*.csv
+./target/release/segbench aggregate benchmarks/segbench/results/*.csv
 ```
 
 Median Mops/s, with speedup against each series' own single-thread median:

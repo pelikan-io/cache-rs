@@ -1,11 +1,16 @@
 //! Scalability bench: Arc<Segcache> shared across N threads.
-//! Usage: segbench <threads> <write_pct> <dist: uniform|zipf> <warmup_s> <measure_s> [mode: base|stripe]
+//!
+//! Usage:
+//!   segbench <threads> <write_pct> <dist: uniform|zipf> <warmup_s> <measure_s> [mode] [mode args]
+//!   segbench aggregate <results.csv>...
 //!
 //! mode=stripe emulates striped active tails through the public API: thread t
 //! writes with TTL = 1000 + 8t seconds, landing in its own 8s-wide tier-1 TTL
 //! bucket, so reservation CASes hit per-thread tail segments instead of one
 //! shared tail. TTLs are ~17 min — no expiry occurs within a run.
 //! Prints CSV: threads,write_pct,dist,mode,mops
+
+mod aggregate;
 
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
@@ -14,6 +19,10 @@ use segcache::{Policy, Segcache};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
+
+const USAGE: &str = "usage:\n  \
+     segbench <threads> <write_pct> <dist: uniform|zipf> <warmup_s> <measure_s> [mode] [mode args]\n  \
+     segbench aggregate <results.csv>...";
 
 const MB: usize = 1024 * 1024;
 const NKEYS: usize = 1_000_000;
@@ -652,6 +661,21 @@ fn run_part(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("{}", USAGE);
+        std::process::exit(2);
+    }
+    if args[1] == "aggregate" {
+        if let Err(e) = aggregate::run(&args[2..]) {
+            eprintln!("segbench: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.len() < 6 {
+        eprintln!("{}", USAGE);
+        std::process::exit(2);
+    }
     let threads: usize = args[1].parse().unwrap();
     let write_pct: u32 = args[2].parse().unwrap();
     let dist = args[3].clone();
