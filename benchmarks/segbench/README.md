@@ -72,5 +72,6 @@ series' absolute Mops/s — the distributions have different per-op sampling cos
 that have nothing to do with the engine. `segbench aggregate` computes speedups
 that way, and prints JSON to stdout.
 
-Findings from the sweeps committed under `results/` are written up in
+Sweeps write to `results/`, which is gitignored — it is build output, not a
+record. The findings drawn from it are written up in
 [`docs/journal/2026-08-25-segcache-read-write-scaling.md`](../../docs/journal/2026-08-25-segcache-read-write-scaling.md).

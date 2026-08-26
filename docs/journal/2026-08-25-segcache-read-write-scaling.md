@@ -30,13 +30,14 @@ turned out to hide the result.
 - Read and write scaling reported separately, each measured directly rather
   than inferred from a mixed workload.
 - Thread count equals core count: one core type, no SMT.
-- Committed results reproducible from the committed code — same engine version,
-  same dependency versions, same scripts.
+- Results reproducible from the committed code — same engine version, same
+  dependency versions, same scripts. The raw CSVs are build output and are not
+  checked in; the numbers that matter are tabulated below.
 
 ## Scope
 
 New workspace member `benchmarks/segbench` (harness, `segbench aggregate`
-subcommand, sweep scripts, raw CSVs) and this entry. `crossbeam-channel` and `rand_distr` added to
+subcommand, sweep scripts) and this entry. `crossbeam-channel` and `rand_distr` added to
 `[workspace.dependencies]`; `segcache` added as a workspace path dependency. No
 existing crate touched, and no engine behavior changed.
 
