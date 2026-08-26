@@ -112,7 +112,7 @@ Expiration is **lazy on access, eager on pressure**:
 
 ## Eviction Policies
 
-Eight policies, set at construction time. The storage layer is identical for all of them — only the segment selection strategy differs:
+Eight policies, set at construction time. The storage layer is identical for all of them — only the segment selection strategy differs. [eviction.md](eviction.md) covers each policy's mechanism with source-derived diagrams:
 
 | Policy | Segment selection | Item-level scanning? |
 |--------|-------------------|---------------------|
