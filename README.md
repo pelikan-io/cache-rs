@@ -13,6 +13,11 @@ Rust implementations of cache storage engines from [Pelikan](https://github.com/
 
 See [design](docs/design.md) for architecture details and eviction policy comparison.
 
+See [handoff](docs/handoff.md) for a reference thread architecture pairing direct
+reads with delegated writes. cache-rs owns no threads — that page describes the
+server side, and why the engine's publish protocol is already enough to make it
+correct.
+
 ## Quick Start
 
 ```rust

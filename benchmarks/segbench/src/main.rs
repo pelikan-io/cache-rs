@@ -11,6 +11,7 @@
 //! Prints CSV: threads,write_pct,dist,mode,mops
 
 mod aggregate;
+mod sweep;
 
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
@@ -22,6 +23,7 @@ use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage:\n  \
      segbench <threads> <write_pct> <dist: uniform|zipf> <warmup_s> <measure_s> [mode] [mode args]\n  \
+     segbench sweep [options]            (--help for the grid options)\n  \
      segbench aggregate <results.csv>...";
 
 const MB: usize = 1024 * 1024;
@@ -667,6 +669,20 @@ fn main() {
     }
     if args[1] == "aggregate" {
         if let Err(e) = aggregate::run(&args[2..]) {
+            eprintln!("segbench: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args[1] == "sweep" {
+        let grid = match sweep::parse(&args[2..]) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+        if let Err(e) = sweep::run(&grid) {
             eprintln!("segbench: {e}");
             std::process::exit(1);
         }

@@ -13,30 +13,38 @@ the write path, and nothing in the repo measured the second one.
 
 ```bash
 cargo build --release -p segbench
+SEGBENCH=./target/release/segbench
 
-# one measurement
-./target/release/segbench <threads> <write_pct> <dist> <warmup_s> <measure_s> [mode] [args...]
+# one measurement -> one CSV row on stdout
+$SEGBENCH <threads> <write_pct> <dist> <warmup_s> <measure_s> [mode] [args...]
 
-# a whole sweep
-CPUS=8-15 ./benchmarks/segbench/sweep_scaling.sh
-CPUS=8-15 ./benchmarks/segbench/sweep_locality.sh
-./target/release/segbench aggregate benchmarks/segbench/results/*.csv
+# a grid of them -> CSV on stdout, progress on stderr
+taskset -c 8-15 $SEGBENCH sweep > scaling.csv
+taskset -c 8-15 $SEGBENCH sweep --mode shuf --write 0 > locality.csv
+
+$SEGBENCH aggregate scaling.csv locality.csv
 ```
 
-Each run prints one CSV row: `threads,write_pct,dist,mode,mops`. Sweep scripts
-take `CPUS`, `THREADS`, `BIN` and `OUT` from the environment.
+`sweep --help` lists the grid options (`--threads`, `--write`, `--dist`,
+`--mode`, `--reps`, `--warmup`, `--measure`); the defaults are the grid above.
+Every point runs in a fresh child process, so no cache, allocator, or metrics
+state carries from one to the next.
 
 ### Pin to one kind of core
 
-`CPUS` is passed to `taskset`. Use it. On a hybrid CPU an unpinned sweep spreads
-threads over performance cores, their SMT siblings, and efficiency cores, then
-plots all three against a single "threads" axis — the resulting curve says more
-about the core mix than about the engine. On the i5-13500H the results here were
-taken on, `CPUS=8-15` selects the eight E cores: no SMT, one thread per core,
+Pin the sweep from outside, as above — that pins every child with it. The tool
+has no pinning flag on purpose: `taskset` is Linux-only, and hard-coding it
+would make the harness less portable than the crate it measures.
+
+Pinning is not optional for a meaningful curve. On a hybrid CPU an unpinned
+sweep spreads threads over performance cores, their SMT siblings, and efficiency
+cores, then plots all three against a single "threads" axis — that curve says
+more about the core mix than about the engine. On the i5-13500H these results
+were taken on, `-c 8-15` selects the eight E cores: no SMT, one thread per core,
 so a thread count is a core count.
 
 Threads are confined to that CPU set, not pinned one-to-one within it. With as
-many threads as cores on an otherwise idle set the difference is inside the
+many threads as cores on an otherwise idle set, the difference is inside the
 run-to-run spread.
 
 ## Workload
@@ -72,6 +80,7 @@ series' absolute Mops/s — the distributions have different per-op sampling cos
 that have nothing to do with the engine. `segbench aggregate` computes speedups
 that way, and prints JSON to stdout.
 
-Sweeps write to `results/`, which is gitignored — it is build output, not a
-record. The findings drawn from it are written up in
+Sweep output is CSV on stdout: redirect it wherever you like. It is not
+checked in, being regenerable output rather than a record. The findings drawn
+from it are written up in
 [`docs/journal/2026-08-25-segcache-read-write-scaling.md`](../../docs/journal/2026-08-25-segcache-read-write-scaling.md).

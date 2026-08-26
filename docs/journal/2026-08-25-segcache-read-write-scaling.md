@@ -36,8 +36,9 @@ turned out to hide the result.
 
 ## Scope
 
-New workspace member `benchmarks/segbench` (harness, `segbench aggregate`
-subcommand, sweep scripts) and this entry. `crossbeam-channel` and `rand_distr` added to
+New workspace member `benchmarks/segbench` (harness with `sweep` and
+`aggregate` subcommands and the `handoff_diagram` generator), `docs/handoff.md`
+with its figure, and this entry. `crossbeam-channel` and `rand_distr` added to
 `[workspace.dependencies]`; `segcache` added as a workspace path dependency. No
 existing crate touched, and no engine behavior changed.
 
@@ -50,10 +51,14 @@ keys, 16 B keys, 128 B values, TTL 0, prefilled. 2 s warmup + 8 s measured, 3
 interleaved repeats, median. Run-to-run spread is under 2% at every point.
 
 ```
-CPUS=8-15 ./benchmarks/segbench/sweep_scaling.sh
-CPUS=8-15 ./benchmarks/segbench/sweep_locality.sh
-./target/release/segbench aggregate benchmarks/segbench/results/*.csv
+taskset -c 8-15 ./target/release/segbench sweep                          > scaling.csv
+taskset -c 8-15 ./target/release/segbench sweep --mode shuf --write 0    > loc-r.csv
+taskset -c 8-15 ./target/release/segbench sweep --mode shuf --write 100 --dist zipf > loc-w.csv
+./target/release/segbench aggregate scaling.csv loc-r.csv loc-w.csv
 ```
+
+`sweep` with no options is exactly the grid above: threads 1,2,4,6,8 x write
+0,50,100 x uniform,zipf.
 
 Median Mops/s, with speedup against each series' own single-thread median:
 
@@ -138,6 +143,14 @@ rather than predicting it.
 
 `benchmarks/segbench/README.md` — how to run the harness, what each mode
 measures, and why pinning to one core type is required.
+
+`docs/handoff.md` and `docs/diagrams/handoff-dataflow.svg` — the reference
+thread architecture these measurements argue for: reads in place, writes
+delegated to per-shard owner threads. Moved here from pelikan's journal, since
+the correctness argument is about segcache's publish protocol rather than about
+any server. It is framed as a reference architecture because cache-rs owns no
+threads; the figure's generator asserts eight claims against the harness and
+aborts on drift.
 
 ## Deferred or Reopen Items
 

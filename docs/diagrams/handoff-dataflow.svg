@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 700" font-family="Helvetica, Arial, sans-serif">
+<rect width="1180" height="700" fill="white"/>
+<text x="40" y="34" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="start" font-weight="bold" fill="#222222">Hybrid handoff — read/write path divergence</text>
+<text x="1140" y="34" font-family="Helvetica, Arial, sans-serif" font-size="12" text-anchor="end" fill="#555555">reference architecture · modeled by segbench mode=hybrid @ 761fd7c</text>
+<text x="40" y="52" font-family="Helvetica, Arial, sans-serif" font-size="12" text-anchor="start" font-style="italic" fill="#555555">thread model belongs to the server built on segcache; cache-rs ships the engine band only</text>
+<rect x="40" y="60" width="1100" height="66" fill="white" stroke="#222222" stroke-width="1.2" rx="0" stroke-dasharray="6 4"/>
+<text x="52" y="84" font-family="Helvetica, Arial, sans-serif" font-size="17" text-anchor="start" font-style="italic" fill="#222222">client connections</text>
+<text x="52" y="106" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" font-style="italic" fill="#555555">pipelined requests per connection; replies retired in request order</text>
+<rect x="40" y="166" width="1100" height="116" fill="none" stroke="#222222" stroke-width="1.2" rx="0"/>
+<text x="52" y="190" font-family="Helvetica, Arial, sans-serif" font-size="17" text-anchor="start" fill="#222222">worker thread ×W</text>
+<rect x="52" y="200" width="114.8" height="22" fill="#FBB4AE" stroke="#222222" stroke-width="0.8" rx="4"/>
+<text x="60" y="215.5" font-family="Helvetica, Arial, sans-serif" font-size="14" text-anchor="start" fill="#222222">parse / reply</text>
+<rect x="174.8" y="200" width="107.19999999999999" height="22" fill="#FBB4AE" stroke="#222222" stroke-width="0.8" rx="4"/>
+<text x="182.8" y="215.5" font-family="Helvetica, Arial, sans-serif" font-size="14" text-anchor="start" fill="#222222">direct reads</text>
+<rect x="290" y="200" width="236.39999999999998" height="22" fill="#CCEBC5" stroke="#222222" stroke-width="0.8" rx="4"/>
+<text x="298" y="215.5" font-family="Helvetica, Arial, sans-serif" font-size="14" text-anchor="start" fill="#222222">store buffer (pending writes)</text>
+<rect x="560" y="322" width="580" height="92" fill="none" stroke="#222222" stroke-width="1.2" rx="0"/>
+<text x="572" y="346" font-family="Helvetica, Arial, sans-serif" font-size="17" text-anchor="start" fill="#222222">owner thread ×S</text>
+<text x="572" y="364" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#555555">single writer per key range</text>
+<rect x="572" y="376" width="107.19999999999999" height="22" fill="#CCEBC5" stroke="#222222" stroke-width="0.8" rx="4"/>
+<text x="580" y="391.5" font-family="Helvetica, Arial, sans-serif" font-size="14" text-anchor="start" fill="#222222">apply writes</text>
+<rect x="687.2" y="376" width="206" height="22" fill="#B3CDE3" stroke="#222222" stroke-width="0.8" rx="4"/>
+<text x="695.2" y="391.5" font-family="Helvetica, Arial, sans-serif" font-size="14" text-anchor="start" fill="#222222">TTL stripe = private tail</text>
+<rect x="40" y="454" width="1100" height="96" fill="#F2F2F2" stroke="#222222" stroke-width="1.2" rx="0"/>
+<text x="52" y="478" font-family="Helvetica, Arial, sans-serif" font-size="17" text-anchor="start" fill="#222222">shared segcache engine</text>
+<text x="52" y="496" font-family="DejaVu Sans Mono, Menlo, monospace" font-size="14" text-anchor="start" fill="#555555">Arc&lt;Segcache&gt;</text>
+<rect x="430" y="470" width="300" height="34" fill="white" stroke="#222222" stroke-width="1.2" rx="0"/>
+<text x="444" y="492" font-family="DejaVu Sans Mono, Menlo, monospace" font-size="14" text-anchor="start" fill="#222222">hashtable — publish point</text>
+<rect x="760" y="470" width="330" height="34" fill="white" stroke="#222222" stroke-width="1.2" rx="0"/>
+<text x="774" y="492" font-family="DejaVu Sans Mono, Menlo, monospace" font-size="14" text-anchor="start" fill="#222222">segments + tails + free pool + merge</text>
+<text x="430" y="538" font-family="Helvetica, Arial, sans-serif" font-size="12" text-anchor="start" font-style="italic" fill="#555555">the pointer swing is the linearization point; readers pin + revalidate (unchanged from 0.4.x)</text>
+<text x="60" y="345" font-family="Helvetica, Arial, sans-serif" font-size="14" text-anchor="start" font-weight="bold" fill="#555555">READ PATH</text>
+<text x="60" y="364" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" font-style="italic" fill="#555555">never queues</text>
+<line x1="200" y1="126" x2="200" y2="158" stroke="#222222" stroke-width="2.4"/>
+<path d="M195,156 L205,156 L200,166 Z" fill="#222222"/>
+<circle cx="182" cy="146" r="12" fill="white" stroke="#222222" stroke-width="1.3"/>
+<text x="182" y="150" font-family="Helvetica, Arial, sans-serif" font-size="11" text-anchor="middle" font-weight="bold" fill="#222222">R1</text>
+<text x="212" y="150" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#222222">request bytes</text>
+<line x1="260" y1="282" x2="260" y2="446" stroke="#222222" stroke-width="1.4"/>
+<path d="M255,444 L265,444 L260,454 Z" fill="#222222"/>
+<circle cx="242" cy="300" r="12" fill="white" stroke="#222222" stroke-width="1.3"/>
+<text x="242" y="304" font-family="Helvetica, Arial, sans-serif" font-size="11" text-anchor="middle" font-weight="bold" fill="#222222">R2</text>
+<text x="272" y="304" font-family="DejaVu Sans Mono, Menlo, monospace" font-size="13" text-anchor="start" fill="#222222">get(key)</text>
+<line x1="320" y1="454" x2="320" y2="290" stroke="#222222" stroke-width="1.4"/>
+<path d="M315,292 L325,292 L320,282 Z" fill="#222222"/>
+<circle cx="302" cy="438" r="12" fill="white" stroke="#222222" stroke-width="1.3"/>
+<text x="302" y="442" font-family="Helvetica, Arial, sans-serif" font-size="11" text-anchor="middle" font-weight="bold" fill="#222222">R3</text>
+<text x="332" y="434" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#222222">value (zero-copy)</text>
+<line x1="380" y1="166" x2="380" y2="134" stroke="#222222" stroke-width="2.4"/>
+<path d="M375,136 L385,136 L380,126 Z" fill="#222222"/>
+<circle cx="362" cy="146" r="12" fill="white" stroke="#222222" stroke-width="1.3"/>
+<text x="362" y="150" font-family="Helvetica, Arial, sans-serif" font-size="11" text-anchor="middle" font-weight="bold" fill="#222222">R4</text>
+<text x="392" y="150" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#222222">reply</text>
+<text x="620" y="310" font-family="Helvetica, Arial, sans-serif" font-size="14" text-anchor="start" font-weight="bold" fill="#555555">WRITE PATH — delegated</text>
+<line x1="640" y1="126" x2="640" y2="158" stroke="#222222" stroke-width="2.4"/>
+<path d="M635,156 L645,156 L640,166 Z" fill="#222222"/>
+<circle cx="622" cy="146" r="12" fill="white" stroke="#222222" stroke-width="1.3"/>
+<text x="622" y="150" font-family="Helvetica, Arial, sans-serif" font-size="11" text-anchor="middle" font-weight="bold" fill="#222222">W1</text>
+<text x="652" y="150" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#222222">request bytes</text>
+<rect x="612" y="236" width="210" height="28" fill="white" stroke="#222222" stroke-width="1.2" rx="3"/>
+<circle cx="598" cy="250" r="12" fill="white" stroke="#222222" stroke-width="1.3"/>
+<text x="598" y="254" font-family="Helvetica, Arial, sans-serif" font-size="11" text-anchor="middle" font-weight="bold" fill="#222222">W2</text>
+<text x="624" y="255" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#222222">append to store buffer</text>
+<text x="612" y="278" font-family="Helvetica, Arial, sans-serif" font-size="12" text-anchor="start" font-style="italic" fill="#555555">pipelined same-key GET is forwarded from here</text>
+<line x1="840" y1="282" x2="840" y2="314" stroke="#222222" stroke-width="1.4"/>
+<path d="M835,312 L845,312 L840,322 Z" fill="#222222"/>
+<rect x="816" y="296" width="11" height="12" fill="white" stroke="#222222" stroke-width="1" rx="0"/>
+<rect x="828" y="296" width="11" height="12" fill="white" stroke="#222222" stroke-width="1" rx="0"/>
+<rect x="840" y="296" width="11" height="12" fill="white" stroke="#222222" stroke-width="1" rx="0"/>
+<rect x="852" y="296" width="11" height="12" fill="white" stroke="#222222" stroke-width="1" rx="0"/>
+<circle cx="878" cy="296" r="12" fill="white" stroke="#222222" stroke-width="1.3"/>
+<text x="878" y="300" font-family="Helvetica, Arial, sans-serif" font-size="11" text-anchor="middle" font-weight="bold" fill="#222222">W3</text>
+<text x="894" y="300" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#222222">batch ≤16</text>
+<line x1="900" y1="414" x2="900" y2="446" stroke="#222222" stroke-width="1.4"/>
+<path d="M895,444 L905,444 L900,454 Z" fill="#222222"/>
+<circle cx="882" cy="430" r="12" fill="white" stroke="#222222" stroke-width="1.3"/>
+<text x="882" y="434" font-family="Helvetica, Arial, sans-serif" font-size="11" text-anchor="middle" font-weight="bold" fill="#222222">W4</text>
+<text x="912" y="436" font-family="DejaVu Sans Mono, Menlo, monospace" font-size="13" text-anchor="start" fill="#222222">insert(key, ttl_stripe)</text>
+<circle cx="744" cy="487" r="12" fill="white" stroke="#222222" stroke-width="1.3"/>
+<text x="744" y="491" font-family="Helvetica, Arial, sans-serif" font-size="11" text-anchor="middle" font-weight="bold" fill="#222222">W5</text>
+<text x="744" y="514" font-family="Helvetica, Arial, sans-serif" font-size="12" text-anchor="middle" fill="#555555">publish</text>
+<line x1="1010" y1="322" x2="1010" y2="290" stroke="#222222" stroke-width="1.4"/>
+<path d="M1005,292 L1015,292 L1010,282 Z" fill="#222222"/>
+<circle cx="992" cy="306" r="12" fill="white" stroke="#222222" stroke-width="1.3"/>
+<text x="992" y="310" font-family="Helvetica, Arial, sans-serif" font-size="11" text-anchor="middle" font-weight="bold" fill="#222222">W6</text>
+<text x="1022" y="306" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#222222">ack (applied) †</text>
+<line x1="1070" y1="166" x2="1070" y2="134" stroke="#222222" stroke-width="2.4"/>
+<path d="M1065,136 L1075,136 L1070,126 Z" fill="#222222"/>
+<circle cx="1052" cy="146" r="12" fill="white" stroke="#222222" stroke-width="1.3"/>
+<text x="1052" y="150" font-family="Helvetica, Arial, sans-serif" font-size="11" text-anchor="middle" font-weight="bold" fill="#222222">W7</text>
+<text x="1082" y="150" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#222222">reply †</text>
+<line x1="40" y1="586" x2="86" y2="586" stroke="#222222" stroke-width="2.4"/>
+<text x="94" y="590" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#555555">process boundary</text>
+<line x1="240" y1="586" x2="286" y2="586" stroke="#222222" stroke-width="1.4"/>
+<text x="294" y="590" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#555555">internal</text>
+<rect x="380" y="576" width="46" height="20" fill="white" stroke="#222222" stroke-width="1.2" rx="0" stroke-dasharray="6 4"/>
+<text x="434" y="590" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" font-style="italic" fill="#555555">external</text>
+<rect x="526" y="580" width="11" height="12" fill="white" stroke="#222222" stroke-width="1" rx="0"/>
+<rect x="538" y="580" width="11" height="12" fill="white" stroke="#222222" stroke-width="1" rx="0"/>
+<rect x="550" y="580" width="11" height="12" fill="white" stroke="#222222" stroke-width="1" rx="0"/>
+<rect x="562" y="580" width="11" height="12" fill="white" stroke="#222222" stroke-width="1" rx="0"/>
+<text x="586" y="590" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="start" fill="#555555">bounded channel</text>
+<rect x="720" y="575" width="76.8" height="22" fill="#FBB4AE" stroke="#222222" stroke-width="0.8" rx="4"/>
+<text x="728" y="590.5" font-family="Helvetica, Arial, sans-serif" font-size="14" text-anchor="start" fill="#222222">protocol</text>
+<rect x="802.8" y="575" width="69.19999999999999" height="22" fill="#B3CDE3" stroke="#222222" stroke-width="0.8" rx="4"/>
+<text x="810.8" y="590.5" font-family="Helvetica, Arial, sans-serif" font-size="14" text-anchor="start" fill="#222222">storage</text>
+<rect x="878" y="575" width="69.19999999999999" height="22" fill="#CCEBC5" stroke="#222222" stroke-width="0.8" rx="4"/>
+<text x="886" y="590.5" font-family="Helvetica, Arial, sans-serif" font-size="14" text-anchor="start" fill="#222222">runtime</text>
+<text x="40" y="626" font-family="Helvetica, Arial, sans-serif" font-size="12" text-anchor="start" font-style="italic" fill="#555555">† design contract (reply released only after W5 publish — reply-after-apply); segbench models the throughput path, not reply release.</text>
+<text x="40" y="646" font-family="Helvetica, Arial, sans-serif" font-size="12" text-anchor="start" font-style="italic" fill="#555555">RMW/CAS ops travel the write path and return applied state in the ack; `noreply` forms may skip W6/W7 — they are the protocol's early-ack path.</text>
+</svg>
