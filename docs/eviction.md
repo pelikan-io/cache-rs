@@ -89,8 +89,8 @@ location. See [s3fifo.md](s3fifo.md) for the full design.
 ## Provenance
 
 The three figures are **generated — do not edit**:
-`python3 docs/diagrams/eviction_diagrams.py` regenerates them in place. The
-generator asserts 22 source claims plus one ordering claim (admission-pool
+`cargo run -p segcache --example eviction_diagrams` regenerates them in
+place. The generator (`crates/segcache/examples/eviction_diagrams.rs`) asserts 22 source claims plus one ordering claim (admission-pool
 eviction precedes main) against `crates/segcache` and aborts on drift; all
 drawn geometry is bounds-checked into each figure's viewBox. Current render
 derived at commit `073cce5` with `crates/segcache` clean. Freshness is manual
