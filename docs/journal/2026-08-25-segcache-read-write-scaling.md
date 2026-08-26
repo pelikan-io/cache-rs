@@ -2,6 +2,7 @@
 status: shipped
 opened: 2026-08-25
 updated: 2026-08-25
+prs: [88]
 ---
 
 # Read and write scaling of the shared segcache engine
@@ -62,6 +63,9 @@ Median Mops/s, with speedup against each series' own single-thread median:
 | 4 | 11.016 (4.14x) | 6.880 (3.58x) | 0.975 (0.99x) | 1.073 (1.13x) | 1.824 (1.27x) |
 | 6 | 16.483 (6.19x) | 9.274 (4.82x) | 0.952 (0.97x) | 1.056 (1.11x) | 1.844 (1.28x) |
 | 8 | 21.796 (8.19x) | 11.371 (5.91x) | 0.808 (0.82x) | 0.910 (0.95x) | 1.639 (1.14x) |
+
+PR: pelikan-io/cache-rs#88 (branched from main at 911dc11, one commit
+`837ebe3`).
 
 Verification: `cargo clippy -p segbench --all-targets --all-features -- -D
 warnings` and `cargo fmt --all --check` both clean;
