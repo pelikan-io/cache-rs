@@ -12,6 +12,137 @@ use std::cmp::min;
 
 const RESERVE_RETRIES: usize = 3;
 
+/// How many post-pin revalidation mismatches `get_pinned` tolerates before it
+/// reports a miss (#65).
+///
+/// A mismatch means another thread published a NEW location for this exact key
+/// between our pin and our revalidation, so every retry is paid for by real
+/// system-wide progress — the same termination argument `cas_location` and
+/// `try_unlink_in_bucket` rely on. That makes an UNBOUNDED loop lock-free but
+/// not starvation-free: unlike a drain (bounded, straight-line work that must
+/// finish), nothing bounds how long a stream of writers keeps rewriting a hot
+/// key, and this is the library's hottest path. So the loop keeps a hard cap.
+///
+/// The cap is its own constant rather than `RESERVE_RETRIES` because it bounds
+/// a different thing (concurrent republications of one key, not reservation
+/// attempts), and because 3 is far too tight: with retries that CONVERGE on
+/// the location the revalidation just returned, exhausting the budget needs 16
+/// consecutive republications each landing inside a pin+lookup window. At the
+/// ~1% per-attempt mismatch rate measured on the worst realistic workload
+/// (#65: one key rewritten by 24 oversubscribed `cas` threads while read) that
+/// is ~1e-32, versus ~1e-6 at 3 — while still capping a `get` at 16 pins.
+pub(crate) const REVALIDATE_RETRIES: usize = 16;
+
+/// Fault injection for `get_pinned`'s lookup/revalidate window. Compiled only
+/// under `feature = "fault-injection"`; a normal build has no trace of it.
+///
+/// The revalidation race is a two-thread interleaving that no unit test can
+/// schedule directly: a writer must republish the key in the window between a
+/// reader's lookup and its revalidation. These two hooks let a single-threaded
+/// test stand in for that writer at exactly the two points that matter, which
+/// is what makes the #65 coverage deterministic instead of a stress run.
+///
+/// - [`after_lookup`] fires after a FROM-SCRATCH lookup resolves a location.
+///   The converging retry loop does one of these per `get`, so a hook that
+///   republishes on every firing loops forever against the pre-#65 code (which
+///   re-looked-up on every attempt) and fires exactly once against this one.
+/// - [`before_revalidate`] fires after the pin, before the revalidation
+///   lookup — i.e. inside the window the retry budget exists to survive.
+#[cfg(feature = "fault-injection")]
+pub(crate) mod revalidation_fault {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Hook = Rc<dyn Fn()>;
+
+    thread_local! {
+        static AFTER_LOOKUP: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static BEFORE_REVALIDATE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Uninstalls both hooks when dropped, so a panicking test cannot leak one
+    /// into whatever else runs on this thread.
+    #[cfg(all(test, not(model_checking)))]
+    pub(crate) struct HookGuard(());
+
+    #[cfg(all(test, not(model_checking)))]
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            AFTER_LOOKUP.with(|h| *h.borrow_mut() = None);
+            BEFORE_REVALIDATE.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(all(test, not(model_checking)))]
+    pub(crate) fn on_after_lookup(f: impl Fn() + 'static) -> HookGuard {
+        AFTER_LOOKUP.with(|h| *h.borrow_mut() = Some(Rc::new(f)));
+        HookGuard(())
+    }
+
+    #[cfg(all(test, not(model_checking)))]
+    pub(crate) fn on_before_revalidate(f: impl Fn() + 'static) -> HookGuard {
+        BEFORE_REVALIDATE.with(|h| *h.borrow_mut() = Some(Rc::new(f)));
+        HookGuard(())
+    }
+
+    // The hook is cloned out before it is called: the callback re-enters the
+    // cache (that is the point — it republishes the key), and a live
+    // `RefCell` borrow across that call would be a re-entrancy panic waiting
+    // for the first hook that also reads a hook.
+    #[inline]
+    pub(crate) fn after_lookup() {
+        if let Some(hook) = AFTER_LOOKUP.with(|h| h.borrow().clone()) {
+            hook();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn before_revalidate() {
+        if let Some(hook) = BEFORE_REVALIDATE.with(|h| h.borrow().clone()) {
+            hook();
+        }
+    }
+}
+
+/// Test-only tally of how often [`Segcache::relookup_after_pin_failure`] has
+/// taken its **stale-incarnation** arm and charged the revalidation budget.
+///
+/// The arm's safety argument is that charging costs a real segment *recycle*,
+/// so exhausting `REVALIDATE_RETRIES` inside one lookup -> pin window would
+/// take ~16 full segment lifecycles. A test of that argument has to prove it
+/// entered the arm at all: a churn test that only republishes the key never
+/// invalidates an incarnation, so it never charges, and it would pass while
+/// asserting nothing. Counting here (rather than inferring from the fault
+/// hooks) is what makes that vacuity impossible to reach silently — if a
+/// future change stops routing stale locations through this arm, the count
+/// goes to zero and the test fails instead of quietly becoming a no-op.
+///
+/// Thread-local, like the fault hooks it is used with: the `get` under test
+/// runs on the thread that installed them.
+#[cfg(all(test, not(model_checking)))]
+pub(crate) mod stale_incarnation_charges {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CHARGES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// One budget attempt charged for a location whose incarnation is gone.
+    #[inline]
+    pub(crate) fn record() {
+        CHARGES.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Read the tally and reset it, so consecutive tests on one thread do not
+    /// inherit each other's counts.
+    // Used by `revalidation_tests`, which needs `fault-injection`; without
+    // that feature the only caller is cfg'd out.
+    #[allow(dead_code)]
+    pub(crate) fn take() -> usize {
+        CHARGES.with(|c| c.replace(0))
+    }
+}
+
 /// A pre-allocated key-value store with eager expiration. It uses a
 /// segment-structured design that stores data in fixed-size segments, grouping
 /// objects with nearby expiration time into the same segment, and lifting most
@@ -117,32 +248,54 @@ impl Segcache {
     #[inline(always)]
     fn get_pinned(&self, key: &[u8], update_freq: bool) -> Option<Item> {
         let verifier = self.verifier();
+        let backoff = Backoff::new();
         let mut attempts = 0;
+        let mut location = self.lookup_location(key, &verifier, update_freq)?;
         loop {
-            let (location, _freq) = if update_freq {
-                self.hashtable.lookup(key, &verifier)?
-            } else {
-                self.hashtable.lookup_no_freq_update(key, &verifier)?
-            };
-            let (seg_id, offset) = unpack_location(location);
+            let (seg_id, _offset) = unpack_location(location);
             let seg_id = NonZeroU32::new(seg_id)?;
-            let (raw, guard) = self.segments.acquire_item_at(seg_id, offset)?;
+            // The incarnation check lives INSIDE the pin, not in front of it:
+            // `acquire_item_at` takes the whole `Location` and compares its tag
+            // against the segment's generation under the reader guard, which is
+            // what freezes the generation while it is read. A stale incarnation
+            // therefore fails the pin, and the triage of *why* a pin failed is
+            // `relookup_after_pin_failure`'s job — off the hot path, behind a
+            // cold edge, so the fast path pays for exactly one generation load
+            // (the one inside the pin) and no `resolve` of its own.
+            let Some((raw, guard)) = self.segments.acquire_item_at(location) else {
+                location = self.relookup_after_pin_failure(
+                    key,
+                    &verifier,
+                    update_freq,
+                    &backoff,
+                    location,
+                    &mut attempts,
+                )?;
+                continue;
+            };
+            #[cfg(feature = "fault-injection")]
+            revalidation_fault::before_revalidate();
             // Re-validate AFTER pinning (concurrent-write reader safety, item
             // 7f). Between the lookup and the pin, `location`'s segment can be
             // drained, recycled, and REUSED (a different item written at this
-            // offset), so `raw` may be an aliased/torn read. A fresh lookup only
-            // ever reads currently-published items — stale entries are removed
-            // from the hashtable BEFORE a segment is recycled — so it is safe
-            // and authoritative: if the key still resolves to this exact
-            // `location`, the (now pinned, hence un-recyclable) segment genuinely
-            // holds the item we want. If it no longer does, drop the pin and
-            // retry; give up after a few attempts (a key churning under us).
-            if self
+            // offset), so `raw` may be an aliased/torn read — the CI-caught bug
+            // this protocol exists to prevent was a reader handing back ANOTHER
+            // KEY'S VALUE, not a miss.
+            //
+            // A fresh hashtable lookup is the soundness argument. It only ever
+            // reads currently-published items — stale entries are removed from
+            // the hashtable BEFORE a segment is recycled — so it is
+            // authoritative in both directions: resolving to this exact
+            // `location` means the (now pinned, hence un-recyclable) segment
+            // genuinely holds the item we want, and resolving ELSEWHERE hands
+            // us a location that is itself currently published. See
+            // `follow_republished` for why following the second is the same
+            // argument rather than a weakening of it.
+            let current = self
                 .hashtable
                 .lookup_no_freq_update(key, &verifier)
-                .map(|(l, _)| l)
-                == Some(location)
-            {
+                .map(|(l, _)| l);
+            if current == Some(location) {
                 // Lazy expiry: an item past its segment deadline is treated
                 // as missing, matching memcached, even before the segment is
                 // reclaimed. The segment is pinned here, so its header's
@@ -157,11 +310,170 @@ impl Segcache {
                 return Some(Item::new(raw, cas, guard));
             }
             drop(guard);
-            attempts += 1;
-            if attempts >= RESERVE_RETRIES {
+            location = Self::follow_republished(current, &mut attempts)?;
+        }
+    }
+
+    /// Resolve `key` to a location from scratch, honouring `update_freq`.
+    #[inline(always)]
+    fn lookup_location(
+        &self,
+        key: &[u8],
+        verifier: &SegmentsVerifier<'_>,
+        update_freq: bool,
+    ) -> Option<Location> {
+        let (location, _freq) = if update_freq {
+            self.hashtable.lookup(key, verifier)?
+        } else {
+            self.hashtable.lookup_no_freq_update(key, verifier)?
+        };
+        #[cfg(feature = "fault-injection")]
+        revalidation_fault::after_lookup();
+        Some(location)
+    }
+
+    /// The revalidation lookup disagreed with the pinned location: `current` is
+    /// where `key` is published NOW (or `None` if it is published nowhere).
+    ///
+    /// Pinning THAT rather than looking the key up again is what makes these
+    /// retries converge (#65). It is sound by the revalidation's own argument —
+    /// `current` came out of a fresh lookup, so it is currently published — and
+    /// it is not the rejected "trust the pinned location" shape: the next thing
+    /// that happens to it is another pin AND another full revalidation lookup.
+    ///
+    /// Before this, every attempt re-raced from scratch, and each attempt's
+    /// vulnerable window spanned lookup + pin + lookup; now it spans only
+    /// pin + lookup, and the second lookup per attempt is gone from the `get`
+    /// path entirely (a cost flagged as "optimize later" when 7f landed).
+    ///
+    /// `None` out means the `get` is over: either the key is genuinely
+    /// unpublished, or the budget is spent. Spending it is a false absent —
+    /// the key is live and we know where — but the alternative, spinning until
+    /// the writers stop, is a starvation hazard on the hottest path. The budget
+    /// picks the first, sized so that reaching it is not a rate anyone will
+    /// observe (see `REVALIDATE_RETRIES`).
+    #[cold]
+    #[inline(never)]
+    fn follow_republished(current: Option<Location>, attempts: &mut usize) -> Option<Location> {
+        *attempts += 1;
+        if *attempts >= REVALIDATE_RETRIES {
+            return None;
+        }
+        current
+    }
+
+    /// The reader pin failed. Both answers are a fresh lookup; they differ only
+    /// in whether the retry is bounded, and the incarnation tag is what tells
+    /// them apart. `acquire_item_at` refuses a pin for exactly two reasons, and
+    /// this is the one place that has to distinguish them:
+    ///
+    /// **Transient (`resolve` still says `Some`)** — the segment is in a
+    /// non-readable state: a drain owns it (Draining) or it is mid linking.
+    /// Under merge eviction a drain RETAINS live items (they are relocated into
+    /// the copy destination and republished), so an unreadable segment does NOT
+    /// mean the key is gone: returning `None` here is a false miss — the key
+    /// "reappears" once the merge publishes the relocation, breaking
+    /// read-your-writes and the add/replace semantics built on a get. Look the
+    /// key up again instead (the same protocol as `numeric_update`): the owning
+    /// drain is bounded, straight-line work that either republishes the item at
+    /// a new location (the fresh lookup resolves there, in a readable segment)
+    /// or removes the entry (the lookup returns `None` and we exit). This retry
+    /// is deliberately NOT counted against the revalidation budget: a drain
+    /// window is far longer than a few spins, so a bounded retry would still
+    /// report false misses. Termination relies on writers/drains never wedging
+    /// — see the replace-vs-drain rollback in `insert`/`replace_at`, which
+    /// guarantees drains cannot block forever on a writer pin.
+    ///
+    /// **Stale incarnation (`resolve` says `None`)** — the segment is perfectly
+    /// readable; it is `location` that is dead. Its tag no longer matches the
+    /// segment's generation, so it names an item that was reclaimed, and a hit
+    /// on whatever occupies those bytes now would be another key's value. That
+    /// is a MISS, and nothing about it is transient: no drain is going to finish
+    /// and fix it. Retrying is still right — the entry is stale by definition,
+    /// so either a writer has already published a fresh location or the key is
+    /// gone — and it is retried under a BOUND, which is the whole reason the tag
+    /// is consulted here rather than left to the post-pin revalidation (that
+    /// would also reject the location, but only after routing it through the
+    /// unbounded arm above).
+    ///
+    /// **What the bound is actually for.** The design justified it as "a stale
+    /// tag must be retried under a bound or a permanently stale entry spins that
+    /// arm forever". No such entry is reachable through the public API, by two
+    /// invariants that meet:
+    ///
+    /// - *nothing publishes at a dead generation.* Every location the hashtable
+    ///   ever holds is packed from a generation read while holding something
+    ///   that blocks the two `-> Free` transitions: `try_alloc_item` reads it
+    ///   after `try_pin_writer` and hands it out inside the `ReservedItem`,
+    ///   whose `WriterPin` is held across the publish (`insert`, `replace_at`);
+    ///   the two relink sites read it off a segment they have claimed
+    ///   (`Draining` source, `Relinking` destination — `pack_location`'s stated
+    ///   precondition).
+    /// - *nothing survives the bump.* Both bumps are reached only through
+    ///   `finalize_drained`, which runs `Segment::clear` first, and `clear`
+    ///   sweeps every item boundary in `[0, write_offset)` — exactly the set of
+    ///   offsets a published location can name — unlinking each entry still
+    ///   there. (`try_unlink_in_bucket` retries its slot across a racing
+    ///   frequency bump for precisely this reason: a spurious `false` would
+    ///   "recycle the segment with the entry still published".) And
+    ///   `claim_for_drain` waits out every writer and remover before the sweep,
+    ///   so no in-flight publish can land behind it.
+    ///
+    /// So at the instant a generation advances, no entry names the outgoing
+    /// incarnation, and a fresh lookup can only hand back a location that was
+    /// live when it was read. Each firing of this arm is therefore PAID FOR by a
+    /// drain+recycle completing inside one lookup -> pin window — real
+    /// system-wide progress, the same termination argument as the revalidation
+    /// mismatch it shares a budget with. The loop is lock-free and terminates
+    /// without the bound; the bound buys STARVATION-freedom (a `get` costs at
+    /// most `REVALIDATE_RETRIES` pins under any recycle storm), and it is what
+    /// makes a directly PLANTED stale entry terminate — a state reachable only
+    /// from inside the crate, which is how
+    /// `incarnation_tests::stale_location_is_rejected_by_every_consumer` gets to
+    /// assert this arm's policy at all.
+    ///
+    /// The three write-path loops that also retry a refused pin
+    /// (`cas`, `numeric_update`, `try_into_numeric`) do NOT share this bound and
+    /// do not triage the two failures at all — they retry both unboundedly. That
+    /// is sound for the reason above and NOT parity with this function; each says
+    /// so at its own snooze.
+    ///
+    /// It shares `attempts` — and therefore `REVALIDATE_RETRIES` — with
+    /// `follow_republished` rather than carrying `RESERVE_RETRIES`. The two
+    /// bound the same thing (how many times ONE `get` re-attempts because the
+    /// world moved under it, one pin apiece), so a single counter is what caps
+    /// a `get` at `REVALIDATE_RETRIES` pins no matter how an adversary mixes the
+    /// arms. `RESERVE_RETRIES` bounds reservation attempts on the write path;
+    /// #68 split the read path's budget out of it precisely because 3 is far too
+    /// tight for a live key, and re-coupling this arm to it would re-introduce
+    /// the false miss on the other face of the same window.
+    ///
+    /// Charging costs a real segment RECYCLE, so exhausting the budget here
+    /// needs ~16 full segment lifecycles inside one lookup -> pin window.
+    /// `revalidation_tests::budget_absorbs_recycled_incarnations_without_a_false_absent`
+    /// drives 15 of them deterministically and counts the charges, so that
+    /// argument is tested rather than merely stated.
+    #[cold]
+    #[inline(never)]
+    fn relookup_after_pin_failure(
+        &self,
+        key: &[u8],
+        verifier: &SegmentsVerifier<'_>,
+        update_freq: bool,
+        backoff: &Backoff,
+        location: Location,
+        attempts: &mut usize,
+    ) -> Option<Location> {
+        if self.segments.resolve(location).is_none() {
+            #[cfg(all(test, not(model_checking)))]
+            stale_incarnation_charges::record();
+            *attempts += 1;
+            if *attempts >= REVALIDATE_RETRIES {
                 return None;
             }
         }
+        backoff.snooze();
+        self.lookup_location(key, verifier, update_freq)
     }
 
     /// Build the CAS token for an item: location + segment generation,
@@ -221,143 +533,200 @@ impl Segcache {
 
         let ttl = Self::coarse_ttl(ttl);
 
-        let reserved = self.reserve_and_define(key, value, optional, ttl)?;
+        // The whole reserve→publish operation restarts (fresh reservation)
+        // when publishing would deadlock against a drain of the reservation's
+        // own segment — see the replace arm's pin-failure handler below.
+        'operation: loop {
+            // `Value` is a borrowed enum without `Copy`; re-borrow it for this
+            // attempt so a restart can consume it again.
+            let attempt_value = match &value {
+                Value::Bytes(b) => Value::Bytes(b),
+                Value::U64(v) => Value::U64(*v),
+            };
+            let reserved = self.reserve_and_define(key, attempt_value, optional, ttl)?;
 
-        let new_location = pack_location(reserved.seg(), reserved.offset() as u64);
-        let (new_seg, new_offset) = (reserved.seg(), reserved.offset());
-        let verifier = self.verifier();
+            // Fresh publish: the generation of the incarnation we reserved in,
+            // captured under the reservation's WriterPin.
+            let new_location = pack_location(
+                reserved.seg(),
+                reserved.generation(),
+                reserved.offset() as u64,
+            );
+            let new_seg = reserved.seg();
+            let verifier = self.verifier();
 
-        // Publish under the pin: `reserved` (and its WriterPin) is held across
-        // the hashtable op(s) below so a concurrent drain cannot recycle the
-        // segment between define and publish (item 7d, H2). It is dropped the
-        // instant publish succeeds, on every path below, BEFORE any
-        // `remove_at` — which can take a bucket `chain_lock` (empty-segment
-        // drain / merge-compact) and would deadlock a drainer that waits on
-        // `active_writers` WHILE holding that same `chain_lock` (lock-order
-        // inversion). Invariant: never hold a WriterPin across a `chain_lock`
-        // acquisition.
-        //
-        // Replace is now "lookup -> pinned cas_location-replace, else
-        // insert-if-absent" rather than one atomic hashtable upsert (item 7f,
-        // F2): the old item's location must be known BEFORE it is unlinked so
-        // its segment can be pinned (`try_pin_remover`) across the unlink AND
-        // the `remove_at` decrement — closing the window where a concurrent
-        // eviction drain of that segment could interleave with the decrement.
-        //
-        // `lookup_slot` (item 7f perf follow-up) returns the slot the old
-        // entry was found in alongside its location, so the publish below
-        // uses `cas_location_at` to CAS that exact slot directly instead of
-        // `cas_location` re-probing the key's candidate buckets from
-        // scratch — the hashtable does one hash per op regardless, so this
-        // only elides the redundant second bucket scan/verify.
-        let backoff = Backoff::new();
-        loop {
-            match self.hashtable.lookup_slot(key, &verifier) {
-                Some((old_location, slot)) => {
-                    if old_location == new_location {
-                        // Already published (a prior loop iteration's
-                        // fresh-key upsert below raced another insert of this
-                        // same reservation) — nothing left to unlink/decrement.
-                        return Ok(());
-                    }
-
-                    let (old_seg_raw, old_offset) = unpack_location(old_location);
-                    let Some(old_seg_id) = NonZeroU32::new(old_seg_raw) else {
-                        // Not expected — `lookup_slot` only returns real
-                        // (non-ghost) entries — but stay defensive and fall
-                        // through to the same rollback used below.
-                        break;
-                    };
-
-                    // Pin the OLD item's segment BEFORE unlinking it (item
-                    // 7f). If a drain has already claimed the segment, it
-                    // owns the item's removal — bail and retry the lookup.
-                    let Some(pin) = self.segments.try_pin_remover(old_seg_id) else {
-                        backoff.snooze();
-                        continue;
-                    };
-
-                    if self
-                        .hashtable
-                        .cas_location_at(slot, old_location, new_location, true)
-                    {
-                        #[cfg(feature = "metrics")]
-                        ITEM_REPLACE.increment();
-
-                        drop(reserved);
-                        let _ = self.segments.remove_at(
-                            old_seg_id,
-                            old_offset,
-                            &self.ttl_buckets,
-                            &self.hashtable,
-                            pin,
-                        );
-                        return Ok(());
-                    }
-
-                    // Lost the unlink race — release the pin and retry.
-                    drop(pin);
-                }
-                None => {
-                    // Fresh key: insert. `hashtable.insert()` is itself an
-                    // atomic upsert, so if a racing writer's insert of this
-                    // same previously-absent key beat us here, our call
-                    // unlinks THEIRS (not ours) as a side effect and returns
-                    // it as `Ok(Some(raced_old))`. F4's matching-slot retry
-                    // means this always resolves to exactly one hashtable
-                    // entry (ours), but that racer's segment accounting is
-                    // now our responsibility to decrement — same as any
-                    // other replace, just with the unlink already done by
-                    // the call above rather than by a pin-first
-                    // `cas_location` (a narrow, accepted gap: if a drain
-                    // claims that segment in the instant between the unlink
-                    // above and the pin attempt below, the pin fails and
-                    // that decrement is missed — concurrent fresh-insert
-                    // de-dup racing a same-instant drain is a known separate
-                    // follow-up).
-                    match self
-                        .hashtable
-                        .insert(reserved.item().key(), new_location, &verifier)
-                    {
-                        Ok(None) => {
-                            #[cfg(feature = "metrics")]
-                            HASH_INSERT.increment();
+            // Publish under the pin: `reserved` (and its WriterPin) is held across
+            // the hashtable op(s) below so a concurrent drain cannot recycle the
+            // segment between define and publish (item 7d, H2). It is dropped the
+            // instant publish succeeds, on every path below, BEFORE any
+            // `remove_at` — which can take a bucket `chain_lock` (empty-segment
+            // drain / merge-compact) and would deadlock a drainer that waits on
+            // `active_writers` WHILE holding that same `chain_lock` (lock-order
+            // inversion). Invariant: never hold a WriterPin across a `chain_lock`
+            // acquisition.
+            //
+            // Replace is now "lookup -> pinned cas_location-replace, else
+            // insert-if-absent" rather than one atomic hashtable upsert (item 7f,
+            // F2): the old item's location must be known BEFORE it is unlinked so
+            // its segment can be pinned (`try_pin_remover`) across the unlink AND
+            // the `remove_at` decrement — closing the window where a concurrent
+            // eviction drain of that segment could interleave with the decrement.
+            //
+            // `lookup_slot` (item 7f perf follow-up) returns the slot the old
+            // entry was found in alongside its location, so the publish below
+            // uses `cas_location_at` to CAS that exact slot directly instead of
+            // `cas_location` re-probing the key's candidate buckets from
+            // scratch — the hashtable does one hash per op regardless, so this
+            // only elides the redundant second bucket scan/verify.
+            let backoff = Backoff::new();
+            loop {
+                match self.hashtable.lookup_slot(key, &verifier) {
+                    Some((old_location, slot)) => {
+                        if old_location == new_location {
+                            // Already published (a prior loop iteration's
+                            // fresh-key upsert below raced another insert of this
+                            // same reservation) — nothing left to unlink/decrement.
                             return Ok(());
                         }
-                        Ok(Some(raced_old)) => {
-                            #[cfg(feature = "metrics")]
-                            HASH_INSERT.increment();
-                            drop(reserved);
-                            let (raced_seg, raced_offset) = unpack_location(raced_old);
-                            if let Some(raced_seg) = NonZeroU32::new(raced_seg) {
-                                if let Some(pin) = self.segments.try_pin_remover(raced_seg) {
-                                    let _ = self.segments.remove_at(
-                                        raced_seg,
-                                        raced_offset,
-                                        &self.ttl_buckets,
-                                        &self.hashtable,
-                                        pin,
-                                    );
-                                }
+
+                        // Address only — the incarnation check happens inside
+                        // `remove_at`, under the remover pin taken below (an
+                        // unpinned check here could go stale before the pin).
+                        let (old_seg_raw, _old_offset) = unpack_location(old_location);
+                        let Some(old_seg_id) = NonZeroU32::new(old_seg_raw) else {
+                            // Not expected — `lookup_slot` only returns real
+                            // (non-ghost) entries — but stay defensive and fall
+                            // through to the same rollback used below.
+                            break;
+                        };
+
+                        // Pin the OLD item's segment BEFORE unlinking it (item
+                        // 7f). If a drain has already claimed the segment, the
+                        // drain owns the item's removal; how to wait for it
+                        // depends on WHICH segment it is:
+                        //
+                        // - `old_seg_id == new_seg` (common: the old value and
+                        //   our new reservation co-locate in the Live tail —
+                        //   e.g. a re-set of a recently written key): the drain
+                        //   that claimed the segment is now waiting for
+                        //   `active_writers == 0`, i.e. for the WriterPin held
+                        //   inside `reserved`. It can never sweep the old entry
+                        //   while we hold that pin, so a spin-and-relookup here
+                        //   NEVER resolves — both threads wedge at 100% CPU
+                        //   (and the drainer holds the bucket `chain_lock`,
+                        //   wedging every writer of the TTL bucket). Roll the
+                        //   reservation back — dropping the WriterPin unblocks
+                        //   the drain — and restart the whole operation; the
+                        //   retry reserves in a fresh tail because this segment
+                        //   is no longer writable.
+                        //
+                        // - `old_seg_id != new_seg`: that drain is not waiting
+                        //   on OUR pin and normally finishes on its own, so a
+                        //   brief spin-and-relookup is productive (the entry is
+                        //   swept or republished elsewhere). But it can be
+                        //   waiting on ANOTHER writer's pin whose owner is
+                        //   symmetrically blocked on a drain of OUR segment (a
+                        //   cross-thread cycle), so the spin is bounded: once
+                        //   the backoff is exhausted, roll back and restart
+                        //   here too — releasing our pin breaks any such cycle.
+                        let Some(pin) = self.segments.try_pin_remover(old_seg_id) else {
+                            if old_seg_id == new_seg || backoff.is_completed() {
+                                self.rollback_reservation(reserved, new_location);
+                                continue 'operation;
                             }
+                            backoff.snooze();
+                            continue;
+                        };
+
+                        if self
+                            .hashtable
+                            .cas_location_at(slot, old_location, new_location, true)
+                        {
+                            #[cfg(feature = "metrics")]
+                            ITEM_REPLACE.increment();
+
+                            drop(reserved);
+                            // `remove_at` re-validates `old_location`'s
+                            // incarnation under `pin` and skips the decrement
+                            // if the entry we just replaced was published by an
+                            // incarnation that is already gone.
+                            let _ = self.segments.remove_at(
+                                old_location,
+                                &self.ttl_buckets,
+                                &self.hashtable,
+                                pin,
+                            );
                             return Ok(());
                         }
-                        Err(()) => {
-                            // Hashtable full — roll back the (unpublished)
-                            // reservation.
-                            #[cfg(feature = "metrics")]
-                            HASH_INSERT_EX.increment();
-                            self.rollback_reservation(reserved, new_seg, new_offset);
-                            return Err(SegcacheError::HashTableInsertEx);
+
+                        // Lost the unlink race — release the pin and retry.
+                        drop(pin);
+                    }
+                    None => {
+                        // Fresh key: `hashtable.insert()` is an atomic upsert
+                        // whose entry CREATION is serialized per key-hash
+                        // stripe (table.rs), so concurrent fresh inserts of
+                        // one key can never publish duplicate entries. If a
+                        // racing writer published this key between our
+                        // `lookup_slot` miss and here, our call resolves to a
+                        // replace under the stripe's re-check and returns the
+                        // racer's location as `Ok(Some(raced_old))` — that
+                        // racer's segment accounting is then ours to
+                        // decrement, with the unlink already done by the call
+                        // above rather than by a pin-first `cas_location` (a
+                        // narrow, accepted gap: if a drain claims that
+                        // segment between the unlink and the pin attempt
+                        // below, the pin fails and the drain owns the
+                        // segment's accounting wholesale). The gap's second
+                        // face — the pin SUCCEEDING on a recycled-and-reused
+                        // incarnation of that segment id, landing the
+                        // decrement on the wrong incarnation — is now closed:
+                        // `raced_old` carries its incarnation tag, and
+                        // `remove_at` re-checks it under the pin and skips the
+                        // decrement on a mismatch.
+                        match self
+                            .hashtable
+                            .insert(reserved.item().key(), new_location, &verifier)
+                        {
+                            Ok(None) => {
+                                #[cfg(feature = "metrics")]
+                                HASH_INSERT.increment();
+                                return Ok(());
+                            }
+                            Ok(Some(raced_old)) => {
+                                #[cfg(feature = "metrics")]
+                                HASH_INSERT.increment();
+                                drop(reserved);
+                                let (raced_seg, _raced_offset) = unpack_location(raced_old);
+                                if let Some(raced_seg) = NonZeroU32::new(raced_seg) {
+                                    if let Some(pin) = self.segments.try_pin_remover(raced_seg) {
+                                        let _ = self.segments.remove_at(
+                                            raced_old,
+                                            &self.ttl_buckets,
+                                            &self.hashtable,
+                                            pin,
+                                        );
+                                    }
+                                }
+                                return Ok(());
+                            }
+                            Err(()) => {
+                                // Hashtable full — roll back the (unpublished)
+                                // reservation.
+                                #[cfg(feature = "metrics")]
+                                HASH_INSERT_EX.increment();
+                                self.rollback_reservation(reserved, new_location);
+                                return Err(SegcacheError::HashTableInsertEx);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Defensive fallback for the "invalid old location" break above.
-        self.rollback_reservation(reserved, new_seg, new_offset);
-        Err(SegcacheError::HashTableInsertEx)
+            // Defensive fallback for the "invalid old location" break above.
+            self.rollback_reservation(reserved, new_location);
+            return Err(SegcacheError::HashTableInsertEx);
+        }
     }
 
     /// Roll back an unpublished reservation: release its `WriterPin` (item
@@ -367,12 +736,22 @@ impl Segcache {
     /// a reserved-but-never-published item. If the pin fails (the segment is
     /// concurrently being drained), the drain owns the item's accounting —
     /// nothing further to do.
-    fn rollback_reservation(&self, reserved: ReservedItem, seg: NonZeroU32, offset: usize) {
+    ///
+    /// `location` is the reservation's own location, built under the
+    /// `WriterPin` that is dropped on the first line here. Dropping it opens a
+    /// window in which the segment can be drained and recycled before the
+    /// remover pin below succeeds — on a DIFFERENT incarnation. `remove_at`
+    /// re-checks the tag under that pin and skips the decrement if so.
+    fn rollback_reservation(&self, reserved: ReservedItem, location: Location) {
         drop(reserved);
+        let (seg, _offset) = unpack_location(location);
+        let Some(seg) = NonZeroU32::new(seg) else {
+            return;
+        };
         if let Some(pin) = self.segments.try_pin_remover(seg) {
             let _ = self
                 .segments
-                .remove_at(seg, offset, &self.ttl_buckets, &self.hashtable, pin);
+                .remove_at(location, &self.ttl_buckets, &self.hashtable, pin);
         }
     }
 
@@ -492,22 +871,46 @@ impl Segcache {
     /// retries in the loop below: `old_location` only ever lives in one
     /// slot at a time, so as long as `get_item_frequency` still finds
     /// `old_location` under `key`, it is still at `old_slot`.
+    ///
+    /// `expected_token`, when given (the `cas` path), is the caller's
+    /// full CAS token: it is RE-VERIFIED under the old segment's remover
+    /// pin immediately before the publish, with a numeric item's seqlock
+    /// writer lock held across both the re-verify and the slot CAS. The
+    /// slot CAS alone only observes the LOCATION — an in-place
+    /// `wrapping_add`/`saturating_sub` changes the item's version (which
+    /// the token folds in) without moving it, so without this gate an
+    /// increment landing in the token-check -> publish window (which
+    /// spans `reserve_and_define`, possibly a whole eviction pass) would
+    /// be silently overwritten by a cas that still reports success. On a
+    /// token mismatch the reservation is rolled back and `Exists` is
+    /// returned, exactly as a token-check failure would have.
     fn replace_at(
         &self,
         key: &[u8],
         old_location: Location,
         old_slot: SlotRef,
         reserved: ReservedItem,
+        expected_token: Option<u64>,
     ) -> Result<(), SegcacheError> {
-        let new_location = pack_location(reserved.seg(), reserved.offset() as u64);
-        // Capture the reservation's own location up front so the rollback paths
+        // Fresh publish: the generation of the incarnation we reserved in,
+        // captured under the reservation's WriterPin.
+        let new_location = pack_location(
+            reserved.seg(),
+            reserved.generation(),
+            reserved.offset() as u64,
+        );
+        // Capture the reservation's own segment up front so the rollback paths
         // can reclaim it AFTER the pin is released (see the drop-before-remove_at
         // invariant below), without borrowing `reserved`.
-        let (new_seg, new_offset) = (reserved.seg(), reserved.offset());
-        let (old_seg_id, old_offset) = unpack_location(old_location);
+        let new_seg = reserved.seg();
+        // Only the segment id is taken from the raw unpack — it is all the pin
+        // below needs. The offset is deliberately NOT taken here: it is only
+        // addressable once the location's incarnation has been validated under
+        // the pin (see the `resolve` gate inside the loop).
+        let (old_seg_id, _) = unpack_location(old_location);
         let Some(old_seg_id) = NonZeroU32::new(old_seg_id) else {
             // invalid old location: roll back the (unpublished) reservation.
-            self.rollback_reservation(reserved, new_seg, new_offset);
+            self.rollback_reservation(reserved, new_location);
             return Err(SegcacheError::NotFound);
         };
 
@@ -520,9 +923,36 @@ impl Segcache {
             // has already claimed the segment, check whether the entry still
             // resolves to `old_location`: if not, it was already moved or
             // removed — roll back and report `Exists` (same as the
-            // post-CAS-failure check below); if it does, the drain claimed
-            // the segment but has not yet drained this hashtable entry —
-            // retry until it does.
+            // post-CAS-failure check below). If it does, the drain claimed
+            // the segment but has not yet drained this hashtable entry;
+            // whether waiting can ever succeed depends on WHICH segment it
+            // is (the same deadlock analysis as `insert`'s replace arm):
+            //
+            // - `old_seg_id == new_seg` (the checked item and our new
+            //   reservation co-locate in the Live tail): the drain is
+            //   waiting for the WriterPin held inside `reserved`, so it can
+            //   never sweep the entry while we spin — a guaranteed
+            //   two-thread wedge. Roll back (releasing the pin unblocks the
+            //   drain) and fail safe with `Exists`: the caller's token is
+            //   about to be invalidated anyway (tokens encode location +
+            //   generation, and the drain relocates or removes the item),
+            //   so a retry through get-then-cas observes the settled state.
+            //   This mirrors delete's drain-owns-the-segment reasoning.
+            //
+            // - `old_seg_id != new_seg`: the drain is not waiting on OUR
+            //   pin and normally finishes on its own — spin briefly. The
+            //   spin is still bounded (cross-thread pin cycles, see
+            //   `insert`): once the backoff is exhausted, roll back and
+            //   fail safe with `Exists` as well. The bound also covers the
+            //   `Relinking` case (the checked item lives in a mid-fill
+            //   merge/promotion DESTINATION): pre-fix the spin waited for
+            //   `publish_dest_sealed` and then succeeded, but that wait is
+            //   not deadlock-free — the fill's owner can simultaneously be
+            //   claiming OUR (concurrently sealed) reservation segment and
+            //   waiting on our WriterPin — so a fill longer than the
+            //   backoff now surfaces as a spurious-but-safe `Exists` on an
+            //   unmodified token; a get-then-cas retry succeeds once the
+            //   fill seals.
             let pin = match self.segments.try_pin_remover(old_seg_id) {
                 Some(pin) => pin,
                 None => {
@@ -530,13 +960,122 @@ impl Segcache {
                         .hashtable
                         .get_item_frequency(key, old_location)
                         .is_none()
+                        || old_seg_id == new_seg
+                        || backoff.is_completed()
                     {
-                        self.rollback_reservation(reserved, new_seg, new_offset);
+                        self.rollback_reservation(reserved, new_location);
                         return Err(SegcacheError::Exists);
                     }
                     backoff.snooze();
                     continue;
                 }
+            };
+
+            // Incarnation gate, under the pin. A remover pin freezes the
+            // generation FROM THE MOMENT IT IS TAKEN; it does NOT prove the
+            // segment it froze is the incarnation `old_location` names. The
+            // segment could have been drained, recycled (generation bumped)
+            // and refilled between the caller's lookup and this pin, with the
+            // hashtable slot still carrying the stale-tagged `old_location` —
+            // `get_item_frequency` matches on (tag, location) alone and would
+            // happily report it present. `old_offset` would then be an offset
+            // into a DIFFERENT incarnation, not necessarily an item boundary
+            // at all, so the token re-verify below would build a `RawItem`
+            // over foreign bytes and read a garbage `is_numeric` bit — and if
+            // that bit read true, CAS a version word into another
+            // incarnation's live payload.
+            //
+            // `resolve` compares the location's tag against the (now frozen)
+            // generation, so a `Some` here holds for the rest of this
+            // iteration. `delete` gates its own `get_item_at`/`set_deleted`
+            // under its remover pin exactly the same way, and `remove_at`
+            // re-checks once more before decrementing. `None` is not an error:
+            // the entry no longer names anything we may touch, which is the
+            // same situation as losing the publish race — roll the
+            // (unpublished) reservation back and report `Exists`.
+            let Some((old_seg_id, old_offset)) = self.segments.resolve(old_location) else {
+                drop(pin);
+                self.rollback_reservation(reserved, new_location);
+                return Err(SegcacheError::Exists);
+            };
+
+            // Token re-verify under the remover pin (cas path only; see the
+            // doc comment). Ordering of the safety argument:
+            //
+            // 1. Location-uniqueness before touching item bytes: the entry
+            //    must still map key -> old_location, AND `old_location` must
+            //    still name the pinned segment's current incarnation (the
+            //    `resolve` gate above — `get_item_frequency` matches on
+            //    (tag, location) alone, so it alone does not establish
+            //    this). Together with the frozen generation those give a real
+            //    item starting at `old_offset`: the segment cannot drain or
+            //    recycle under the pin, a drain must unlink entries BEFORE
+            //    its segment is recycled, and a location surviving from an
+            //    earlier incarnation was rejected above. (The ABA where the
+            //    same key was re-inserted at this exact location after a full
+            //    drain+recycle is a real item too — and the recycle bumped
+            //    the generation, which the token compare below catches.)
+            // 2. For a numeric item, take its seqlock WRITER lock
+            //    (`lock_numeric_version`) and hold it across the re-verify
+            //    AND the slot CAS. In-place numeric writers serialize
+            //    their own check-linkage-then-write step on that same lock
+            //    (`numeric_update`), and merge/s3fifo relocation holds it
+            //    across its byte copy + relink (`copy_into`,
+            //    `s3fifo_promote_from`), so no two of these critical
+            //    sections can interleave; whichever completes first
+            //    decides:
+            //      - increment first: its bumped version fails the compare
+            //        below — `Exists`, the increment's ack survives (and a
+            //        cas whose token was read after the increment
+            //        legitimately carries it forward);
+            //      - this publish first: the increment's in-lock linkage
+            //        re-check (its lock acquire synchronizes-with our
+            //        unlock) observes the published NEW location and
+            //        retries against the new item before acking.
+            //    Residual window: none — every lost-acked-write
+            //    interleaving requires an increment and a token-gated
+            //    publish inside one another's critical sections, which the
+            //    shared lock forbids.
+            // 3. The generation is re-read under the pin (frozen), so the
+            //    recomputed token is exact, not racy.
+            let old_raw;
+            let version_guard = if let Some(expected) = expected_token {
+                if self
+                    .hashtable
+                    .get_item_frequency(key, old_location)
+                    .is_none()
+                {
+                    drop(pin);
+                    self.rollback_reservation(reserved, new_location);
+                    return Err(SegcacheError::Exists);
+                }
+                old_raw = self.segments.get_item_at(Some(old_seg_id), old_offset);
+                let raw = old_raw.as_ref().expect("pinned segment id is valid");
+                let base =
+                    CasToken::new(old_location, self.segments.generation(old_seg_id)).as_raw();
+                match raw.lock_numeric_version() {
+                    Ok(guard) => {
+                        if crate::cas::mix_version(base, guard.version()) != expected {
+                            drop(guard);
+                            drop(pin);
+                            self.rollback_reservation(reserved, new_location);
+                            return Err(SegcacheError::Exists);
+                        }
+                        Some(guard)
+                    }
+                    Err(_) => {
+                        // Non-numeric item: the token is bare
+                        // location + generation.
+                        if base != expected {
+                            drop(pin);
+                            self.rollback_reservation(reserved, new_location);
+                            return Err(SegcacheError::Exists);
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
             };
 
             // Publish under the pin: `reserved` (and its WriterPin) is held
@@ -546,6 +1085,11 @@ impl Segcache {
                 .hashtable
                 .cas_location_at(old_slot, old_location, new_location, true)
             {
+                // Unlock the old item's seqlock the instant the publish
+                // resolves — numeric writers spinning on it re-validate
+                // and follow the new location.
+                drop(version_guard);
+
                 #[cfg(feature = "metrics")]
                 ITEM_REPLACE.increment();
 
@@ -557,17 +1101,17 @@ impl Segcache {
                 // the unlink just performed and the decrement below (item
                 // 7f); `remove_at` releases it, also before any `chain_lock`.
                 drop(reserved);
-                let _ = self.segments.remove_at(
-                    old_seg_id,
-                    old_offset,
-                    &self.ttl_buckets,
-                    &self.hashtable,
-                    pin,
-                );
+                // `remove_at` re-validates `old_location`'s incarnation under
+                // `pin` before decrementing (see `Segments::resolve`).
+                let _ =
+                    self.segments
+                        .remove_at(old_location, &self.ttl_buckets, &self.hashtable, pin);
                 return Ok(());
             }
 
-            // The exchange failed while pinned — release the remover pin.
+            // The exchange failed while pinned — release the seqlock (if
+            // held) and the remover pin.
+            drop(version_guard);
             drop(pin);
 
             if self
@@ -578,7 +1122,7 @@ impl Segcache {
                 // The entry genuinely no longer maps to old_location
                 // (replaced, relocated, or removed) — roll back the
                 // (unpublished) reservation.
-                self.rollback_reservation(reserved, new_seg, new_offset);
+                self.rollback_reservation(reserved, new_location);
                 return Err(SegcacheError::Exists);
             }
 
@@ -656,32 +1200,82 @@ impl Segcache {
         ttl: std::time::Duration,
         cas: u64,
     ) -> Result<(), SegcacheError> {
-        // Look up the current item to check its CAS token
+        // Look up the current item to check its CAS token. The lookup+pin
+        // retries through transient drain windows, exactly like
+        // `get_pinned`: a reader-pin failure means a drain owns the
+        // segment, and under merge eviction a drain RETAINS live items
+        // (they are relocated and republished) — so failing here with
+        // `NotFound` would report a LIVE key missing (memcached: a live
+        // key can only fail a cas with EXISTS). Termination mirrors
+        // `get_pinned`'s argument: the owning drain either republishes the
+        // entry (the fresh lookup resolves it in a readable segment) or
+        // removes it (the lookup returns `None` and we exit `NotFound`,
+        // now truthfully).
         let verifier = self.verifier();
-        let (location, slot) = self
-            .hashtable
-            .lookup_slot(key, &verifier)
-            .ok_or(SegcacheError::NotFound)?;
-
-        let (seg_id, offset) = unpack_location(location);
-        let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
-
-        // Lazy expiry: memcached returns NOT_FOUND for a cas on an expired
-        // key, even before the segment is reclaimed. The header is read
-        // unpinned here, so this is a semantic filter, not a safety
-        // mechanism — if the segment races a recycle, the token/generation
-        // check below still protects correctness.
-        self.remaining_ttl(seg_id)?;
-
-        let current_cas = {
-            // Pin briefly to read the item's seqlock version (numeric
-            // items fold it into the token); drop the pin before the
-            // reservation below — pinned segments are unevictable.
-            let (raw, _guard) = self
-                .segments
-                .acquire_item_at(seg_id, offset)
+        let backoff = Backoff::new();
+        let mut attempts = 0;
+        let (location, slot, current_cas) = loop {
+            let (location, slot) = self
+                .hashtable
+                .lookup_slot(key, &verifier)
                 .ok_or(SegcacheError::NotFound)?;
-            Self::token_for(&raw, location, self.segments.generation(seg_id))
+
+            let (seg_id, _offset) = unpack_location(location);
+            let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
+
+            // Lazy expiry: memcached returns NOT_FOUND for a cas on an expired
+            // key, even before the segment is reclaimed. The header is read
+            // unpinned here, so this is a semantic filter, not a safety
+            // mechanism — if the segment races a recycle, the token/generation
+            // check below still protects correctness.
+            self.remaining_ttl(seg_id)?;
+
+            // Pin briefly to read the item's seqlock version (numeric
+            // items fold it into the token); the pin drops before the
+            // reservation below — pinned segments are unevictable.
+            let Some((raw, guard)) = self.segments.acquire_item_at(location) else {
+                // Transient drain window, or a location whose incarnation is
+                // gone (`acquire_item_at` refuses the pin — see
+                // `Segments::resolve`); either way the fresh lookup on retry
+                // resolves the live location or reports the key gone.
+                //
+                // NOT counted against `attempts`, and — unlike `get_pinned`
+                // — not counted against anything else either: this loop does
+                // not triage the two failures, so it has no bounded arm to
+                // charge. Sound because neither can spin. A drain is bounded,
+                // straight-line work; and a fresh lookup cannot keep handing
+                // back a dead incarnation, because no hashtable entry
+                // survives its segment's generation bump (the reachability
+                // argument is written out on `relookup_after_pin_failure`),
+                // so every stale pin failure is paid for by a real recycle.
+                // `attempts`/`RESERVE_RETRIES` below bounds the OTHER face of
+                // this window — a key being republished under us.
+                backoff.snooze();
+                continue;
+            };
+            // Re-validate after pinning (see `get_pinned`): if the key no
+            // longer resolves to this exact location, the entry moved (or
+            // the segment recycled) between lookup and pin — the token we
+            // would mint from `raw` could be an aliased read. A bounded
+            // number of mismatches means the key is churning under us, and
+            // any relocation/replacement has already staled the caller's
+            // location-bearing token: fail `Exists` (never a false
+            // `NotFound` for a live key).
+            if self
+                .hashtable
+                .lookup_no_freq_update(key, &verifier)
+                .map(|(l, _)| l)
+                != Some(location)
+            {
+                drop(guard);
+                attempts += 1;
+                if attempts >= RESERVE_RETRIES {
+                    return Err(SegcacheError::Exists);
+                }
+                continue;
+            }
+            let token = Self::token_for(&raw, location, self.segments.generation(seg_id));
+            break (location, slot, token);
         };
         if current_cas != cas {
             return Err(SegcacheError::Exists);
@@ -704,7 +1298,15 @@ impl Segcache {
         // `reserved` (and its WriterPin) is handed to `replace_at` by value and
         // stays alive there until publish — never dropped/destructured here
         // before the hashtable exchange (item 7d, H2).
-        self.replace_at(key, location, slot, reserved)
+        //
+        // The token is passed down for a second, pinned verification
+        // right before the publish: the slot CAS inside `replace_at`
+        // only observes the LOCATION, so an in-place numeric increment
+        // landing after the check above (the window spans
+        // `reserve_and_define`, possibly a whole eviction pass) would
+        // otherwise be invisible to it — a false STORED that destroys an
+        // acked increment.
+        self.replace_at(key, location, slot, reserved, Some(cas))
     }
 
     /// Remove the item with the given key, returns a bool indicating if it was
@@ -730,59 +1332,149 @@ impl Segcache {
     /// ```
     // TODO(bmartin): a result would be better here
     pub fn delete(&self, key: &[u8]) -> bool {
-        // Look up the item to get its location
         let verifier = self.verifier();
-        let (location, _freq) = match self.hashtable.lookup_no_freq_update(key, &verifier) {
-            Some(result) => result,
-            None => return false,
-        };
+        let backoff = Backoff::new();
+        loop {
+            // Look up the item to get its location
+            let (location, _freq) = match self.hashtable.lookup_no_freq_update(key, &verifier) {
+                Some(result) => result,
+                None => return false,
+            };
 
-        let (seg_id, offset) = unpack_location(location);
-        let Some(seg_id) = NonZeroU32::new(seg_id) else {
-            // Not expected — `lookup_no_freq_update` only returns real
-            // (non-ghost) entries — but stay defensive: nothing to pin.
-            return self.hashtable.remove(key, location);
-        };
+            let (seg_id, offset) = unpack_location(location);
+            let Some(seg_id) = NonZeroU32::new(seg_id) else {
+                // Not expected — `lookup_no_freq_update` only returns real
+                // (non-ghost) entries — but stay defensive: nothing to pin.
+                return self.hashtable.remove(key, location);
+            };
 
-        // Lazy expiry: DELETE on an expired key reports NOT_FOUND (false),
-        // matching memcached, even before the segment is reclaimed. The
-        // stale hashtable entry is left for expire()/eviction pressure to
-        // sweep.
-        if self.remaining_ttl(seg_id).is_err() {
-            return false;
-        }
+            // Capture the segment generation before anything else: the
+            // unpinned-unlink path below uses it to detect a recycle of
+            // `seg_id` between this lookup and its remove (see the ABA note
+            // there).
+            let observed_gen = self.segments.generation(seg_id);
 
-        // Pin the item's segment BEFORE unlinking it (item 7f): the pin
-        // brackets both the hashtable unlink below and the `remove_at`
-        // decrement, so a concurrent drain of this segment cannot interleave
-        // with the decrement. If a drain has already claimed the segment, it
-        // owns this item's removal — the key is going away either way (the
-        // drain's own hashtable sweep will unlink it), so report success.
-        let Some(pin) = self.segments.try_pin_remover(seg_id) else {
+            // Lazy expiry: DELETE on an expired key reports NOT_FOUND (false),
+            // matching memcached, even before the segment is reclaimed. The
+            // stale hashtable entry is left for expire()/eviction pressure to
+            // sweep.
+            if self.remaining_ttl(seg_id).is_err() {
+                return false;
+            }
+
+            // Pin the item's segment BEFORE unlinking it (item 7f): the pin
+            // brackets both the hashtable unlink below and the `remove_at`
+            // decrement, so a concurrent drain of this segment cannot
+            // interleave with the decrement.
+            //
+            // If the pin FAILS, the segment is Draining (a drain owns it) or
+            // Relinking (a merge/promotion copy destination mid-fill). The
+            // delete must still unlink the hashtable entry itself: a merge
+            // drain RETAINS live items — `copy_into` relocates every item
+            // still present in the hashtable — and a Relinking destination is
+            // never swept at all, so "the drain will remove it" does NOT
+            // hold; an acked delete that leaves the entry behind resurrects.
+            //
+            // Doing the unlink WITHOUT the pin is safe: `hashtable.remove`
+            // only CASes the hashtable slot — it touches neither segment
+            // bytes nor the live-item/live-byte counters, so it cannot race
+            // the drain's exclusive access to the segment. What is skipped is
+            // only `remove_at`'s accounting decrement: the segment's owner
+            // covers it — every parse path (`clear`, `prune`, `copy_into`,
+            // `s3fifo_promote_from`) consults `get_item_frequency` and treats
+            // the unlinked item as dead (no relocation, no double remove),
+            // and the counters are reset wholesale when the segment is
+            // recycled/re-reserved (`reset_write_stats`), the same accepted
+            // transient over-count documented in `Segment::clear` (item 7f). If the unlink races `copy_into`
+            // after its liveness check, the relink CAS simply fails and the
+            // copy aborts — an eviction-legal drop, not corruption.
+            //
+            // ABA guard: `location` is (segment, incarnation tag, offset),
+            // and `hashtable.remove` matches (hash tag, location) — the whole
+            // 44-bit location word, incarnation included — without
+            // re-verifying key bytes. The pinned path below is exempt only
+            // because its pin freezes the segment against recycling (the
+            // location-uniqueness precondition documented on
+            // `cas_location_at`). Unpinned, the segment could have been
+            // drained, recycled, and refilled since the lookup, with a
+            // colliding-tag key freshly written at this exact offset. Three
+            // defenses, the first structural: (0) the incarnation tag — a
+            // refill republishes at the NEXT generation, so `remove`'s
+            // location compare simply does not match it, and an ALIASING
+            // republish needs 64 full lifecycles of this id rather than one
+            // (the tag is 6 bits); (1) refuse the unpinned unlink when the
+            // generation moved since the lookup — the entry is stale either
+            // way; (2) after a successful unlink, re-verify the key stopped
+            // resolving, retrying if it did not — so an acked delete NEVER
+            // leaves the key reachable (a retry against a concurrent
+            // re-insert deletes the newer value: a legal linearization of
+            // concurrent set+delete).
+            //
+            // The residual below predates (0), so it is now CONSERVATIVE
+            // rather than tight — kept because its conclusion is the part
+            // that matters. The residual window (generation load to
+            // remove-CAS) requires a full drain+recycle+refill+publish
+            // plus a 12-bit tag collision in an overlapping bucket to land
+            // within a few instructions — and, with (0), 64 such lifecycles
+            // rather than one. Its worst case is a spurious unlink of ONE
+            // colliding key — observably an eviction, which a cache may
+            // always perform — never corruption (the unlink touches no
+            // segment state). `table.rs`'s
+            // `loom_stale_incarnation_unlink_cannot_take_the_refilled_entry`
+            // models exactly this race with defense (1) deliberately absent,
+            // so (0)'s own contribution is asserted rather than assumed.
+            let Some(pin) = self.segments.try_pin_remover(seg_id) else {
+                if self.segments.generation(seg_id) == observed_gen
+                    && self.hashtable.remove(key, location)
+                    && self
+                        .hashtable
+                        .lookup_no_freq_update(key, &verifier)
+                        .is_none()
+                {
+                    #[cfg(feature = "metrics")]
+                    {
+                        HASH_REMOVE.increment();
+                        ITEM_DELETE.increment();
+                    }
+                    return true;
+                }
+                // The entry moved (a merge republished it elsewhere), was
+                // removed concurrently, or the key still resolves after the
+                // unlink — retry from the lookup, which resolves the fresh
+                // location or reports the key gone.
+                backoff.snooze();
+                continue;
+            };
+
+            // Remove from hashtable
+            if !self.hashtable.remove(key, location) {
+                drop(pin);
+                return false;
+            }
+
+            #[cfg(feature = "metrics")]
+            {
+                HASH_REMOVE.increment();
+                ITEM_DELETE.increment();
+            }
+
+            // Remove from segment. Both steps are incarnation-gated: under the
+            // remover pin the generation is frozen, so a tag mismatch here
+            // means the entry we just unlinked was published by an incarnation
+            // that is already gone — its bytes belong to a different
+            // incarnation now, and marking THEM deleted would destroy a live
+            // item. `remove_at` re-checks the same way before decrementing.
+            if self.segments.resolve(location).is_some() {
+                if let Some(mut item) = self.segments.get_item_at(Some(seg_id), offset) {
+                    item.set_deleted(true);
+                }
+            }
+            let _ = self
+                .segments
+                .remove_at(location, &self.ttl_buckets, &self.hashtable, pin);
+
             return true;
-        };
-
-        // Remove from hashtable
-        if !self.hashtable.remove(key, location) {
-            drop(pin);
-            return false;
         }
-
-        #[cfg(feature = "metrics")]
-        {
-            HASH_REMOVE.increment();
-            ITEM_DELETE.increment();
-        }
-
-        // Remove from segment
-        if let Some(mut item) = self.segments.get_item_at(Some(seg_id), offset) {
-            item.set_deleted(true);
-        }
-        let _ = self
-            .segments
-            .remove_at(seg_id, offset, &self.ttl_buckets, &self.hashtable, pin);
-
-        true
     }
 
     /// Loops through the TTL Buckets to handle eager expiration, returns the
@@ -848,7 +1540,7 @@ impl Segcache {
     /// alias the same memory and observe updates (seqlock-consistent,
     /// never torn).
     pub fn wrapping_add(&self, key: &[u8], rhs: u64) -> Result<u64, SegcacheError> {
-        self.numeric_update(key, |raw| raw.fetch_wrapping_add(rhs))
+        self.numeric_update(key, |v| v.wrapping_add(rhs))
     }
 
     /// Perform a saturating subtraction on the value stored at the supplied
@@ -858,7 +1550,7 @@ impl Segcache {
     /// See [`Self::wrapping_add`] for the update and CAS-token semantics.
     /// Returns the new value.
     pub fn saturating_sub(&self, key: &[u8], rhs: u64) -> Result<u64, SegcacheError> {
-        self.numeric_update(key, |raw| raw.fetch_saturating_sub(rhs))
+        self.numeric_update(key, |v| v.saturating_sub(rhs))
     }
 
     /// Shared in-place update for the numeric operations.
@@ -866,26 +1558,34 @@ impl Segcache {
     /// Looks up the key, checks its segment deadline (memcached lazily
     /// treats expired keys as missing — increments must not resurrect
     /// them), pins the segment, and performs the seqlocked in-place
-    /// update through the pinned item. The pin is the load-bearing
-    /// safety argument for mutating in place: eviction\'s byte-copy
-    /// paths (merge prune/copy_into) only proceed on segments
-    /// whose reader count is zero (the Sealed -> Draining CAS plus the
-    /// SeqCst recheck-and-revert from the drain protocol), so segment
-    /// memory cannot be moved or reused out from under the update.
+    /// update through the pinned item. Mutating in place under only a
+    /// reader pin is safe by two mechanisms working together:
+    ///
+    /// - the reader pin keeps the segment's MEMORY alive: a drained
+    ///   segment is recycled or condemned-and-released only once its
+    ///   reader count is observed zero, so the item bytes cannot be
+    ///   reused out from under the write. The pin does NOT stop a drain
+    ///   from claiming the segment or relocating the item — drains wait
+    ///   on writers/removers, not readers;
+    /// - the item's seqlock version lock serializes the write against
+    ///   every party that can supersede or MOVE the item: cas publishes
+    ///   re-verify their token under it (`replace_at`), and merge/s3fifo
+    ///   relocation holds it across its byte copy and relink CAS
+    ///   (`copy_into`, `s3fifo_promote_from`). Linkage is re-validated
+    ///   INSIDE the lock, so a write can never land on an item that was
+    ///   superseded or relocated first — the re-check observes the new
+    ///   location and retries against the live item before acking.
     ///
     /// Returns the value this call published.
-    fn numeric_update(
-        &self,
-        key: &[u8],
-        op: impl Fn(&RawItem) -> Result<u64, keyvalue::NotNumericError>,
-    ) -> Result<u64, SegcacheError> {
+    fn numeric_update(&self, key: &[u8], op: impl Fn(u64) -> u64) -> Result<u64, SegcacheError> {
+        let backoff = Backoff::new();
         loop {
             let verifier = self.verifier();
             let (location, _freq) = self
                 .hashtable
                 .lookup(key, &verifier)
                 .ok_or(SegcacheError::NotFound)?;
-            let (seg_id, offset) = unpack_location(location);
+            let (seg_id, _offset) = unpack_location(location);
             let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
 
             // Lazy expiry: a counter past its segment deadline is
@@ -893,10 +1593,23 @@ impl Segcache {
             // expire() reclaims the segment.
             self.remaining_ttl(seg_id)?;
 
-            match self.segments.acquire_item_at(seg_id, offset) {
+            match self.segments.acquire_item_at(location) {
                 // Segment not readable (draining; a relocation is in
-                // flight) — retry from the lookup.
-                None => continue,
+                // flight), or the location's incarnation is gone (the pin
+                // is refused — see `Segments::resolve`) — back off and retry
+                // from the lookup, giving the drain a chance to finish
+                // instead of busy-waiting through its whole window.
+                //
+                // Unbounded, and NOT the bounded arm `get_pinned` gives a
+                // stale incarnation: this loop does not triage the two. Safe
+                // for both — a drain is bounded work, and a fresh lookup
+                // cannot keep resolving to a dead incarnation, because no
+                // hashtable entry survives its segment's generation bump (see
+                // `relookup_after_pin_failure` for the invariants).
+                None => {
+                    backoff.snooze();
+                    continue;
+                }
                 Some((raw, _guard)) => {
                     // Re-validate after pinning (see `get`): if the key no longer
                     // resolves to this exact location, the segment was
@@ -904,10 +1617,56 @@ impl Segcache {
                     // stale/aliased item — retry rather than update the WRONG
                     // item in place (item 7f). The fresh lookup only reads
                     // currently-published items, so it is safe and authoritative.
+                    // It also establishes `raw` as a REAL item, making the
+                    // version-word access below sound.
                     if self.hashtable.lookup(key, &verifier).map(|(l, _)| l) != Some(location) {
                         continue;
                     }
-                    return op(&raw).map_err(|_| SegcacheError::NotNumeric);
+
+                    // Take the item's seqlock writer lock, then re-validate
+                    // linkage INSIDE it, so the "still the published item"
+                    // check and the value write are one atomic step with
+                    // respect to every party that serializes on this lock —
+                    // a cas publish, which re-verifies its token and swaps
+                    // the hashtable slot while holding it (`replace_at`),
+                    // and a merge/s3fifo relocation, which byte-copies the
+                    // item and relinks its location while holding it
+                    // (`copy_into`, `s3fifo_promote_from`; a relocation
+                    // that completed first is seen by the re-check below as
+                    // a new location, and we retry against the
+                    // destination). Interleavings:
+                    //
+                    //   - cas critical section completed first and
+                    //     PUBLISHED: the re-check below sees the new
+                    //     location, we drop the lock unchanged and retry —
+                    //     the increment applies (once) to the NEW item.
+                    //     Acked only after it is visible.
+                    //   - cas critical section completed first but FAILED
+                    //     (token stale): slot unchanged, we update in
+                    //     place. Correct.
+                    //   - our update completes first: the cas's in-lock
+                    //     token re-verify sees our bumped version and
+                    //     fails `Exists` — our acked increment survives on
+                    //     the still-linked item. A cas whose token was
+                    //     read AFTER our update legitimately carries our
+                    //     increment forward in the value it publishes.
+                    //
+                    // A checked-then-written window simply cannot contain
+                    // a token-gated publish, and non-token-gated writes
+                    // (set/delete/convert) owe no preservation to a
+                    // concurrent increment — losing to them is a legal
+                    // linearization. This is why the validation must sit
+                    // inside the lock: a post-write re-check variant
+                    // double-applies when a fresh-token cas lands between
+                    // the write and the re-check.
+                    let vguard = raw
+                        .lock_numeric_version()
+                        .map_err(|_| SegcacheError::NotNumeric)?;
+                    if self.hashtable.lookup(key, &verifier).map(|(l, _)| l) != Some(location) {
+                        drop(vguard);
+                        continue;
+                    }
+                    return Ok(vguard.update(&op));
                 }
             }
         }
@@ -923,6 +1682,9 @@ impl Segcache {
     ///   existing item (its absolute expiration is preserved) — the
     ///   caller's `ttl` is deliberately unused
     /// - any other value: `Err(NotNumeric)`, item untouched
+    /// - key churning under concurrent relocation/replacement: may fail
+    ///   safe with `Err(Exists)` after bounded retries — retryable, never
+    ///   a false `NotFound`
     ///
     /// Composes with [`Self::wrapping_add`]/[`Self::saturating_sub`] to
     /// implement memcached-style incr-with-initial at a protocol layer.
@@ -932,23 +1694,58 @@ impl Segcache {
         initial: u64,
         ttl: std::time::Duration,
     ) -> Result<(), SegcacheError> {
+        // Lookup+pin retries through transient drain windows, exactly like
+        // `get_pinned`/`cas`: a reader-pin failure means a drain owns the
+        // segment, and a merge drain RETAINS live items — reporting
+        // `NotFound` here was a false miss on a live key (a
+        // #51-acknowledged follow-up, fixed alongside `cas`).
         let verifier = self.verifier();
-        let Some((location, slot)) = self.hashtable.lookup_slot(key, &verifier) else {
-            // Missing: create with the caller's ttl. NOTE for the
-            // concurrent future: this publishes via plain insert, which
-            // would overwrite a concurrently created value; revisit with
-            // insert-if-absent when the API goes concurrent.
-            return self.insert(key, initial, None, ttl);
-        };
+        let backoff = Backoff::new();
+        let mut attempts = 0;
+        let (location, slot, parsed, opt_buf, olen, seg_ttl) = loop {
+            let Some((location, slot)) = self.hashtable.lookup_slot(key, &verifier) else {
+                // Missing: create with the caller's ttl. NOTE for the
+                // concurrent future: this publishes via plain insert, which
+                // would overwrite a concurrently created value; revisit with
+                // insert-if-absent when the API goes concurrent.
+                return self.insert(key, initial, None, ttl);
+            };
 
-        let (seg_id, offset) = unpack_location(location);
-        let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
+            let (seg_id, _offset) = unpack_location(location);
+            let seg_id = NonZeroU32::new(seg_id).ok_or(SegcacheError::NotFound)?;
 
-        let (parsed, opt_buf, olen, seg_ttl) = {
-            let (raw, _guard) = self
-                .segments
-                .acquire_item_at(seg_id, offset)
-                .ok_or(SegcacheError::NotFound)?;
+            let Some((raw, guard)) = self.segments.acquire_item_at(location) else {
+                // Transient drain window, or a stale incarnation whose pin is
+                // refused (`Segments::resolve`) — retry from the lookup.
+                //
+                // Unbounded, for both, and NOT parity with `get_pinned`
+                // (which bounds its stale arm): this loop does not triage the
+                // two failures. Neither can spin — a drain is bounded work,
+                // and no hashtable entry survives its segment's generation
+                // bump, so a fresh lookup cannot keep returning a dead
+                // incarnation (see `relookup_after_pin_failure`). `attempts`
+                // below bounds the separate churn face of this window.
+                backoff.snooze();
+                continue;
+            };
+            // Re-validate after pinning (see `get_pinned`): a moved entry
+            // means `raw` may be an aliased read; retry, and after a
+            // bounded number of mismatches report the churn as `Exists`
+            // (the same outcome `replace_at` gives a concurrent
+            // replacement), never a false `NotFound`.
+            if self
+                .hashtable
+                .lookup_no_freq_update(key, &verifier)
+                .map(|(l, _)| l)
+                != Some(location)
+            {
+                drop(guard);
+                attempts += 1;
+                if attempts >= RESERVE_RETRIES {
+                    return Err(SegcacheError::Exists);
+                }
+                continue;
+            }
             let parsed = match raw.value() {
                 Value::U64(_) => return Ok(()),
                 Value::Bytes(b) => {
@@ -961,12 +1758,16 @@ impl Segcache {
                 o.len()
             });
             let seg_ttl = self.remaining_ttl(seg_id)?;
-            (parsed, opt_buf, olen, seg_ttl)
+            break (location, slot, parsed, opt_buf, olen, seg_ttl);
         };
 
         let reserved =
             self.reserve_and_define(key, Value::U64(parsed), &opt_buf[..olen], seg_ttl)?;
-        self.replace_at(key, location, slot, reserved)
+        // No caller token here (this is a convert-in-place, not a cas):
+        // location-only publish semantics are the intent — any
+        // concurrent replacement fails the slot CAS and surfaces as
+        // `Exists`.
+        self.replace_at(key, location, slot, reserved, None)
     }
 
     /// Test-only access to the segment collection, for asserting on segment
@@ -974,5 +1775,33 @@ impl Segcache {
     #[cfg(test)]
     pub(crate) fn segments_for_test(&self) -> &Segments {
         &self.segments
+    }
+
+    /// Test-only: reserve a fresh item and drive [`Self::replace_at`] against a
+    /// caller-supplied `old_location`/`old_slot`.
+    ///
+    /// The public `cas`/`try_into_numeric` entry points derive those two from a
+    /// lookup that pins the old item first, so they can only ever hand
+    /// `replace_at` a location that was live a moment ago; the state a
+    /// concurrent recycle produces — a slot still carrying a location whose
+    /// incarnation is already gone — is not constructible through them without
+    /// a real race. This hook plants that state directly so `replace_at`'s
+    /// incarnation gate can be tested deterministically.
+    #[cfg(all(test, not(model_checking)))]
+    pub(crate) fn replace_at_for_test(
+        &self,
+        key: &[u8],
+        old_location: Location,
+        old_slot: SlotRef,
+        value: &[u8],
+        expected_token: Option<u64>,
+    ) -> Result<(), SegcacheError> {
+        let reserved = self.reserve_and_define(
+            key,
+            Value::Bytes(value),
+            &[],
+            Self::coarse_ttl(std::time::Duration::from_secs(3600)),
+        )?;
+        self.replace_at(key, old_location, old_slot, reserved, expected_token)
     }
 }

@@ -2,6 +2,7 @@
 
 use crate::eviction::*;
 use crate::segments::*;
+use crate::Location;
 
 /// Configuration builder for [`Segments`].
 ///
@@ -47,12 +48,30 @@ impl SegmentsBuilder {
     ///
     /// Returns an error if:
     /// - `segment_size` is not larger than the per-item header overhead
+    /// - `segment_size` exceeds `Location::MAX_SEGMENT_BYTES`, the most a
+    ///   location's offset field can address (`SegmentsError::SegmentTooLarge`)
     /// - `heap_size` is zero or not a multiple of `segment_size`
+    /// - the resulting segment count exceeds `Location::MAX_SEGMENTS`, the
+    ///   largest id a heap may issue — one below what a location's 18-bit
+    ///   segment field could address, the top value being reserved so no
+    ///   location aliases the ghost sentinel
+    ///   (`SegmentsError::TooManySegments`, raised by `Segments::from_builder`)
     pub fn build(self) -> Result<Segments, SegmentsError> {
         let min_size = crate::ITEM_HDR_SIZE as i32 + 1;
 
         if self.segment_size < min_size {
             return Err(SegmentsError::SegmentTooSmall);
+        }
+
+        // A location's offset field encodes `byte_offset >> 3` in
+        // `OFFSET_BITS` bits behind only a debug_assert in pack_location; a
+        // segment larger than it can address would wrap silently in release
+        // builds, aliasing two live items onto one location.
+        if self.segment_size as usize > Location::MAX_SEGMENT_BYTES {
+            return Err(SegmentsError::SegmentTooLarge {
+                segment_size: self.segment_size as usize,
+                limit: Location::MAX_SEGMENT_BYTES,
+            });
         }
 
         // Items are placed at 8-byte-aligned offsets and locations encode

@@ -9,6 +9,97 @@ use core::num::NonZeroU32;
 
 pub const SEG_MAGIC: u64 = 0xBADC0FFEEBADCAFE;
 
+/// Fault injection for `copy_into`'s relink CAS. Compiled only under
+/// `feature = "fault-injection"` — there is no trace of it in a normal build,
+/// and `debug` does NOT pull it in: `debug` is observational, this is not.
+///
+/// `copy_into` aborts an entire in-flight copy with `RelinkFailure` when its
+/// relink CAS loses the item it is relocating. Thanks to the remover Dekker
+/// pair, a pinned replace/delete can NOT republish an entry out of a
+/// `Draining` segment, so the only thing that can lose that CAS is an
+/// UNPINNED unlink landing in the few tens of nanoseconds between the
+/// per-item liveness gate and the CAS itself. That is not reachable by
+/// workload — a tuned storm of 46k relocations across merge drains and
+/// concurrent same-key writers/deleters produced zero — yet the path has
+/// real accounting to get right, since items relocated earlier in the same
+/// call have already moved. This knob makes it reachable for
+/// `tests/copy_into_relink_failure.rs`.
+#[cfg(feature = "fault-injection")]
+pub mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `Some(n)`: let the next `n` relink CASes run, then force the one
+        /// after them to behave as a lost CAS (and disarm). `None`: inactive.
+        static RELINKS_BEFORE_FAILURE: Cell<Option<u32>> = const { Cell::new(None) };
+        /// How many relinks the CALL that took the injected failure had
+        /// already completed. Reset at each `copy_into` entry, frozen when
+        /// the failure fires. Lets a test assert the abort actually stranded
+        /// relocated items rather than hitting a call's very first item.
+        static RELINKS_THIS_CALL: Cell<u32> = const { Cell::new(0) };
+        static RELINKS_BEFORE_FIRING: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// Arm this thread so that, after `after` further successful relink
+    /// CASes, the next one behaves as though it lost. One-shot.
+    pub fn fail_relink_after(after: u32) {
+        RELINKS_BEFORE_FIRING.with(|c| c.set(None));
+        RELINKS_BEFORE_FAILURE.with(|c| c.set(Some(after)));
+    }
+
+    /// Disarm this thread.
+    pub fn disarm() {
+        RELINKS_BEFORE_FAILURE.with(|c| c.set(None));
+    }
+
+    /// Whether this thread is still armed. A test can assert this is `false`
+    /// afterwards to prove the injected failure actually fired.
+    pub fn armed() -> bool {
+        RELINKS_BEFORE_FAILURE.with(|c| c.get().is_some())
+    }
+
+    /// How many items the aborting `copy_into` call had ALREADY relocated
+    /// when the injected failure fired, or `None` if it never fired. A test
+    /// asserting this is `> 0` proves the abort actually stranded
+    /// compensation — the whole point of the path under test — rather than
+    /// landing on a call's first item, where the bug would be invisible.
+    pub fn relinks_before_firing() -> Option<u32> {
+        RELINKS_BEFORE_FIRING.with(|c| c.get())
+    }
+
+    /// Called at each `copy_into` entry: the per-call relink tally is what
+    /// makes `relinks_before_firing` meaningful (the arming countdown itself
+    /// spans calls).
+    pub(crate) fn enter_copy_into() {
+        RELINKS_THIS_CALL.with(|c| c.set(0));
+    }
+
+    /// Record a relink that the current `copy_into` call completed.
+    pub(crate) fn note_relink() {
+        RELINKS_THIS_CALL.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Consume one relink attempt. Returns `true` when this attempt must be
+    /// treated as a lost CAS. Skipping the CAS is faithful to losing it:
+    /// either way the hashtable entry stays at the old location, the item
+    /// stays in the source, and the bytes already written to the
+    /// destination are orphaned (its write offset is not advanced).
+    pub(crate) fn take_forced_relink_failure() -> bool {
+        RELINKS_BEFORE_FAILURE.with(|c| match c.get() {
+            Some(0) => {
+                c.set(None);
+                RELINKS_BEFORE_FIRING.with(|f| f.set(Some(RELINKS_THIS_CALL.with(|n| n.get()))));
+                true
+            }
+            Some(n) => {
+                c.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
+    }
+}
+
 /// A view of a single segment, combining a shared header reference with
 /// a mutable data slice. The header is accessed via shared reference
 /// since all its fields are atomic.
@@ -91,7 +182,12 @@ impl<'a> Segment<'a> {
             }
 
             if !item.is_deleted() {
-                let loc = pack_location(self.id(), offset as u64);
+                // Reconstruction (see `pack_location`): this debug-only scan is
+                // meant for a quiescent cache, where the header's generation is
+                // the one every resident item was published under. Under
+                // concurrent recycling it would simply stop resolving items,
+                // which is the same direction the scan already tolerates.
+                let loc = pack_location(self.id(), self.generation(), offset as u64);
                 let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
                 if !deleted {
                     count += 1;
@@ -100,12 +196,23 @@ impl<'a> Segment<'a> {
             offset += item.size();
         }
 
-        if count != self.live_items() {
+        // DIRECTIONAL invariant, not equality: the design deliberately
+        // retains unpinned unlinks (a delete racing a drain, the fresh-key
+        // insert de-dup race, a reservation rollback) that drop the
+        // hashtable entry WITHOUT running `remove_item_at`, so the header
+        // legitimately EXCEEDS the resolving count until the segment is
+        // drained and `reset_write_stats` reconciles the residue. What is
+        // never legal is the other direction: more items resolving through
+        // the hashtable than the header claims are live means a decrement
+        // without an unlink, or a lost increment — real corruption.
+        let live_items = self.live_items();
+        if count > live_items {
             error!(
-                "seg: {} has mismatch between counted items: {} and header items: {}",
+                "seg: {} has more resolving items: {} than header items: {} (excess: {})",
                 self.id(),
                 count,
-                self.live_items()
+                live_items,
+                count - live_items
             );
             integrity = false;
         }
@@ -118,6 +225,13 @@ impl<'a> Segment<'a> {
     #[inline]
     pub fn id(&self) -> NonZeroU32 {
         self.header.id()
+    }
+
+    /// The current incarnation's generation. Locations published into this
+    /// segment carry its low 6 bits as their tag (see `pack_location`).
+    #[inline]
+    pub fn generation(&self) -> u16 {
+        self.header.generation()
     }
 
     #[inline]
@@ -148,6 +262,13 @@ impl<'a> Segment<'a> {
     #[inline]
     pub fn incr_live_bytes(&self, bytes: i32) {
         self.header.incr_live_bytes(bytes);
+    }
+
+    /// Take back the dead charge `remove_item_at` placed on this segment,
+    /// for an item that was RELOCATED rather than killed.
+    #[inline]
+    pub fn decr_dead_item(&self, bytes: i32) {
+        self.header.decr_dead_item(bytes);
     }
 
     #[inline]
@@ -205,7 +326,14 @@ impl<'a> Segment<'a> {
 
     // -- Item operations --
 
-    /// Remove an item at the given offset, decrementing live counters.
+    /// Remove an item at the given offset, decrementing live counters and
+    /// charging the item's space to this segment's dead total.
+    ///
+    /// The dead side is a hand-off, not a death certificate: the space stays
+    /// charged until the segment is reset (`reset_write_stats`), which is
+    /// what makes `ITEM_DEAD`/`ITEM_DEAD_BYTES` occupancy gauges. Relocation
+    /// sites (`copy_into`, `Segments::s3fifo_promote_from`) take the dead
+    /// charge back off, because a moved item did not die.
     pub(crate) fn remove_item_at(&self, offset: usize) {
         let item = self.get_item_at(offset).unwrap();
         let item_size = item.size() as i32;
@@ -220,6 +348,7 @@ impl<'a> Segment<'a> {
 
         self.check_magic();
         self.header.decr_item(item_size);
+        self.header.incr_dead_item(item_size);
         assert!(self.live_bytes() >= 0);
         assert!(self.live_items() >= 0);
 
@@ -242,17 +371,14 @@ impl<'a> Segment<'a> {
         target: &mut Segment,
         hashtable: &MultiChoiceHashtable,
     ) -> Result<(), SegmentsError> {
+        #[cfg(feature = "fault-injection")]
+        fault::enter_copy_into();
         let max_offset = self.max_item_offset();
         let mut read_offset = if cfg!(feature = "integrity") {
             std::mem::size_of_val(&SEG_MAGIC)
         } else {
             0
         };
-
-        #[cfg(feature = "metrics")]
-        let mut items_copied = 0;
-        #[cfg(feature = "metrics")]
-        let mut bytes_copied = 0;
 
         while read_offset <= max_offset {
             let item = self.get_item_at(read_offset).unwrap();
@@ -264,7 +390,16 @@ impl<'a> Segment<'a> {
             let item_size = item.size();
             let write_offset = target.write_offset() as usize;
 
-            let old_loc = pack_location(self.id(), read_offset as u64);
+            // RECONSTRUCTION (see `pack_location`): this rebuilds the location
+            // the item was PUBLISHED under, to use as the expected value of the
+            // relink CAS below — it does not mint a new one. `self.generation()`
+            // is the publishing generation because this scan runs under the
+            // caller's `Sealed -> Draining` claim on `self`: the generation only
+            // advances on the transitions that end a used incarnation, and
+            // neither can run while the claim is held. If this tag were wrong
+            // the CAS would fail for every item and the merge would silently
+            // relocate nothing.
+            let old_loc = pack_location(self.id(), self.generation(), read_offset as u64);
             let deleted =
                 item.is_deleted() || hashtable.get_item_frequency(item.key(), old_loc).is_none();
             if deleted || write_offset + item_size >= target.data.len() {
@@ -275,7 +410,39 @@ impl<'a> Segment<'a> {
             let src = unsafe { self.data.as_ptr().add(read_offset) };
             let dst = unsafe { target.data.as_mut_ptr().add(write_offset) };
 
-            let new_loc = pack_location(target.id(), write_offset as u64);
+            // Fresh publish into the destination: its own current generation.
+            // The destination is `Relinking` and owned by this merge, so its
+            // generation is likewise fixed for the duration of the copy.
+            let new_loc = pack_location(target.id(), target.generation(), write_offset as u64);
+            // NUMERIC RELOCATION GATE: in-place numeric writers
+            // (`numeric_update`) mutate item bytes holding only a READER
+            // pin plus the item's seqlock writer lock — and the drain
+            // claim behind this copy waits on writers/removers, NOT
+            // readers. Without this gate the raw copy below races the
+            // value/CRC stores (torn copy, formally a data race), can
+            // capture the version word in its transient ODD state and
+            // publish a permanently write-in-progress destination (every
+            // subsequent seqlock read/incr of the key spins forever), and
+            // can publish a pre-increment value AFTER the increment acked
+            // (a lost acked increment). Taking the item's version lock
+            // across the byte copy AND the relink CAS closes all three:
+            // an increment that locked first completes before we read
+            // (the copy carries its final value/CRC); one that arrives
+            // while we hold the lock spins, and its in-lock linkage
+            // re-validation then observes the published new location and
+            // retries against the destination — no lost ack. The copied
+            // version word is odd (our own lock), so the destination is
+            // stamped back to the guard's frozen even version before the
+            // publish. Deadlock-free: the version lock is a leaf — its
+            // holders (`numeric_update`, `replace_at`) do bounded
+            // lock-free work and never wait on chain locks, claims, or
+            // pins (and `replace_at` cannot even hold it on an item in
+            // this Draining source: it requires a remover pin the claim
+            // already waited out). Non-numeric items stay on the raw
+            // copy: they are immutable in place once published (the only
+            // header mutation, delete's `set_deleted`, runs under a
+            // remover pin, which the drain claim waited out).
+            let vguard = item.lock_numeric_version().ok();
             // Copy-then-publish: write the bytes into the destination BEFORE the
             // Release-CAS publishes the new location. The Release success ordering
             // on cas_location orders these writes ahead of the publish, so a
@@ -285,29 +452,64 @@ impl<'a> Segment<'a> {
             unsafe {
                 std::ptr::copy_nonoverlapping(src, dst, item_size);
             }
-            if hashtable.cas_location(item.key(), old_loc, new_loc, true) {
+            if let Some(guard) = &vguard {
+                guard.stamp_relocated_copy(&RawItem::from_ptr(dst));
+            }
+            #[cfg(feature = "fault-injection")]
+            let relinked = !fault::take_forced_relink_failure()
+                && hashtable.cas_location(item.key(), old_loc, new_loc, true);
+            #[cfg(not(feature = "fault-injection"))]
+            let relinked = hashtable.cas_location(item.key(), old_loc, new_loc, true);
+
+            if relinked {
+                // Unlock only AFTER the publish resolved: a numeric writer
+                // spinning on this lock re-validates its linkage inside the
+                // lock, and the acquire it wins synchronizes-with this drop's
+                // Release store, making the new location visible to it.
+                drop(vguard);
                 self.remove_item_at(read_offset);
+                // A relocation is not a death (see the metrics note below):
+                // take back the dead charge `remove_item_at` just put on this
+                // (source) segment. Unconditional, like every other header
+                // counter — only the global gauge mirror is `metrics`-gated.
+                self.header.decr_dead_item(item_size as i32);
                 target.header.incr_live_items();
                 target.header.incr_live_bytes(item_size as i32);
                 target.set_write_offset(write_offset as i32 + item_size as i32);
 
+                #[cfg(feature = "fault-injection")]
+                fault::note_relink();
+
                 #[cfg(feature = "metrics")]
                 {
                     ITEM_RELINK.increment();
-                    items_copied += 1;
-                    bytes_copied += item_size;
+                    // A relocation MOVES an item, it does not kill one, so
+                    // it must be gauge-NEUTRAL on BOTH sides:
+                    // `remove_item_at` above decremented the global live
+                    // gauges and incremented the global dead gauges, while
+                    // the destination's header bumps do not touch either.
+                    //
+                    // Compensate PER ITEM, in the same block that recorded
+                    // the relink, rather than batching a running total for
+                    // a tail block: the loop has an early
+                    // `Err(RelinkFailure)` return below, and a tail block
+                    // silently loses the compensation for every item
+                    // already relocated by that call. Per-item leaves no
+                    // pending state for an exit path to drop, and matches
+                    // `Segments::s3fifo_promote_from`. The cost is four
+                    // atomics on a path that already does six in
+                    // `remove_item_at`.
+                    ITEM_CURRENT.increment();
+                    ITEM_CURRENT_BYTES.add(item_size as _);
+                    ITEM_DEAD.decrement();
+                    ITEM_DEAD_BYTES.sub(item_size as _);
                 }
             } else {
+                drop(vguard);
                 return Err(SegmentsError::RelinkFailure);
             }
 
             read_offset += item_size;
-        }
-
-        #[cfg(feature = "metrics")]
-        {
-            ITEM_CURRENT.add(items_copied);
-            ITEM_CURRENT_BYTES.add(bytes_copied as _);
         }
 
         Ok(())
@@ -355,7 +557,8 @@ impl<'a> Segment<'a> {
                 continue;
             }
 
-            let loc = pack_location(self.id(), offset as u64);
+            // Reconstruction under this segment's drain claim (see `copy_into`).
+            let loc = pack_location(self.id(), self.generation(), offset as u64);
             // Fallback for items deleted before is_deleted was introduced.
             let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
             if deleted {
@@ -441,7 +644,16 @@ impl<'a> Segment<'a> {
 
             debug_assert!(item.klen() > 0, "invalid klen: ({})", item.klen());
 
-            let loc = pack_location(self.id(), offset as u64);
+            // F1 (single decrement): only the unlinker decrements. A
+            // `remove` returning false therefore has to mean another
+            // unlinker/replacer owns this entry — which holds because
+            // `try_unlink_in_bucket` retries the same slot across a
+            // racing reader's freq-bump CAS instead of abandoning the
+            // entry (table.rs). Without that retry a spurious false here
+            // would recycle the segment with the entry still published.
+            // Reconstruction under this segment's `Draining` claim (asserted
+            // above), so `self.generation()` is the publishing generation.
+            let loc = pack_location(self.id(), self.generation(), offset as u64);
             let deleted = hashtable.get_item_frequency(item.key(), loc).is_none();
             if !deleted && hashtable.remove(item.key(), loc) {
                 trace!("evicting from hashtable");
@@ -472,15 +684,19 @@ impl<'a> Segment<'a> {
         // `active_removers == 0` wait (claim_for_drain, drain_chain) +
         // try_pin_remover's recheck-bail cover every replace/delete remove that
         // PINS BEFORE UNLINKING — those decrement before this sweep runs and are
-        // then skipped (get_item_frequency is None). But the fresh-key
-        // insert-vs-insert race and the hashtable-full rollback path unlink an
-        // entry WITHOUT holding a remover pin (a known tracked follow-up); such
-        // an item can be unlinked-but-not-yet-decremented while we clear, so it
-        // is counted-yet-skipped and `live_items`/`live_bytes` may be transiently
-        // over-counted. That is a leak, not corruption (it self-heals when the
-        // segment is recycled: `init()` resets the counters). A synchronous
-        // "empty after clear" assertion is therefore not a valid concurrent
-        // invariant; the crash-direction (`live_bytes() >= 0`) is still asserted
+        // then skipped (get_item_frequency is None). But the raced-old handling
+        // in `Segcache::insert`'s fresh-key arm (a racing writer published
+        // between the lookup miss and the hashtable upsert, resolved to a
+        // replace under the stripe re-check) and the hashtable-full rollback
+        // path unlink an entry WITHOUT holding a remover pin — a narrow,
+        // ACCEPTED gap: if that item's segment is being cleared, it can be
+        // unlinked-but-not-yet-decremented while we sweep, so it is
+        // counted-yet-skipped and `live_items`/`live_bytes` may be transiently
+        // over-counted. Not corruption (it self-heals when the segment is
+        // recycled: `init()` resets the counters) — the drain owns the
+        // segment's accounting wholesale. A synchronous "empty after clear"
+        // assertion is therefore not a valid concurrent invariant; the
+        // crash-direction (`live_bytes() >= 0`) is still asserted
         // per-decrement in `remove_item_at`. Reclaim uses the live counters, so
         // set write_offset to whatever remains.
         self.set_write_offset(self.live_bytes());

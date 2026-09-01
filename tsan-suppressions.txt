@@ -1,0 +1,19 @@
+# ThreadSanitizer suppressions for the segcache test suite.
+#
+# ONE suppression, for the engine's one accepted data race: the unpinned
+# read-path verify (`SegmentsVerifier::verify`) compares key bytes at a
+# location taken from a hashtable slot while holding no pin, so a STALE
+# location can race the bytes with a writer defining a new item into
+# recycled segment space (`ItemHeader::init`) or a delete's tombstone
+# (`set_deleted`). The protocol treats the unpinned verify as advisory —
+# wrong answers are caught by the slot re-read (`verify_slot`) and the
+# pinned, tag-checked revalidation — but the ACCESS itself is a formal
+# data race. Removing it (pinned verify, plain compares under the pin) is
+# tracked in issue #91; a racy-atomics attempt was parked on measured
+# perf regressions (branch racy-bytes, numbers in the issue).
+#
+# Suppressing one side of a race pair silences the report, so this line
+# covers both the init and set_deleted pairings — every report class
+# observed in the issue #61 spike and since. Any NEW race class anywhere
+# else in the engine still fails the CI job (halt_on_error=1).
+race:SegmentsVerifier

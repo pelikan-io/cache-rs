@@ -34,7 +34,7 @@ impl Drop for RemoverPin {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod tests {
     use super::*;
     use crate::segments::state::{Metadata, State};
@@ -48,6 +48,7 @@ mod tests {
             next: None,
             prev: None,
             state: State::Sealed,
+            tag: 0,
         });
 
         assert!(h.try_pin_remover());

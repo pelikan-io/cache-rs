@@ -1,6 +1,6 @@
 [package]
 name = "keyvalue"
-version = "0.3.0"
+version = "0.4.0"
 description = "Shared key-value item types for cache storage engines"
 
 edition = { workspace = true }
@@ -8,9 +8,26 @@ repository = { workspace = true }
 license = { workspace = true }
 
 [features]
-default = ["integrity"]
+# Corruption diagnostics: magic bytes + a CRC32 over the item, computed
+# at define time and re-computed on every in-place numeric update. NOT
+# default — the CRC costs a whole-item hash on every insert (~27% of
+# set time when it was unconditionally on).
+#
+# There is deliberately NO feature for the numeric seqlock writer-lock
+# discipline: incr/decr always serialize on the item's version word
+# (odd = write in progress), which is what lets an engine's cas publish
+# path exclude concurrent increments by holding `lock_numeric_version`.
+# That is a correctness property, not a knob — as a (default) feature it
+# could be silently disabled by any downstream building with
+# `default-features = false`.
 integrity = ["crc32fast"]
 debug = ["integrity"]
 
 [dependencies]
 crc32fast = { workspace = true, optional = true }
+
+# `--cfg kani` is set by the Kani driver when verifying the #[kani::proof]
+# harnesses; declare it so normal builds don't flag the cfg as unexpected.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(kani)"]

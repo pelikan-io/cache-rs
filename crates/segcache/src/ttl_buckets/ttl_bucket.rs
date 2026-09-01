@@ -70,8 +70,9 @@ pub struct TtlBucket {
     _pad: [u8; 36],
 }
 
-// Loom atomics are larger than std atomics, so skip size check under loom.
-#[cfg(not(feature = "loom"))]
+// Model-checking atomics may be larger than std atomics, so the layout
+// assert only applies to production builds.
+#[cfg(not(model_checking))]
 const _: () = assert!(std::mem::size_of::<TtlBucket>() == 64);
 
 impl TtlBucket {
@@ -126,7 +127,7 @@ impl TtlBucket {
     }
 
     /// Total segments ever linked into this bucket.
-    #[cfg(all(test, not(feature = "loom")))]
+    #[cfg(all(test, not(model_checking)))]
     pub(crate) fn nseg(&self) -> u32 {
         self.nseg.load(Ordering::Relaxed)
     }
@@ -261,8 +262,11 @@ impl TtlBucket {
 
                 freed += 1;
             } else {
-                // Condemn: unlinked immediately, freed by the last
-                // reader's guard drop (or by the race-fix recheck).
+                // Condemn: unlinked immediately, freed by whichever of the
+                // three claimants wins the AwaitingRelease -> Free CAS (the
+                // last reader's guard drop, the race-fix recheck below, or
+                // the backout of an acquire that failed after its
+                // increment).
                 match segments.condemn(seg_id, next, prev) {
                     ClearOutcome::Freed => freed += 1,
                     ClearOutcome::Deferred => {
@@ -496,15 +500,15 @@ impl TtlBucket {
     /// Test-only shim exposing `try_expand`'s `observed` (tail + generation)
     /// argument directly, so the H3 generation-ABA guard can be exercised
     /// without forcing the real drain/recycle race. `#[cfg(test)]` (not gated
-    /// to `not(feature = "loom")`) because the caller test module below IS
-    /// gated to `not(feature = "loom")` — under `--all-features` (loom on)
+    /// to `not(model_checking)`) because the caller test module below IS
+    /// gated to `not(model_checking)` — under `--all-features` (loom on)
     /// that caller disappears, and an unconditional `#[cfg(test)]` shim
     /// would then be dead code that trips `clippy --all-features -D
     /// warnings`. `#[allow(dead_code)]` covers that combination (same
     /// reasoning as `header.rs`'s `store_metadata_for_test`, mirrored
     /// direction).
     #[cfg(test)]
-    #[allow(dead_code)] // caller test module is cfg'd out under loom
+    #[allow(dead_code)] // caller test module is cfg'd out under model checking
     fn try_expand_for_test(
         &self,
         observed: Option<(NonZeroU32, u16)>,
@@ -514,7 +518,7 @@ impl TtlBucket {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod tests {
     use super::*;
     use crate::segments::{AllocOutcome, SegmentsBuilder};

@@ -14,6 +14,10 @@
 use crate::sync::Ordering;
 use crate::*;
 use clocksource::coarse::AtomicInstant;
+// Deliberately aliased: `Instant` in this crate is the *coarse* (1-second)
+// clock, which is correct for expiry deadlines but cannot measure the
+// sub-millisecond duration of a sweep. Duration measurement uses this.
+use std::time::Instant as StdInstant;
 
 const BUCKETS_PER_TIER: usize = 256;
 const TIER_COUNT: usize = 4;
@@ -62,19 +66,7 @@ impl TtlBuckets {
 
     /// Map a TTL duration to its bucket index (0–1023).
     pub(crate) fn get_bucket_index(&self, ttl: Duration) -> usize {
-        let secs = ttl.as_secs() as i32;
-        if secs <= 0 {
-            self.buckets.len() - 1
-        } else if secs & !(TIER_1_MAX - 1) == 0 {
-            (secs >> TIER_1_SHIFT) as usize
-        } else if secs & !(TIER_2_MAX - 1) == 0 {
-            (secs >> TIER_2_SHIFT) as usize + BUCKETS_PER_TIER
-        } else if secs & !(TIER_3_MAX - 1) == 0 {
-            (secs >> TIER_3_SHIFT) as usize + BUCKETS_PER_TIER * 2
-        } else {
-            let idx = (secs >> TIER_4_SHIFT) as usize + BUCKETS_PER_TIER * 3;
-            idx.min(TOTAL_BUCKETS - 1)
-        }
+        bucket_index(ttl.as_secs() as i32)
     }
 
     /// Get the bucket for the given TTL.
@@ -97,7 +89,7 @@ impl TtlBuckets {
             return 0;
         }
 
-        let start = Instant::now();
+        let start = StdInstant::now();
         let mut expired = 0;
         for bucket in self.buckets.iter() {
             expired += bucket.expire(hashtable, segments);
@@ -113,7 +105,7 @@ impl TtlBuckets {
 
     /// Clear all segments across all buckets. Returns total segments cleared.
     pub(crate) fn clear(&self, hashtable: &MultiChoiceHashtable, segments: &Segments) -> usize {
-        let start = Instant::now();
+        let start = StdInstant::now();
         let mut cleared = 0;
         for bucket in self.buckets.iter() {
             cleared += bucket.clear(hashtable, segments);
@@ -125,6 +117,53 @@ impl TtlBuckets {
         CLEAR_TIME.add(duration.as_nanos() as _);
 
         cleared
+    }
+}
+
+/// The pure tier arithmetic behind [`TtlBuckets::get_bucket_index`],
+/// separated from the collection so the `< TOTAL_BUCKETS` bound —
+/// which `get_bucket`'s `get_unchecked` rests on — is a checkable fact
+/// about a function of one integer rather than a claim about `self`.
+/// Proven total by the Kani harness below.
+fn bucket_index(secs: i32) -> usize {
+    if secs <= 0 {
+        TOTAL_BUCKETS - 1
+    } else if secs & !(TIER_1_MAX - 1) == 0 {
+        (secs >> TIER_1_SHIFT) as usize
+    } else if secs & !(TIER_2_MAX - 1) == 0 {
+        (secs >> TIER_2_SHIFT) as usize + BUCKETS_PER_TIER
+    } else if secs & !(TIER_3_MAX - 1) == 0 {
+        (secs >> TIER_3_SHIFT) as usize + BUCKETS_PER_TIER * 2
+    } else {
+        let idx = (secs >> TIER_4_SHIFT) as usize + BUCKETS_PER_TIER * 3;
+        idx.min(TOTAL_BUCKETS - 1)
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Every possible seconds value — negative, zero, the full i32 range
+    /// — maps inside the bucket array. This is the bound
+    /// `TtlBuckets::get_bucket`'s `get_unchecked` relies on, previously
+    /// carried by a SAFETY comment.
+    #[kani::proof]
+    fn bucket_index_always_in_range() {
+        let secs: i32 = kani::any();
+        assert!(bucket_index(secs) < TOTAL_BUCKETS);
+    }
+
+    /// The mapping is globally monotone over positive TTLs — across tier
+    /// boundaries and the tier-4 clamp included: a longer TTL never maps
+    /// to an earlier bucket (so eager expiration's per-bucket cutoffs
+    /// stay ordered).
+    #[kani::proof]
+    fn bucket_index_monotone_for_positive() {
+        let a: i32 = kani::any();
+        let b: i32 = kani::any();
+        kani::assume(a > 0 && b > 0 && a <= b);
+        assert!(bucket_index(a) <= bucket_index(b));
     }
 }
 

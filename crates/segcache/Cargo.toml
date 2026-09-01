@@ -1,6 +1,6 @@
 [package]
 name = "segcache"
-version = "0.4.1"
+version = "0.4.5"
 description = "Segment-structured cache storage engine with eager TTL expiration"
 authors = ["Brian Martin <brian@pelikan.io>"]
 
@@ -24,6 +24,28 @@ metrics = ["metriken"]
 # enables loom concurrency model checking for the hashtable
 loom = ["dep:loom"]
 
+# enables shuttle randomized concurrency testing. Complementary to loom:
+# loom models weak memory orderings but cannot model the SeqCst total
+# order (so the Dekker/store-buffering-shaped invariants are unassertable
+# under it); shuttle executes sequentially consistently (treating every
+# ordering as SeqCst), so it CAN assert those invariants — but can never
+# catch an ordering that is too weak. Keep both suites green. `loom` wins
+# if both features are enabled (e.g. under --all-features). Run with:
+#   cargo test -p segcache --features shuttle -- shuttle_
+# (the filter matters: like loom's, the model tests panic if their sync
+# primitives are used outside the model runner, and the std-thread suites
+# are compiled out under this feature)
+shuttle = ["dep:shuttle"]
+
+# enables the test-only fault-injection knob (`segcache::fault`) that forces
+# `Segment::copy_into`'s relink CAS to lose, so its `RelinkFailure` abort path
+# can be exercised. Deliberately NOT default and NOT implied by `debug`:
+# `debug` is purely observational (`items()`, `check_integrity()`) and is
+# reasonable to enable in staging, whereas this knob CHANGES BEHAVIOUR. It
+# needs nothing else to compile; the test that uses it also wants `debug` for
+# `items()`, which its own invocation enables.
+fault-injection = []
+
 # metafeatures
 debug = ["integrity"]
 
@@ -35,7 +57,13 @@ ahash = { workspace = true }
 clocksource = { workspace = true }
 crossbeam-deque = { workspace = true }
 crossbeam-utils = { workspace = true }
-keyvalue = { workspace = true, features = [] }
+# Deliberately does NOT pull keyvalue/integrity — the CRC half of the
+# once-bundled feature cost a whole-item hash on every insert (~27% of
+# set time) in builds that never check a CRC; segcache's own `integrity`
+# feature turns it on. The numeric seqlock discipline the cas publish
+# path relies on (`lock_numeric_version`) is unconditional in keyvalue,
+# not a feature — it cannot be built out.
+keyvalue = { workspace = true }
 log = { workspace = true }
 metriken = { workspace = true, optional = true }
 rand = { workspace = true, features = ["sys_rng"] }
@@ -44,6 +72,17 @@ memmap2 = { workspace = true }
 thiserror = { workspace = true }
 
 loom = { version = "0.7", features = ["checkpoint"], optional = true }
+shuttle = { version = "0.9", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# For layout-proof integration-test sizing (item_size): features unify
+# with the lib's own requirement, so the tests always see the layout the
+# build under test uses.
+keyvalue = { workspace = true }
+
+# `--cfg kani` is set by the Kani driver when verifying the #[kani::proof]
+# harnesses; declare it so normal builds don't flag the cfg as unexpected.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(kani)"]

@@ -23,6 +23,17 @@ pub enum SegmentsError {
         heap_size: usize,
         segment_size: usize,
     },
+    #[error(
+        "heap requires {segments} segments, more than the {limit} a location can address (the \
+         18-bit segment id holds one more, reserved so no location aliases the ghost sentinel); \
+         increase segment_size (or reduce heap_size)"
+    )]
+    TooManySegments { segments: usize, limit: usize },
+    #[error(
+        "segment size ({segment_size}) exceeds the {limit} bytes a location's offset field can \
+         address without aliasing two items onto one location; decrease segment_size"
+    )]
+    SegmentTooLarge { segment_size: usize, limit: usize },
     #[error("mmap allocation failed")]
     Mmap(#[from] std::io::Error),
 }

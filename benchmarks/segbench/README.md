@@ -1,0 +1,86 @@
+# segbench
+
+A multi-threaded scaling harness for `segcache`: N OS threads sharing one
+`Arc<Segcache>` and calling `get`/`insert` directly. No sockets, no protocol
+parsing — the numbers are the engine's.
+
+`cargo bench -p segcache` answers "how fast is one operation?" with
+single-threaded criterion microbenchmarks. This answers a different question:
+**how does throughput change as threads are added?** Those diverge sharply on
+the write path, and nothing in the repo measured the second one.
+
+## Running
+
+```bash
+cargo build --release -p segbench
+SEGBENCH=./target/release/segbench
+
+# one measurement -> one CSV row on stdout
+$SEGBENCH <threads> <write_pct> <dist> <warmup_s> <measure_s> [mode] [args...]
+
+# a grid of them -> CSV on stdout, progress on stderr
+taskset -c 8-15 $SEGBENCH sweep > scaling.csv
+taskset -c 8-15 $SEGBENCH sweep --mode shuf --write 0 > locality.csv
+
+$SEGBENCH aggregate scaling.csv locality.csv
+```
+
+`sweep --help` lists the grid options (`--threads`, `--write`, `--dist`,
+`--mode`, `--reps`, `--warmup`, `--measure`); the defaults are the grid above.
+Every point runs in a fresh child process, so no cache, allocator, or metrics
+state carries from one to the next.
+
+### Pin to one kind of core
+
+Pin the sweep from outside, as above — that pins every child with it. The tool
+has no pinning flag on purpose: `taskset` is Linux-only, and hard-coding it
+would make the harness less portable than the crate it measures.
+
+Pinning is not optional for a meaningful curve. On a hybrid CPU an unpinned
+sweep spreads threads over performance cores, their SMT siblings, and efficiency
+cores, then plots all three against a single "threads" axis — that curve says
+more about the core mix than about the engine. On the i5-13500H these results
+were taken on, `-c 8-15` selects the eight E cores: no SMT, one thread per core,
+so a thread count is a core count.
+
+Threads are confined to that CPU set, not pinned one-to-one within it. With as
+many threads as cores on an otherwise idle set, the difference is inside the
+run-to-run spread.
+
+## Workload
+
+Fixed at 1M keys, 16 B keys, 128 B values, TTL 0, prefilled before measurement.
+Per op each thread draws a key (uniform or Zipf s=0.99) and rolls `write_pct`
+for GET vs SET-replace. Writes are same-size replaces, so segment reclamation
+runs during measurement rather than only at the end.
+
+Threads count their own ops and add them to a shared total when a measurement
+flag flips, sampled every 64 ops to keep the check off the hot path.
+
+## Modes
+
+| Mode | What it measures |
+|---|---|
+| `base` (default) | One shared engine, TTL 0 — a single TTL bucket, so all writers share one active tail. |
+| `shuf` | `base` with prefill in shuffled key order. Spreads a Zipf head across segments instead of packing it into the segments filled first, which separates per-segment contention from key contention. |
+| `stripe` | Shared engine, thread *t* writes with TTL `1000 + 8t` s, landing in its own tier-1 TTL bucket: per-thread tails through the public API. Each stripe also gets its own merge chain, so it is an upper bound for a tail-only change. |
+| `shard <>` | T private single-writer engines, heap `1024/T` MB each, keys partitioned `idx % T`, each thread driving only its own shard. The no-routing upper bound for sharded designs. |
+| `part <P>` | P engines behind one routing function, every thread reading and writing every partition. Isolates the partitioned data layout from the ownership discipline. |
+| `delegate <batch> [owners] [ns]` | Workers route ops by key hash over bounded channels to owner threads holding private shards. `batch` = requests per message; `ns` = calibrated per-op worker busy-work modelling parse/socket cost. |
+| `hybrid <batch> [owners] [ns]` | Shared engine; workers execute reads in place, writes are batch-routed to owners applying with per-owner TTL stripes. |
+
+TTL 0 is deliberate: it concentrates every writer on one TTL bucket, which is
+both realistic for a single-default-TTL deployment and the worst case for tail
+reservation contention.
+
+## Reading the output
+
+Compare a series against **its own** single-thread median, not against another
+series' absolute Mops/s — the distributions have different per-op sampling costs
+that have nothing to do with the engine. `segbench aggregate` computes speedups
+that way, and prints JSON to stdout.
+
+Sweep output is CSV on stdout: redirect it wherever you like. It is not
+checked in, being regenerable output rather than a record. The findings drawn
+from it are written up in
+[`docs/journal/2026-08-25-segcache-read-write-scaling.md`](../../docs/journal/2026-08-25-segcache-read-write-scaling.md).

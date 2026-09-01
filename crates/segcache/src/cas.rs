@@ -100,7 +100,7 @@ impl fmt::Display for CasToken {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod tests {
     use super::*;
 
@@ -165,5 +165,68 @@ mod tests {
         assert_eq!(token1, token2);
         assert_ne!(token1, token3); // Different generation
         assert_ne!(token1, token4); // Different location
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Location and generation survive the token roundtrip for every
+    /// 44-bit location and every generation.
+    #[kani::proof]
+    fn cas_token_roundtrip() {
+        let raw: u64 = kani::any();
+        kani::assume(raw <= Location::MAX_RAW);
+        let generation: u16 = kani::any();
+        let token = CasToken::new(Location::new(raw), generation);
+        assert_eq!(token.location().as_raw(), raw);
+        assert_eq!(token.generation(), generation);
+    }
+
+    /// Distinct seqlock versions never collide on a token for a fixed
+    /// raw token value — the doc comment's "odd constant, bijective over
+    /// u64" claim, certified. This is what makes CAS tokens observe
+    /// every in-place increment.
+    ///
+    /// Deliberately scoped to a FIXED raw: cross-raw collisions
+    /// (`mix(raw1, v1) == mix(raw2, v2)`) exist by pigeonhole for any
+    /// 64-bit token and are not a goal — memcached's cas unique shares
+    /// the property. The protocol's freshness argument only needs
+    /// in-place updates at one (location, generation) to change the
+    /// token, which is exactly what this establishes.
+    ///
+    /// # What is machine-checked, and what carries the rest
+    ///
+    /// The machine-checked certificate is `K * K_INV == 1 (mod 2^64)` —
+    /// a constant equation, solver-trivial. Injectivity follows by ring
+    /// arithmetic: `v1*K == v2*K` implies (multiplying both sides by
+    /// K_INV, associativity/commutativity of wrapping multiplication)
+    /// `v1 == v2`, and XOR with a fixed `raw` preserves injectivity.
+    /// A full-width symbolic proof of the same theorem — either as the
+    /// direct disequality or as the `(v*K)*K_INV == v` roundtrip — is
+    /// deliberately NOT used: both forms build 64-bit multiplier
+    /// circuits whose SAT cost proved erratic (seconds on one machine,
+    /// 44+ minutes of CNF reduction on the CI runner before timeout).
+    /// A 16-bit-bounded roundtrip keeps a symbolic sanity layer that a
+    /// wrong K_INV or a broken `mix_version` expression still fails.
+    #[kani::proof]
+    fn mix_version_injective_in_version() {
+        const K: u64 = 0x9E37_79B9_7F4A_7C15;
+        /// Multiplicative inverse of K mod 2^64 (K is odd, so it exists).
+        const K_INV: u64 = 0xF1DE_83E1_9937_733D;
+
+        // The certificate: K really is a unit and K_INV really is its
+        // inverse. Constant-folded — no symbolic multiplier.
+        assert_eq!(K & 1, 1);
+        assert_eq!(K.wrapping_mul(K_INV), 1);
+
+        // Bounded symbolic sanity layer: recovering v from the token is
+        // XOR-then-K_INV, over a domain small enough to keep the
+        // multiplier cone tractable everywhere.
+        let raw: u64 = kani::any();
+        let v: u64 = kani::any();
+        kani::assume(v < 1 << 16);
+        assert_eq!((mix_version(raw, v) ^ raw).wrapping_mul(K_INV), v);
     }
 }

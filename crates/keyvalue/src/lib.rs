@@ -10,6 +10,7 @@ pub mod numeric;
 pub mod tiny;
 mod value;
 
+pub use item::NumericVersionGuard;
 pub use item::{item_size, numeric_value_pad, ItemGuard, ItemHeader, RawItem, ITEM_HDR_SIZE};
 pub use tiny::{TinyItem, TinyItemHeader, TINY_ITEM_HDR_SIZE};
 pub use value::{OwnedValue, Value};

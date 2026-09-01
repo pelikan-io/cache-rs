@@ -3,8 +3,9 @@
 //! Ported from crucible's `cache/core/src/state.rs` with one deviation:
 //! chain pointers use cache-rs's 1-indexed `Option<NonZeroU32>` convention
 //! (0 = none) rather than crucible's `INVALID_SEGMENT_ID = 0xFF_FFFF`
-//! sentinel. Segment ids are asserted `< 2^24` at construction, so they
-//! always fit the 24-bit packed fields.
+//! sentinel. Segment ids are capped at `Location::MAX_SEGMENT_ID` (< 2^18)
+//! at construction — a `Location` addresses a segment in 18 bits — so they
+//! always fit the 24-bit packed fields here with room to spare.
 
 use core::num::NonZeroU32;
 
@@ -43,32 +44,52 @@ use core::num::NonZeroU32;
 /// # State Transition Diagram (as used by this crate)
 ///
 /// ```text
-///        +--------------->  Free  <-------------------------------+
-///        |                   | try_reserve (generation bump)      |
-///        |                   v                                    |
-///  try_release           Reserved                                 |
-///        |                   | link into chain (prev set)         |
-///        +---------------  Linking                                |
-///                            | publish                            |
-///                            v                                    |
-///        +---------------> Live  (bucket tail: writable)          |
-///        |                   | sealed by the appender, in the     |
-///        |                   | same CAS that sets `next`          |
-///        |                   v                                    |
-///        | (copy dest:    Sealed  (readable, evictable)           |
-///        |  Linking ->        | begin drain (SeqCst)              |
-///        |  Relinking ->      v                                   |
-///        |  Sealed)       Draining ---- ref_count == 0 -----------+
-///        |                 |     ^  \                        (-> Free)
-///        +--- revert ------+     |   \ ref_count > 0
-///            (merge source        \   v
-///             found pinned)        AwaitingRelease
-///                                    | last reader guard drop
-///                                    +------------------> Free
+///                        Free
+///                         | try_reserve (no generation bump)
+///                         v
+///                      Reserved ---+
+///                         |        |
+///                         | link   | try_release (Reserved|Linking -> Free):
+///                         | into   | the ONLY release that does NOT bump the
+///                         | chain  | generation — nothing was ever published
+///                         v        | into this incarnation, so there is
+///                      Linking ----+ nothing for a new one to invalidate
+///                         |
+///                         | publish
+///                         v
+///                       Live  (bucket tail: writable)
+///                         | sealed by the appender, in the
+///                         | same CAS that sets `next`
+///     (copy dest:         v
+///      Linking ->       Sealed  (readable, evictable)
+///      Relinking ->       | begin drain (SeqCst)
+///      Sealed)            v
+///                      Draining --- ref_count == 0 ----------> Free
+///                         |                     try_release_drained
+///                         | ref_count > 0        (GENERATION BUMP)
+///                         v
+///                   AwaitingRelease --- last reader guard drop -> Free
+///                                       try_release_condemned
+///                                        (GENERATION BUMP)
 /// ```
+///
+/// The generation advances on exactly the two `-> Free` transitions that end
+/// a *used* incarnation — `try_release_drained` and `try_release_condemned`,
+/// the unpinned and reader-pinned halves of the same event. That is what
+/// invalidates every `Location` (via its incarnation tag) and every
+/// `CasToken` published into the incarnation just ended. `try_reserve` does
+/// NOT bump: a reservation begins an incarnation rather than ending one.
 ///
 /// Live -> Draining also exists for draining the bucket tail during
 /// `clear()`/`expire()`.
+///
+/// There is deliberately no `Draining -> Sealed` revert edge: a drain claim
+/// always ends the incarnation, and a segment whose items are still pinned by
+/// in-flight readers is condemned (`Draining -> AwaitingRelease`) rather than
+/// handed back to `Sealed`. (Earlier revisions of this diagram drew such a
+/// "revert (merge source found pinned)" arrow; no production path ever
+/// implemented it — the only `Draining -> Sealed` CAS in the tree is inside a
+/// loom model in `header.rs`.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum State {
@@ -107,15 +128,17 @@ impl State {
 
     /// Check if the segment is readable (allows get operations).
     ///
-    /// Note: AwaitingRelease is readable so in-flight pinned readers can
-    /// complete; new reads cannot arrive because the hashtable is fully
-    /// drained before a segment is condemned.
+    /// AwaitingRelease is deliberately NOT readable. Draining the
+    /// hashtable before condemning stops new *lookups* from routing to a
+    /// segment, but a reader whose lookup preceded the drain still calls
+    /// `try_acquire_reader` afterwards, so a new *pin* can still arrive
+    /// after the condemn. Permitting it lets the reader count return to
+    /// non-zero after reaching zero, which no reference-count handoff can
+    /// survive: the last-reader drop frees the segment while that later
+    /// pin is live.
     #[inline]
     pub fn is_readable(self) -> bool {
-        matches!(
-            self,
-            State::Live | State::Sealed | State::Relinking | State::AwaitingRelease
-        )
+        matches!(self, State::Live | State::Sealed | State::Relinking)
     }
 
     /// Check if the segment is writable (allows append operations).
@@ -136,7 +159,7 @@ impl State {
 /// The packed layout in the `AtomicU64`:
 ///
 /// ```text
-/// bits 63..56  unused      (8)
+/// bits 63..56  tag         (8)  lifetime tag, see `cas_condemn`
 /// bits 55..48  state       (8)
 /// bits 47..24  prev        (24)  0 = none
 /// bits 23..0   next        (24)  0 = none
@@ -146,10 +169,17 @@ pub(crate) struct Metadata {
     pub next: Option<NonZeroU32>,
     pub prev: Option<NonZeroU32>,
     pub state: State,
+    /// Lifetime tag, meaningful only while AwaitingRelease (see `cas_condemn`).
+    pub tag: u8,
 }
 
 impl Metadata {
     const LINK_MASK: u64 = 0xFF_FFFF;
+
+    /// Bit position of the tag byte, which `SegmentHeader::cas_condemn`
+    /// uses to make the AwaitingRelease -> Free CAS token unique to one
+    /// use of a segment.
+    const TAG_SHIFT: u32 = 56;
 
     /// Create metadata for a fresh, unlinked segment.
     pub fn new_free() -> Self {
@@ -157,6 +187,7 @@ impl Metadata {
             next: None,
             prev: None,
             state: State::Free,
+            tag: 0,
         }
     }
 
@@ -167,7 +198,7 @@ impl Metadata {
         let prev = self.prev.map_or(0, NonZeroU32::get) as u64;
         debug_assert!(next <= Self::LINK_MASK, "segment id exceeds 24 bits");
         debug_assert!(prev <= Self::LINK_MASK, "segment id exceeds 24 bits");
-        ((self.state as u64) << 48) | (prev << 24) | next
+        ((self.tag as u64) << Self::TAG_SHIFT) | ((self.state as u64) << 48) | (prev << 24) | next
     }
 
     /// Unpack from the u64 representation.
@@ -177,11 +208,12 @@ impl Metadata {
             next: NonZeroU32::new((packed & Self::LINK_MASK) as u32),
             prev: NonZeroU32::new(((packed >> 24) & Self::LINK_MASK) as u32),
             state: State::from_u8(((packed >> 48) & 0xFF) as u8),
+            tag: ((packed >> Self::TAG_SHIFT) & 0xFF) as u8,
         }
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
 mod tests {
     use super::*;
 
@@ -214,10 +246,10 @@ mod tests {
     #[test]
     fn predicates() {
         use State::*;
-        for s in [Free, Reserved, Linking, Draining, Locked] {
+        for s in [Free, Reserved, Linking, Draining, Locked, AwaitingRelease] {
             assert!(!s.is_readable(), "{s:?} must not be readable");
         }
-        for s in [Live, Sealed, Relinking, AwaitingRelease] {
+        for s in [Live, Sealed, Relinking] {
             assert!(s.is_readable(), "{s:?} must be readable");
         }
         for s in [
@@ -256,16 +288,26 @@ mod tests {
                 next: NonZeroU32::new(1),
                 prev: None,
                 state: State::Live,
+                tag: 0,
             },
             Metadata {
                 next: NonZeroU32::new(0xFF_FFFF),
                 prev: NonZeroU32::new(0xFF_FFFE),
                 state: State::AwaitingRelease,
+                tag: 0,
             },
             Metadata {
                 next: None,
                 prev: NonZeroU32::new(42),
                 state: State::Sealed,
+                tag: 0,
+            },
+            /* a non-zero tag must survive alongside links */
+            Metadata {
+                next: NonZeroU32::new(7),
+                prev: NonZeroU32::new(9),
+                state: State::AwaitingRelease,
+                tag: 0xFF,
             },
         ];
         for m in cases {
@@ -281,5 +323,52 @@ mod tests {
         assert!(m.prev.is_none());
         // Free with no links packs the state bits only
         assert_eq!(m.pack() & 0xFFFF_FFFF_FFFF, 0);
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    fn any_metadata() -> Metadata {
+        let state_raw: u8 = kani::any();
+        kani::assume(state_raw <= State::AwaitingRelease as u8);
+        let next: u32 = kani::any();
+        kani::assume(next <= Metadata::LINK_MASK as u32);
+        let prev: u32 = kani::any();
+        kani::assume(prev <= Metadata::LINK_MASK as u32);
+        Metadata {
+            next: NonZeroU32::new(next),
+            prev: NonZeroU32::new(prev),
+            state: State::from_u8(state_raw),
+            tag: kani::any(),
+        }
+    }
+
+    /// Every valid metadata survives the pack/unpack roundtrip — the
+    /// hand-picked-case unit test made total.
+    #[kani::proof]
+    fn metadata_roundtrip() {
+        let m = any_metadata();
+        assert_eq!(Metadata::unpack(m.pack()), m);
+    }
+
+    /// Packing is injective over valid metadata: no two distinct
+    /// (state, links, tag) tuples share a packed word, so a CAS on the
+    /// metadata word can never confuse two states.
+    #[kani::proof]
+    fn metadata_injective() {
+        let a = any_metadata();
+        let b = any_metadata();
+        kani::assume(a.pack() == b.pack());
+        assert_eq!(a, b);
+    }
+
+    /// `from_u8` roundtrips every valid discriminant.
+    #[kani::proof]
+    fn state_from_u8_roundtrip() {
+        let v: u8 = kani::any();
+        kani::assume(v <= State::AwaitingRelease as u8);
+        assert_eq!(State::from_u8(v) as u8, v);
     }
 }

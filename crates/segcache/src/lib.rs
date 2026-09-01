@@ -48,6 +48,25 @@ mod metrics;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, not(model_checking)))]
+mod pin_failure_tests;
+
+#[cfg(all(test, not(model_checking)))]
+mod numeric_concurrency_tests;
+
+#[cfg(all(test, not(model_checking)))]
+mod numeric_relocation_tests;
+
+// Deterministic coverage of `get_pinned`'s revalidation retry (#65). Needs the
+// `fault-injection` knob: the race is a two-thread interleaving that a test
+// can only reach by luck, so the hooks stand in for the racing writer at the
+// exact two points that matter. CI runs it via the fault-injection step.
+#[cfg(all(test, feature = "fault-injection", not(model_checking)))]
+mod revalidation_tests;
+
+#[cfg(all(test, not(model_checking)))]
+mod incarnation_tests;
+
 // publicly exported items from submodules
 pub use crate::segcache::Segcache;
 pub use builder::Builder;
@@ -56,6 +75,12 @@ pub use eviction::Policy;
 pub use hashtable::Location;
 pub use item::Item;
 pub use keyvalue::Value;
+// Hidden from rustdoc: docs.rs commonly builds `--all-features`, which would
+// otherwise publish this as documented API surface for a knob whose own docs
+// say never to enable it outside tests.
+#[cfg(feature = "fault-injection")]
+#[doc(hidden)]
+pub use segments::segment_fault as fault;
 
 // items from submodules which are imported for convenience to the crate level
 pub(crate) use crate::rand::*;

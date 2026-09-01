@@ -23,19 +23,202 @@ fn sizes() {
     assert_eq!(std::mem::size_of::<TtlBuckets>(), 24);
 }
 
+// WHICH transition spends a generation is load-bearing, not an
+// implementation detail. The generation is the clock both the incarnation
+// tag (#50) and the CAS token are carved against, so a bump on the wrong
+// edge is a correctness bug in both directions: too EARLY (at the condemn)
+// kills every location of a segment that still has live readers pinning and
+// reading it; too LATE, or on reserve, lets a location outlive the
+// incarnation that published it.
+//
+// Written as a table over the transitions rather than as a walk through one
+// segment's life, so that it reads against the state diagram in `state.rs`
+// line by line. What it CATCHES is the bump MOVING: onto an edge that must
+// not spend a generation, or off one that must — which is exactly the gap
+// that let a textual merge move the `generation.fetch_add` off
+// `try_release_condemned` and onto `cas_condemn` with the entire suite, loom
+// included, still green.
+//
+// What it does NOT catch, stated plainly so nobody trusts it further than it
+// goes: a NEW `SegmentHeader` transition added without a row here. Nothing
+// enumerates the header's transitions at runtime, so the `table.len()`
+// assertion below can only compare a literal against a literal — it fires
+// when someone edits the table, which makes an intentional change deliberate,
+// and is silent about an omission. Reviewing a new transition into this table
+// is a human step; #80 tracks a check that could enforce it.
+//
+// Calibration, measured rather than asserted: with that defect reinstated
+// and ONLY this test skipped, 151 lib tests and all 31 loom models still
+// pass. That is what this assertion is standing in for — nothing else in
+// the tree pins which edge spends a generation, so weakening it removes the
+// only signal, not one signal among several.
 #[test]
-fn segment_header_generation_bumps_on_reserve() {
+fn generation_advances_on_exactly_the_two_transitions_that_end_a_used_incarnation() {
+    use crate::segments::state::State;
+
+    struct Transition {
+        /// `Source -> Destination (the header method that performs it)`.
+        label: &'static str,
+        /// Drive a fresh header to the source state.
+        arrive: fn(&SegmentHeader),
+        /// The transition under test; must win.
+        run: fn(&SegmentHeader) -> bool,
+        /// The state it must leave the header in.
+        lands_in: State,
+        /// Does it END a used incarnation, and therefore spend a generation?
+        bumps: bool,
+    }
+
+    // Every state transition a `SegmentHeader` method performs. Exactly two
+    // of them may write `generation` — `grep -n 'generation.fetch_add'` must
+    // return the two rows marked `bumps: true` and nothing else.
+    let table = [
+        Transition {
+            label: "Free -> Reserved (try_reserve)",
+            arrive: |_| {},
+            run: SegmentHeader::try_reserve,
+            lands_in: State::Reserved,
+            // A reservation BEGINS an incarnation; there is nothing to end.
+            bumps: false,
+        },
+        Transition {
+            label: "Reserved -> Free (try_release)",
+            arrive: |h| assert!(h.try_reserve()),
+            run: SegmentHeader::try_release,
+            lands_in: State::Free,
+            // The chain-extension election loser: never written into, so no
+            // location names it and there is nothing to invalidate.
+            bumps: false,
+        },
+        Transition {
+            label: "Linking -> Free (try_release)",
+            arrive: |h| {
+                assert!(h.try_reserve());
+                h.set_state(State::Linking);
+            },
+            run: SegmentHeader::try_release,
+            lands_in: State::Free,
+            bumps: false,
+        },
+        Transition {
+            label: "Draining -> AwaitingRelease (cas_condemn)",
+            arrive: |h| {
+                assert!(h.try_reserve());
+                h.set_state(State::Draining);
+            },
+            run: SegmentHeader::cas_condemn,
+            lands_in: State::AwaitingRelease,
+            // THE ONE THAT LOOKS LIKE IT SHOULD. A condemn is where a used
+            // incarnation stops being reachable, but it is not where the
+            // incarnation ENDS: readers pinned before the condemn are still
+            // reading its bytes, and their locations must keep resolving
+            // until the last of them drops. The generation is spent by the
+            // release those readers hand off to, one transition later.
+            bumps: false,
+        },
+        Transition {
+            label: "Draining -> Free (try_release_drained)",
+            arrive: |h| {
+                assert!(h.try_reserve());
+                h.set_state(State::Draining);
+            },
+            run: SegmentHeader::try_release_drained,
+            lands_in: State::Free,
+            // A used incarnation ends here, unpinned half.
+            bumps: true,
+        },
+        Transition {
+            label: "AwaitingRelease -> Free (try_release_condemned)",
+            arrive: |h| {
+                assert!(h.try_reserve());
+                h.set_state(State::Draining);
+                assert!(h.cas_condemn());
+            },
+            run: SegmentHeader::try_release_condemned,
+            lands_in: State::Free,
+            // The same event, reader-pinned half. This row is what covers
+            // the last reader's guard drop, which frees a segment without
+            // ever passing through `Segments::recycle`.
+            bumps: true,
+        },
+    ];
+
+    assert_eq!(
+        table.len(),
+        6,
+        "this table was edited; every row is load-bearing, so re-derive the \
+         `bumps` column against `state.rs`'s diagram before changing the count. \
+         (This compares a literal against a literal: it cannot see a NEW \
+         `SegmentHeader` transition that never got a row — see the note above.)"
+    );
+
+    for t in table {
+        let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
+        (t.arrive)(&header);
+        let before = header.generation();
+
+        assert!((t.run)(&header), "{}: the transition must win", t.label);
+        assert_eq!(
+            header.state(),
+            t.lands_in,
+            "{}: landed in the wrong state",
+            t.label
+        );
+
+        let after = header.generation();
+        if t.bumps {
+            assert_eq!(
+                after,
+                before.wrapping_add(1),
+                "{}: this transition ENDS a used incarnation, so it must spend \
+                 exactly one generation (was {before}, now {after}); without it \
+                 a location published into the incarnation just ended stays \
+                 valid against the next one",
+                t.label
+            );
+        } else {
+            assert_eq!(
+                after, before,
+                "{}: this transition does NOT end a used incarnation, so it must \
+                 not spend a generation (was {before}, now {after}); bumping here \
+                 invalidates locations whose incarnation is still live — at the \
+                 condemn edge that means readers still pinning and reading the \
+                 segment lose their items",
+                t.label
+            );
+        }
+    }
+
+    // A LOST transition CAS must not spend one either. The condemned handoff
+    // has three claimants and the CAS admits exactly one, which is what makes
+    // it exactly-one-free; the bump riding behind that CAS makes it
+    // exactly-one-bump for the same reason.
     let header = SegmentHeader::new(NonZeroU32::new(1).unwrap());
-    assert_eq!(header.generation(), 0);
-
-    // every Free -> Reserved reservation bumps the generation, so CAS
-    // tokens from a previous use of the segment can never match again
     assert!(header.try_reserve());
+    header.set_state(State::Draining);
+    assert!(header.try_release_drained());
     assert_eq!(header.generation(), 1);
-
-    assert!(header.try_release());
-    assert!(header.try_reserve());
-    assert_eq!(header.generation(), 2);
+    for (label, lost) in [
+        (
+            "try_release_drained",
+            SegmentHeader::try_release_drained as fn(&SegmentHeader) -> bool,
+        ),
+        (
+            "try_release_condemned",
+            SegmentHeader::try_release_condemned,
+        ),
+        ("cas_condemn", SegmentHeader::cas_condemn),
+    ] {
+        assert!(
+            !lost(&header),
+            "{label}: the segment is Free, so this transition cannot win"
+        );
+        assert_eq!(
+            header.generation(),
+            1,
+            "{label}: a transition that lost its CAS must not spend a generation"
+        );
+    }
 }
 
 // A held Item pins its segment: heavy eviction churn must neither move
@@ -557,7 +740,10 @@ fn can_evict_respects_ref_count() {
     assert!(!header.can_evict());
     header.set_state(State::Sealed);
 
-    assert!(header.try_acquire_reader());
+    assert_eq!(
+        header.try_acquire_reader(),
+        crate::segments::AcquireOutcome::Acquired
+    );
     assert!(!header.can_evict());
 
     header.release_reader();
@@ -570,8 +756,14 @@ fn reader_pin_acquire_release() {
 
     // acquisition succeeds in readable states and counts pins
     header.set_state(State::Live);
-    assert!(header.try_acquire_reader());
-    assert!(header.try_acquire_reader());
+    assert_eq!(
+        header.try_acquire_reader(),
+        crate::segments::AcquireOutcome::Acquired
+    );
+    assert_eq!(
+        header.try_acquire_reader(),
+        crate::segments::AcquireOutcome::Acquired
+    );
     assert_eq!(header.ref_count(), 2);
 
     header.release_reader();
@@ -580,11 +772,17 @@ fn reader_pin_acquire_release() {
 
     // acquisition fails in non-readable states and leaves no pin
     header.set_state(State::Draining);
-    assert!(!header.try_acquire_reader());
+    assert_ne!(
+        header.try_acquire_reader(),
+        crate::segments::AcquireOutcome::Acquired
+    );
     assert_eq!(header.ref_count(), 0);
 
     header.set_state(State::Free);
-    assert!(!header.try_acquire_reader());
+    assert_ne!(
+        header.try_acquire_reader(),
+        crate::segments::AcquireOutcome::Acquired
+    );
     assert_eq!(header.ref_count(), 0);
 }
 
@@ -795,13 +993,31 @@ fn cas_stale_token_rejected_after_segment_recycle() {
     assert!(cache.insert(b"coffee", b"cold", None, ttl).is_ok());
     let fresh = cache.get(b"coffee").unwrap().cas();
 
-    // Precondition: this really is the ABA scenario — same location bits.
-    // If free-queue ordering ever changes, fail loudly here rather than
-    // silently passing without exercising ABA.
+    // Precondition: this really is the ABA scenario — the same key landed at
+    // the same ADDRESS (segment id + offset) in the recycled segment. If
+    // free-queue ordering ever changes, fail loudly here rather than silently
+    // passing without exercising ABA.
+    let stale_loc = Location::from_raw(stale & CasToken::LOCATION_MASK);
+    let fresh_loc = Location::from_raw(fresh & CasToken::LOCATION_MASK);
     assert_eq!(
-        stale & CasToken::LOCATION_MASK,
-        fresh & CasToken::LOCATION_MASK,
-        "test precondition violated: item did not land at the same location"
+        unpack_location(stale_loc),
+        unpack_location(fresh_loc),
+        "test precondition violated: item did not land at the same address"
+    );
+    // The location bits themselves now differ, because a location carries the
+    // segment's incarnation tag (#50): recycling the segment advanced the
+    // generation, so the reused address packs to a different 44-bit value.
+    // That is a second, structural line of defence under the token's own
+    // generation field — the ABA the token was added for cannot even produce
+    // matching location bits any more.
+    assert_ne!(
+        stale_loc, fresh_loc,
+        "the incarnation tag must differentiate the two locations"
+    );
+    assert_ne!(
+        stale_loc.tag(),
+        fresh_loc.tag(),
+        "the differing bits must be the incarnation tag"
     );
     assert_ne!(stale, fresh, "generation must differentiate the tokens");
 
@@ -1114,7 +1330,7 @@ fn expiration() {
 // Uses `Segments::free_only`, which (like the rest of the Task-1 spare
 // accessors) is only compiled outside the `loom` feature.
 #[test]
-#[cfg(not(feature = "loom"))]
+#[cfg(not(model_checking))]
 fn evict_expires_before_merging() {
     // Fixed-width key + fixed value so every insert consumes exactly the
     // same number of bytes. `keyvalue::item_size` is the same size
@@ -1238,7 +1454,7 @@ fn evict_expires_before_merging() {
 // Uses the Task-1 spare accessors (`free`, `free_only`, `spare_count`),
 // which are compiled only outside the `loom` feature.
 #[test]
-#[cfg(not(feature = "loom"))]
+#[cfg(not(model_checking))]
 fn merge_evict_copies_survivors_into_spare() {
     const ITEMS_PER_SEGMENT: usize = 64;
     const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits
@@ -1405,7 +1621,7 @@ fn merge_evict_copies_survivors_into_spare() {
 //   (c) drain both source segments (Free, nothing leaked);
 //   (d) leave the untouched Live tail segment alone.
 #[test]
-#[cfg(not(feature = "loom"))]
+#[cfg(not(model_checking))]
 fn merge_compact_combines_under_full_segments_into_spare() {
     const ITEMS_PER_SEGMENT: usize = 12;
     const KEY_LEN: usize = 7; // "k" + 6 zero-padded digits

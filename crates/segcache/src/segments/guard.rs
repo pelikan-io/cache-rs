@@ -12,8 +12,9 @@ use crate::segments::SegmentHeader;
 /// The guard completes that handoff: when the LAST pin drops on a
 /// condemned segment, the guard's drop transitions it AwaitingRelease ->
 /// Free and returns it to the free queue directly — no `&mut Segments`
-/// pass required. The transition CAS guarantees exactly-one-free between
-/// a racing last-guard drop and the condemner's recheck.
+/// pass required. The transition CAS guarantees exactly-one-free among the
+/// three claimants: a racing last-guard drop, the condemner's recheck, and
+/// the backout of an acquire that failed after its increment.
 ///
 /// Holds raw pointers rather than borrows so that the guard (and the
 /// [`crate::Item`] carrying it) is not lifetime-tied to the cache; this
@@ -28,8 +29,9 @@ impl SegmentGuard {
     ///
     /// # Safety
     ///
-    /// - `SegmentHeader::try_acquire_reader` must have returned `true`
-    ///   on `header`, and ownership of that pin transfers to this guard.
+    /// - `SegmentHeader::try_acquire_reader` must have returned
+    ///   `AcquireOutcome::Acquired` on `header`, and ownership of that pin
+    ///   transfers to this guard.
     /// - `header` must point into the `Segments` headers allocation and
     ///   `free_queue` at the `Segments`-owned boxed Injector; both must
     ///   outlive the guard.
@@ -60,7 +62,23 @@ impl Drop for SegmentGuard {
             // AwaitingRelease -> Free transition: return it to the free
             // queue ourselves.
             //
-            // Intentionally bypasses the spare-aware `return_segment`
+            // Settle the segment's accounting FIRST. The CAS we just won is
+            // exclusive (exactly one of the three claimants listed in the
+            // struct doc above can win it) and nothing can find the segment
+            // until we push it, so
+            // we are its sole owner here — the same ownership `recycle` has
+            // when it calls this. The other two claimants settle the same
+            // way, at their own `return_segment`. Without it a condemned
+            // segment carries its unpinned-unlink residue AND its whole dead
+            // total onto the free queue, unreconciled until some later
+            // `try_reserve` happens to pick it up: `item_current` would sit
+            // above the true live count and `item_dead` above the true dead
+            // occupancy for as long as the segment stays free (issue #58
+            // part 2). `reset_write_stats` is idempotent, so the later
+            // reserve-time reset is harmless.
+            header.reset_write_stats();
+
+            // The push below intentionally bypasses the spare-aware `return_segment`
             // helper: this guard only holds a raw pointer to the free
             // queue (see the struct doc), not `&Segments`, so it cannot
             // see or update the spare queue/count. A segment freed here

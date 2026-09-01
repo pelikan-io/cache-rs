@@ -1,3 +1,8 @@
+// Model-checking backends replace the lib's sync primitives, which panic
+// outside their runner — compile this std-thread suite out rather than
+// relying on the model jobs' name filters to skip it.
+#![cfg(not(model_checking))]
+
 use segcache::*;
 use std::time::Duration;
 
@@ -100,106 +105,84 @@ fn random_evicts_short_ttl_segment_when_full() {
 
 #[test]
 fn fifo_evicts_oldest_segment_first() {
-    // 3 segments: seg1 (old items) → seg2 (new items) → seg3 (tail/current write target).
-    // Eviction must choose between seg1 and seg2; seg3 is never eligible because
-    // it has no next_seg.  Correct FIFO picks seg1 (oldest).
-    let cache = small_cache(3, Policy::Fifo);
+    // 3 segments: seg1 (old items) -> seg2 (new items) -> seg3 (tail/current
+    // write target). Eviction must choose between seg1 and seg2; seg3 is
+    // never eligible because it has no next_seg. Correct FIFO picks seg1
+    // (the oldest).
+    //
+    // LAYOUT-PROOF SIZING: uniform items and a segment size computed from
+    // the real item footprint, so "three items fill a segment exactly"
+    // holds in every feature combination (the item header is 6 bytes by
+    // default and 12 under `integrity`, which also prefixes each segment
+    // with 8 magic bytes — a hand-tuned byte count silently repacks when
+    // the layout changes, which is exactly how this test broke when the
+    // CRC stopped being always-on).
+    const ITEMS_PER_SEG: usize = 3;
+    const KLEN: usize = 5;
+    const VLEN: usize = 40;
+    let value = [b'x'; VLEN];
+    let item_size = keyvalue::item_size(KLEN, &keyvalue::Value::Bytes(&value), 0);
+    let seg_base = if cfg!(feature = "integrity") { 8 } else { 0 };
+    let segment_size = (seg_base + ITEMS_PER_SEG * item_size) as i32;
+
+    let cache = Segcache::builder()
+        .segment_size(segment_size)
+        .heap_size(3 * segment_size as usize)
+        .hash_power(16)
+        .eviction(Policy::Fifo)
+        .build()
+        .expect("failed to create cache");
     let ttl = Duration::ZERO;
 
-    // Fill segment 1 with "old" items.
-    let _ = cache.insert(
-        b"old_a",
-        b"What's in a name? A rose by any other name would smell as sweet.",
-        None,
-        ttl,
-    );
-    let _ = cache.insert(b"old_b", b"All that glitters is not gold.", None, ttl);
-    let _ = cache.insert(
-        b"old_c",
-        b"Cry 'havoc' and let slip the dogs of war.",
-        None,
-        ttl,
-    );
-    // segment 1 is sealed; segment 2 becomes the new tail.
+    let insert = |key: &[u8]| {
+        assert_eq!(key.len(), KLEN, "uniform sizing requires {KLEN}-byte keys");
+        cache
+            .insert(key, &value[..], None, ttl)
+            .expect("insert must succeed");
+    };
 
-    // Sleep long enough for clocksource::coarse (1-second resolution) to tick.
+    // Fill segment 1 with "old" items.
+    insert(b"old_a");
+    insert(b"old_b");
+    insert(b"old_c");
+    // segment 1 is exactly full and seals on the next insert.
+
+    // Sleep long enough for clocksource::coarse (1-second resolution) to
+    // tick, so the FIFO comparator can distinguish the segments' ages.
     std::thread::sleep(Duration::from_millis(1100));
 
     // Fill segment 2 with "new" items.
-    let _ = cache.insert(
-        b"new_d",
-        b"There are more things in heaven and earth, Horatio, than are dreamt of in your philosophy.",
-        None,
-        ttl,
-    );
-    let _ = cache.insert(
-        b"new_e",
-        b"Uneasy lies the head that wears the crown.",
-        None,
-        ttl,
-    );
-    let _ = cache.insert(b"new_f", b"Brevity is the soul of wit.", None, ttl);
-    #[cfg(not(feature = "integrity"))]
-    let _ = cache.insert(
-        b"new_g",
-        b"But, for my own part, it was Greek to me.",
-        None,
-        ttl,
-    );
-    #[cfg(feature = "integrity")]
-    let _ = cache.insert(b"new_g", b"Et tu, Brute?", None, ttl);
-    // segment 2 is sealed; segment 3 becomes the new tail.
+    insert(b"new_d");
+    insert(b"new_e");
+    insert(b"new_f");
 
-    // Fill segment 3 so that the next insert must evict.
-    // (Without this, "trigger" would fit in the still-empty tail segment 3
-    // and no eviction would occur.)
-    let _ = cache.insert(
-        b"seg3_a",
-        b"What's in a name? A rose by any other name would smell as sweet.",
-        None,
-        ttl,
-    );
-    let _ = cache.insert(b"seg3_b", b"All that glitters is not gold.", None, ttl);
-    let _ = cache.insert(
-        b"seg3_c",
-        b"Cry 'havoc' and let slip the dogs of war.",
-        None,
-        ttl,
-    );
-    // segment 3 is now sealed; segment 4 would be the new tail — but we only
-    // have 3 total, so the next insert triggers eviction.
+    // Fill segment 3 so that the next insert must evict. (Without this,
+    // the trigger would fit in the still-empty tail and no eviction would
+    // occur.)
+    insert(b"thr_a");
+    insert(b"thr_b");
+    insert(b"thr_c");
 
-    // Trigger eviction: insert something that requires a free segment.
-    let _ = cache.insert(
-        b"trigger",
-        b"There is nothing either good or bad, but thinking makes it so.",
-        None,
-        ttl,
-    );
+    // Trigger eviction: the next insert needs a free segment.
+    insert(b"trigX");
 
-    // Correct FIFO: oldest segment (seg1, "old_*" items) is evicted.
-    assert!(
-        cache.get(b"old_a").is_none(),
-        "FIFO must evict the oldest segment: old_a should be gone"
-    );
-    assert!(
-        cache.get(b"old_b").is_none(),
-        "FIFO must evict the oldest segment: old_b should be gone"
-    );
-    assert!(
-        cache.get(b"old_c").is_none(),
-        "FIFO must evict the oldest segment: old_c should be gone"
-    );
+    // Correct FIFO: the oldest segment (seg1, "old_*") is evicted.
+    for key in [b"old_a", b"old_b", b"old_c"] {
+        assert!(
+            cache.get(key).is_none(),
+            "FIFO must evict the oldest segment: {} should be gone",
+            String::from_utf8_lossy(key)
+        );
+    }
 
-    // The newer segment (seg2, "new_*" items) must still be present.
-    assert!(
-        cache.get(b"new_d").is_some(),
-        "FIFO must not evict the newer segment: new_d should be present"
-    );
-    assert!(
-        cache.get(b"new_e").is_some(),
-        "FIFO must not evict the newer segment: new_e should be present"
-    );
+    // The newer segment (seg2, "new_*") must still be present.
+    for key in [b"new_d", b"new_e", b"new_f"] {
+        assert!(
+            cache.get(key).is_some(),
+            "FIFO must not evict the newer segment: {} should be present",
+            String::from_utf8_lossy(key)
+        );
+    }
 }
 
 // Regression: insert() into a FULL Merge pool must complete (not livelock).

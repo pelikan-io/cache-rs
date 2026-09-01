@@ -56,10 +56,18 @@ D=4 cuckoo hashing with four independent ahash builders (deterministic seeds). E
 - `magic`: Enables 0xDECAFBAD corruption-detection bytes in item headers
 - `debug`: Enables `magic` + exposes `items()` count and `check_integrity()`
 - `metrics` (default): Exports counters/gauges via `metriken` crate with `metadata = { engine = "segcache" | "cuckoo" }`
+- `fault-injection` (segcache, test-only): Exposes `segcache::fault`, which forces `Segment::copy_into`'s relink CAS to lose so its otherwise-unreachable `RelinkFailure` abort path can be tested. Deliberately not default and **not** implied by `debug` — `debug` is observational, this changes behaviour. Never enable it outside tests.
 
 **Error types**: `thiserror`-derived enums (`SegcacheError`, `CuckooCacheError`).
 
 **Time**: Uses `clocksource::coarse::{Duration, Instant}` throughout, not `std::time`.
+
+⚠️ **Two clocks, one type name.** `crate::Instant` is `clocksource::coarse::Instant` — **1-second resolution**. `std::time::Instant` is nanosecond-resolution. The name gives no hint which you have, and picking the wrong one fails *silently* rather than loudly.
+
+- **Deadlines and item lifetimes → coarse.** `create_at`, `ttl`, `remaining_ttl`, `expiry_info`, `AtomicInstant`, TTL-bucket cutoffs, and the once-per-tick debounces. This is what the coarse clock is *for*: cheap, and item-lifetime arithmetic depends on its whole-second grid. Do not "improve" these to `std::time`.
+- **Measuring how long an operation took → `std::time::Instant`.** A sub-second duration measured on the coarse clock truncates *both* endpoints to a second boundary, so `elapsed()` returns either `0` or exactly `1_000_000_000` ns — a random value, not a small one. That is worse than a dead counter: it looks like a plausible latency. This is exactly how `clear_time`/`expire_time`/`evict_time` were broken (#75), and #73 is the same trap in the TTL direction.
+
+At a measurement site, import the nanosecond clock under an explicit alias (`use std::time::Instant as StdInstant;`) so the distinction is visible in the code rather than depending on which `Instant` happens to be in scope.
 
 ## CI
 

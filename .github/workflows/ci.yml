@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, hardening]
   pull_request:
-    branches: [main]
+    branches: [main, hardening]
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,8 +42,192 @@ jobs:
       - name: Test with debug feature
         run: cargo test -p segcache --features debug
 
+      # keyvalue's two shapes carry distinct behavior: default (6-byte
+      # header, no CRC — the numeric seqlock is unconditional, not a
+      # feature) and integrity (CRC/magic — the shape the CRC-coherence
+      # concurrency tests exercise). The workspace run above covers only
+      # the default shape.
+      - name: Test keyvalue (integrity)
+        run: cargo test -p keyvalue --features integrity
+
+      # `tests/copy_into_relink_failure.rs` covers `Segment::copy_into`'s
+      # `RelinkFailure` abort path, which no workload can reach (the relink CAS
+      # can only lose to an unpinned unlink landing in a few tens of
+      # nanoseconds). It drives the abort with the `fault-injection` knob and
+      # needs `debug` for `items()`. Neither feature is default, so without
+      # this step that file compiles to an empty binary and the path goes
+      # untested. Scoped to the one binary: the rest of the suite is already
+      # covered by the steps above, and this still compiles the lib under the
+      # new feature combination, so the gating is validated either way.
+      - name: Test copy_into abort accounting (fault injection)
+        run: cargo test -p segcache --features fault-injection,debug --test copy_into_relink_failure
+
+      # `src/revalidation_tests.rs` covers `get_pinned`'s post-pin revalidation
+      # retry (#65). The race needs a writer republishing the key inside a
+      # reader's lookup -> revalidate window, which no test can schedule, so it
+      # drives that window from the `fault-injection` hooks instead. Same
+      # gating story as the step above: without this the module compiles to
+      # nothing. Scoped by name — the rest of the lib suite already ran.
+      - name: Test revalidation retry (fault injection)
+        run: cargo test -p segcache --features fault-injection --lib revalidation_tests
+
       - name: Test with loom
         run: cargo test -p segcache --features loom -- loom
+
+      # Shuttle is the complement of loom: randomized schedules under
+      # sequential consistency, which lets the models assert the
+      # SC-total-order (Dekker) invariants loom structurally cannot — a
+      # pinned reader/writer/remover never coexists with a committed drain,
+      # and the condemned-segment handoff neither leaks nor double-frees.
+      # Loom stays the only check on ordering STRENGTH (shuttle treats every
+      # ordering as SeqCst). The name filter matters: model-backend sync
+      # primitives panic outside their runner.
+      - name: Test with shuttle
+        run: cargo test -p segcache --features shuttle -- shuttle_
+
+  # Kani bounded model checking over the sequential bit-packing substrate
+  # the concurrency protocols rest on: location packing (roundtrip,
+  # injectivity, GHOST unreachability — the #79 silent-wrap class),
+  # segment-state metadata packing, CAS token construction and the
+  # mix_version injectivity claim, TTL bucket index bounds (what
+  # get_bucket's get_unchecked rests on), and keyvalue's item size/pad
+  # arithmetic. These are exhaustive symbolic proofs over the full input
+  # domains — the unit tests keep their hand-picked cases as living
+  # documentation; the proofs make them total. Kani explores no thread
+  # interleavings: loom/shuttle/TSan cover that axis.
+  # Hand-rolled install rather than model-checking/kani-github-action:
+  # the action pins an old Kani and compiles kani-verifier from source on
+  # every run; installing a pinned current version behind a cache keyed on
+  # that version makes warm runs cheap and upgrades deliberate.
+  kani:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      KANI_VERSION: "0.67.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: ${{ runner.os }}-kani-${{ env.KANI_VERSION }}
+
+      # The guard is FUNCTIONAL, not just presence: `cargo kani setup`
+      # installs a pinned nightly under ~/.rustup and symlinks
+      # ~/.kani/kani-<ver>/toolchain to it. The cache restores ~/.kani but
+      # not ~/.rustup, so on a warm run the symlink dangles while
+      # `cargo kani --version` still works — checking the toolchain's
+      # rustc through the symlink is what makes warm runs re-heal.
+      - name: Install Kani
+        run: |
+          if ! command -v cargo-kani >/dev/null \
+             || [ "$(cargo kani --version | awk '{print $2}')" != "$KANI_VERSION" ]; then
+            cargo install --version "$KANI_VERSION" --locked kani-verifier
+          fi
+          if ! [ -x "$HOME/.kani/kani-$KANI_VERSION/toolchain/bin/rustc" ]; then
+            cargo kani setup
+          fi
+
+      # Both header layouts: default (6-byte header — what segcache ships)
+      # and integrity (12-byte). The proofs are layout-generic; running
+      # both keeps each shipping layout's arithmetic actually proven.
+      - name: Verify keyvalue harnesses (default layout)
+        run: cargo kani -p keyvalue
+
+      - name: Verify keyvalue harnesses (integrity layout)
+        run: cargo kani -p keyvalue --features integrity
+
+      - name: Verify segcache harnesses
+        run: cargo kani -p segcache
+
+  # ThreadSanitizer over the concurrent test suite. TSan models atomics
+  # correctly (no reports from the freq counters, seqlock, or pin
+  # protocols — all expressed through atomics) and flags exactly the
+  # non-atomic racing accesses; the issue #61 spike found it surfaces in
+  # one ordinary 16s run what the stress tests need thousands of runs to
+  # hit once. One suppression is loaded (tsan-suppressions.txt): the
+  # accepted unpinned-verify byte race, tracked for removal in issue #91.
+  # halt_on_error makes any OTHER report fail the job.
+  #
+  # Skips: full_cache_long* are single-threaded throughput soaks with zero
+  # concurrency value under a race detector (they dominate the runtime
+  # ~20x); cas_incr_stress_exact_accounting assumes eviction-pressure
+  # timing that TSan's slowdown distorts (it runs in the normal matrix
+  # above). --tests skips doctests, whose rustdoc invocations don't get
+  # the sanitizer ABI flags under -Zbuild-std.
+  tsan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-Zsanitizer=thread"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tsan-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-tsan-
+
+      - name: Test under ThreadSanitizer
+        env:
+          TSAN_OPTIONS: "halt_on_error=1 suppressions=${{ github.workspace }}/tsan-suppressions.txt"
+        run: >
+          cargo +nightly test -p segcache -Zbuild-std
+          --target x86_64-unknown-linux-gnu --features debug --tests --
+          --skip full_cache_long --skip cas_incr_stress_exact_accounting
+
+  # Differential fuzz smoke: 60s of libFuzzer over the public API with a
+  # HashMap model oracle (fuzz_targets/segcache.rs) — asserts hits match
+  # the model (value + type + no resurrection after delete), numeric ops
+  # agree exactly, and check_integrity()/item-count bounds at end of
+  # input. A smoke run is a regression tripwire, not a search campaign;
+  # longer local runs use the same target.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_FUZZ_VERSION: "0.13.2"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: ${{ runner.os }}-cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}
+
+      # Deliberately NOT --locked: the pinned lockfile drags in crates
+      # old enough to no longer compile on current nightly
+      # (proc-macro-error's reserved-attribute breakage took down the
+      # first run of this job); a fresh resolution stays buildable, and
+      # the version itself is still pinned via the cache key above.
+      - name: Install cargo-fuzz
+        run: >
+          command -v cargo-fuzz >/dev/null ||
+          cargo install "cargo-fuzz@$CARGO_FUZZ_VERSION"
+
+      # -max_len matters: at libFuzzer's 4096-byte default, a maximal
+      # input cannot fill the fuzz cache's heap and eviction never runs
+      # (found in review — the "forces eviction" claim was false).
+      - name: Fuzz smoke (60s, model oracle)
+        working-directory: crates/segcache/fuzz
+        run: >
+          cargo +nightly fuzz run segcache --
+          -max_total_time=60 -max_len=65536 -rss_limit_mb=4096
 
   lint:
     runs-on: ubuntu-latest
@@ -66,6 +250,13 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Default features too: --all-features turns loom ON, which compiles
+      # every #[cfg(all(test, not(model_checking)))] module OUT — the
+      # whole std-thread test tier was invisible to the line above (the
+      # CI gap flagged in the July hardening notes).
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Format
         run: cargo fmt --all --check

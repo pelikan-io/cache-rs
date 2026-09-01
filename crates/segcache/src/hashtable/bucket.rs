@@ -18,7 +18,11 @@ pub struct Hashbucket {
     pub(crate) items: [AtomicU64; 8],
 }
 
+// Model-checking atomics may be wider than std atomics, so the layout
+// asserts only apply to production builds (mirrors `SegmentHeader`'s).
+#[cfg(not(model_checking))]
 const _: () = assert!(std::mem::size_of::<Hashbucket>() == 64);
+#[cfg(not(model_checking))]
 const _: () = assert!(std::mem::align_of::<Hashbucket>() == 64);
 
 impl Hashbucket {
@@ -99,12 +103,12 @@ impl Hashbucket {
         let should_increment = if freq <= 16 {
             true
         } else {
-            #[cfg(not(feature = "loom"))]
+            #[cfg(not(model_checking))]
             let rand = {
                 use rand::RngExt;
                 rand::rng().random::<u64>()
             };
-            #[cfg(feature = "loom")]
+            #[cfg(model_checking)]
             let rand = 0u64;
 
             rand.is_multiple_of(freq as u64)

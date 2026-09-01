@@ -6,18 +6,22 @@ mod guard;
 mod header;
 mod remover_pin;
 mod segment;
+#[cfg(feature = "fault-injection")]
+pub use segment::fault as segment_fault;
 #[allow(clippy::module_inception)]
 mod segments;
 pub(crate) mod state;
 mod writer_pin;
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(model_checking)))]
+mod dead_accounting_tests;
+#[cfg(all(test, not(model_checking)))]
 mod eviction_concurrency_tests;
 
 pub(crate) use builder::SegmentsBuilder;
 pub(crate) use error::SegmentsError;
 pub(crate) use guard::SegmentGuard;
-pub(crate) use header::{SegmentHeader, SegmentPool};
+pub(crate) use header::{AcquireOutcome, SegmentHeader, SegmentPool};
 pub(crate) use remover_pin::RemoverPin;
 pub(crate) use segment::Segment;
 pub(crate) use segments::{AllocOutcome, ClearOutcome, Segments};
