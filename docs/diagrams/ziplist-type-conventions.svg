@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 320" role="img" aria-label="Four rows showing the same entry glyphs arranged per type: list positional, hash field-value pairs sorted by field, set sorted members, sorted set member-score pairs sorted by score then member." style="max-width:100%;height:auto"><rect x="0" y="0" width="900" height="320" fill="#FCFCFA"/>
+    <style>text{font-family:system-ui,sans-serif}</style>
+    <defs><marker id="a2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#22303C"/></marker></defs>
+    <!-- row template: label at x=14, entries from x=150 -->
+    <!-- LIST -->
+    <text x="14" y="48" font-size="14" font-weight="600" fill="#22303C">List</text>
+    <g font-size="13" font-family="ui-monospace,monospace">
+      <rect x="150" y="28" width="70" height="30" fill="#CCEBC5" stroke="#22303C" stroke-opacity="0.35"/><text x="185" y="48" text-anchor="middle" fill="#22303C">a</text>
+      <rect x="224" y="28" width="70" height="30" fill="#CCEBC5" stroke="#22303C" stroke-opacity="0.35"/><text x="259" y="48" text-anchor="middle" fill="#22303C">b</text>
+      <rect x="298" y="28" width="70" height="30" fill="#CCEBC5" stroke="#22303C" stroke-opacity="0.35"/><text x="333" y="48" text-anchor="middle" fill="#22303C">c</text>
+      <rect x="372" y="28" width="70" height="30" fill="#CCEBC5" stroke="#22303C" stroke-opacity="0.35"/><text x="407" y="48" text-anchor="middle" fill="#22303C">d</text>
+    </g>
+    <path d="M 140 43 H 118" stroke="#22303C" stroke-width="1.2" fill="none" marker-end="url(#a2)"/>
+    <path d="M 452 43 H 474" stroke="#22303C" stroke-width="1.2" fill="none" marker-end="url(#a2)"/>
+    <text x="500" y="47" font-size="12" fill="#22303C">positional · O(1) at both ends via tail_off; middle costs a memmove</text>
+    <!-- HASH -->
+    <text x="14" y="118" font-size="14" font-weight="600" fill="#22303C">Hash</text>
+    <g font-size="13" font-family="ui-monospace,monospace">
+      <rect x="150" y="98" width="70" height="30" fill="#FBB4AE" stroke="#22303C" stroke-opacity="0.35"/><text x="185" y="118" text-anchor="middle" fill="#22303C">5</text>
+      <rect x="224" y="98" width="70" height="30" fill="#CCEBC5" stroke="#22303C" stroke-opacity="0.35"/><text x="259" y="118" text-anchor="middle" fill="#22303C">"9"</text>
+      <rect x="312" y="98" width="70" height="30" fill="#FBB4AE" stroke="#22303C" stroke-opacity="0.35"/><text x="347" y="118" text-anchor="middle" fill="#22303C">"z"</text>
+      <rect x="386" y="98" width="70" height="30" fill="#CCEBC5" stroke="#22303C" stroke-opacity="0.35"/><text x="421" y="118" text-anchor="middle" fill="#22303C">"ab"</text>
+    </g>
+    <path d="M 152 136 v 5 h 140 v -5" stroke="#22303C" fill="none" stroke-width="1"/>
+    <path d="M 314 136 v 5 h 140 v -5" stroke="#22303C" fill="none" stroke-width="1"/>
+    <text x="500" y="117" font-size="12" fill="#22303C">(field, value) adjacent pairs · sorted by field · fields classified as ints first</text>
+    <!-- SET -->
+    <text x="14" y="192" font-size="14" font-weight="600" fill="#22303C">Set</text>
+    <g font-size="13" font-family="ui-monospace,monospace">
+      <rect x="150" y="172" width="70" height="30" fill="#CCEBC5" stroke="#22303C" stroke-opacity="0.35"/><text x="185" y="192" text-anchor="middle" fill="#22303C">2</text>
+      <rect x="224" y="172" width="70" height="30" fill="#CCEBC5" stroke="#22303C" stroke-opacity="0.35"/><text x="259" y="192" text-anchor="middle" fill="#22303C">10</text>
+      <rect x="298" y="172" width="70" height="30" fill="#CCEBC5" stroke="#22303C" stroke-opacity="0.35"/><text x="333" y="192" text-anchor="middle" fill="#22303C">"a"</text>
+    </g>
+    <text x="500" y="191" font-size="12" fill="#22303C">sorted members · duplicate SADD lands on its own position and is refused</text>
+    <!-- ZSET -->
+    <text x="14" y="266" font-size="14" font-weight="600" fill="#22303C">Zset</text>
+    <g font-size="13" font-family="ui-monospace,monospace">
+      <rect x="150" y="246" width="70" height="30" fill="#CCEBC5" stroke="#22303C" stroke-opacity="0.35"/><text x="185" y="266" text-anchor="middle" fill="#22303C">"c"</text>
+      <rect x="224" y="246" width="70" height="30" fill="#F6E3B4" stroke="#22303C" stroke-opacity="0.35"/><text x="259" y="266" text-anchor="middle" fill="#22303C">10</text>
+      <rect x="312" y="246" width="70" height="30" fill="#CCEBC5" stroke="#22303C" stroke-opacity="0.35"/><text x="347" y="266" text-anchor="middle" fill="#22303C">"a"</text>
+      <rect x="386" y="246" width="70" height="30" fill="#F6E3B4" stroke="#22303C" stroke-opacity="0.35"/><text x="421" y="266" text-anchor="middle" fill="#22303C">20</text>
+    </g>
+    <path d="M 152 284 v 5 h 140 v -5" stroke="#22303C" fill="none" stroke-width="1"/>
+    <path d="M 314 284 v 5 h 140 v -5" stroke="#22303C" fill="none" stroke-width="1"/>
+    <text x="500" y="265" font-size="12" fill="#22303C">(member, score) pairs · sorted by (score, member) · scores are u64 integers</text>
+  </svg>

@@ -9,6 +9,7 @@ Rust implementations of cache storage engines from [Pelikan](https://github.com/
 | [**segcache**](docs/segcache.md) | Segment-structured cache engine with pluggable eviction policies |
 | [**cuckoo-cache**](docs/cuckoo.md) | Array-based cuckoo hash cache with fixed-size item slots |
 | [**keyvalue**](docs/keyvalue.md) | Shared packed item types (`Value`, `RawItem`, `TinyItem`) |
+| [**ziplist**](docs/ziplist.md) | Compact byte-format collections codec (lists, hashes, sets, sorted sets) |
 | [**datatier**](docs/datatier.md) | Byte storage pool abstraction (anonymous mmap, file-backed mmap, hybrid) |
 
 See [design](docs/design.md) for architecture details and eviction policy comparison.
