@@ -21,7 +21,7 @@ use crate::segments::SegmentHeader;
 /// is the same contract `RawItem` already has with the segment data.
 pub(crate) struct SegmentGuard {
     header: *const SegmentHeader,
-    free_queue: *const crossbeam_deque::Injector<u32>,
+    free_queue: *const crate::sync::SegmentQueue,
 }
 
 impl SegmentGuard {
@@ -37,7 +37,7 @@ impl SegmentGuard {
     ///   outlive the guard.
     pub(crate) unsafe fn new(
         header: *const SegmentHeader,
-        free_queue: *const crossbeam_deque::Injector<u32>,
+        free_queue: *const crate::sync::SegmentQueue,
     ) -> Self {
         Self { header, free_queue }
     }

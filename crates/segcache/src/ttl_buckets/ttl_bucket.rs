@@ -66,7 +66,7 @@ pub struct TtlBucket {
     /// policy Mutex) — code may take `evict` while holding this, never the
     /// reverse.
     // LOCK: bucket-chain
-    chain_lock: Box<std::sync::Mutex<()>>,
+    chain_lock: Box<crate::sync::Mutex<()>>,
     _pad: [u8; 36],
 }
 
@@ -84,7 +84,7 @@ impl TtlBucket {
             ttl,
             nseg: AtomicU32::new(0),
             next_to_merge: AtomicU32::new(0),
-            chain_lock: Box::new(std::sync::Mutex::new(())),
+            chain_lock: Box::new(crate::sync::Mutex::new(())),
             _pad: [0; 36],
         }
     }
@@ -92,7 +92,7 @@ impl TtlBucket {
     /// Acquire this bucket's chain-structure lock. See the field docs and the
     /// lock inventory in the design spec (`docs/superpowers/specs/...`). Held
     /// only around brief per-bucket chain pointer surgery.
-    pub(crate) fn chain_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+    pub(crate) fn chain_lock(&self) -> crate::sync::MutexGuard<'_, ()> {
         self.chain_lock.lock().unwrap()
     }
 

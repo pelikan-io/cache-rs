@@ -17,6 +17,8 @@ mod writer_pin;
 mod dead_accounting_tests;
 #[cfg(all(test, not(model_checking)))]
 mod eviction_concurrency_tests;
+#[cfg(all(test, feature = "shuttle", not(feature = "loom")))]
+mod shuttle_eviction_tests;
 
 pub(crate) use builder::SegmentsBuilder;
 pub(crate) use error::SegmentsError;

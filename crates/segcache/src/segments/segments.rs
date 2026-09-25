@@ -37,11 +37,11 @@ pub(crate) struct Segments {
     /// Lock-free free segment queue. Boxed for a stable address: guards
     /// hold a raw pointer to it so the AwaitingRelease handoff can return
     /// segments without `&mut Segments`.
-    free_queue: Box<crossbeam_deque::Injector<u32>>,
+    free_queue: Box<crate::sync::SegmentQueue>,
     /// Held-back spare segments for merge compaction. Never handed out by
     /// `reserve_free` (normal writes), so a destination is always available
     /// to merge even when the main free queue is empty.
-    spare_queue: Box<crossbeam_deque::Injector<u32>>,
+    spare_queue: Box<crate::sync::SegmentQueue>,
     /// Target number of segments to keep in the spare queue.
     spare_capacity: u32,
     /// Current spare-queue depth. `return_segment` replenishes it with a
@@ -67,7 +67,7 @@ pub(crate) struct Segments {
     /// may take `evict` while holding a bucket's `chain_lock`, never the
     /// reverse (no site acquires a `chain_lock` while holding `evict`).
     // LOCK: eviction-policy
-    evict: std::sync::Mutex<Eviction>,
+    evict: crate::sync::Mutex<Eviction>,
     /// Max segments in the admission pool (S3-FIFO only, 0 for other policies).
     admission_cap: u32,
     /// Current number of segments in the admission pool.
@@ -159,8 +159,8 @@ impl Segments {
         // Initialize each segment and fill the free/spare queues. Segments
         // rest in the Free state with no chain links; both queues are
         // lock-free Injectors rather than intrusive lists.
-        let free_queue = Box::new(crossbeam_deque::Injector::new());
-        let spare_queue = Box::new(crossbeam_deque::Injector::new());
+        let free_queue = Box::new(crate::sync::SegmentQueue::new());
+        let spare_queue = Box::new(crate::sync::SegmentQueue::new());
         for idx in 0..segments {
             let begin = segment_size as usize * idx;
             let end = begin + segment_size as usize;
@@ -198,7 +198,11 @@ impl Segments {
             spare_count: crate::sync::AtomicU32::new(spare_capacity),
             data,
             policy: evict_policy,
-            evict: std::sync::Mutex::new(Eviction::new(segments, evict_policy, builder.evict_seed)),
+            evict: crate::sync::Mutex::new(Eviction::new(
+                segments,
+                evict_policy,
+                builder.evict_seed,
+            )),
             admission_cap,
             admission_count: crate::sync::AtomicU32::new(0),
         })
