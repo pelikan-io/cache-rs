@@ -338,3 +338,155 @@ fn shuttle_concurrent_s3fifo_evictions() {
     );
     COVERAGE.require("s3fifo");
 }
+
+/// An expiry drain racing a merge on the neighbouring segments of one chain.
+///
+/// The models above never put two mutators on adjacent links: two merges on
+/// one bucket start from the same cursor and the loser backs off at the
+/// claim, and nothing expires during their concurrent phase. So the
+/// per-bucket `chain_lock` went untested -- a merge with it removed passed
+/// 5000 schedules. Here one chain holds two segments from T0 followed by six
+/// from T0 + 30, and the merge cursor sits on the first of the six: the
+/// drain of the old pair rewrites the links the merge splices its spare
+/// into.
+///
+/// `evict` runs its own expiry pass first, under the same lock, so the two
+/// only overlap if time moves mid-phase: the evictor's pass finds nothing,
+/// it starts merging, and only then does the clock pass the old pair's
+/// deadline for the expirer. One thread moves the clock; the override is
+/// shared, since shuttle runs every thread on the test's OS thread.
+///
+/// Run under PCT, not uniform random scheduling. The race window is a
+/// single step of the merge -- between reading s0's predecessor and linking
+/// the spare to it -- and the drain must run its whole unlink of that
+/// predecessor inside it. A uniform scheduler picks a thread at every step,
+/// so a stretch that long never happens: with the merge's chain lock removed
+/// it passed 1000 schedules in which both a drain and a merge ran. PCT
+/// switches priorities at only a few points, so one thread can run far
+/// while another sits mid-operation, and the same mutation fails in about a
+/// second -- as an asymmetric link after the merge spliced its spare next to
+/// a segment the drain had unlinked, or as the drain walking into the half-
+/// linked spare.
+fn run_drain_vs_merge(coverage: &Coverage, drained: &AtomicUsize) {
+    let shape = Shape {
+        items_per_segment: 8,
+        segments: 12,
+    };
+    let total = shape.segments as u32;
+    let clock = VirtualClock::at(T0);
+    let cache = Arc::new(shape.build(Policy::Merge {
+        max: 8,
+        merge: 4,
+        compact: 0,
+    }));
+
+    // Two segments at T0 (ids 2, 3: the spare seeded at construction is 1),
+    // then six at T0 + 30 (ids 4..=9).
+    let old: Vec<String> = (0..16).map(|i| key('o', i)).collect();
+    for k in &old {
+        cache.insert(k.as_bytes(), VALUE, None, TTL).expect("fill");
+    }
+    clock.set(T0 + 30);
+    let young: Vec<String> = (0..48).map(|i| key('y', i)).collect();
+    for k in &young {
+        cache.insert(k.as_bytes(), VALUE, None, TTL).expect("fill");
+    }
+    for s in 31..=33 {
+        clock.set(T0 + s);
+        for k in &young[..24] {
+            let _ = cache.get(k.as_bytes());
+        }
+    }
+    let bucket = cache
+        .ttl_buckets
+        .get_bucket(clocksource::coarse::Duration::from_secs(
+            TTL.as_secs() as u32
+        ));
+    let first_young = NonZeroU32::new(4).unwrap();
+    assert_eq!(
+        bucket.head(),
+        NonZeroU32::new(2),
+        "the old pair must head the chain"
+    );
+    bucket.set_next_to_merge(Some(first_young));
+    let before: Vec<Option<u32>> = young[..24].iter().map(|k| segment_of(&cache, k)).collect();
+
+    // T0 + 50: nothing has expired (the old pair's deadline is T0 + 56).
+    clock.set(T0 + 50);
+    let mut handles = Vec::new();
+    handles.push(shuttle::thread::spawn(|| clock::set_virtual_now(T0 + 57)));
+    {
+        let cache = Arc::clone(&cache);
+        handles.push(shuttle::thread::spawn(move || {
+            for _ in 0..2 {
+                cache.expire();
+            }
+        }));
+    }
+    {
+        let cache = Arc::clone(&cache);
+        handles.push(shuttle::thread::spawn(move || {
+            for _ in 0..2 {
+                let _ = cache.segments.evict(&cache.ttl_buckets, &cache.hashtable);
+            }
+        }));
+    }
+    {
+        let cache = Arc::clone(&cache);
+        handles.push(shuttle::thread::spawn(move || {
+            for i in 0..8 {
+                let _ = cache.insert(key('w', i).as_bytes(), VALUE, None, TTL);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("a model thread panicked");
+    }
+
+    // Both halves of the race have to have happened for the schedule to
+    // count: the old pair drained, and a merge copied a young item.
+    let old_gone = [2u32, 3]
+        .iter()
+        .all(|&id| cache.segments.header(NonZeroU32::new(id).unwrap()).state() != State::Sealed);
+    let merged = young[..24].iter().zip(&before).any(
+        |(k, was)| matches!((segment_of(&cache, k), was), (Some(now), Some(was)) if now != *was),
+    );
+    coverage.schedules.fetch_add(1, StdOrdering::Relaxed);
+    if merged {
+        coverage.copied.fetch_add(1, StdOrdering::Relaxed);
+    }
+    if old_gone && merged {
+        drained.fetch_add(1, StdOrdering::Relaxed);
+    }
+
+    let chained = assert_chains_well_formed(&cache, total);
+    assert_no_leak(&cache, &chained, total);
+
+    clock.set(T0 + 60);
+    for k in &old {
+        assert!(
+            cache.get(k.as_bytes()).is_none(),
+            "{k}, written at T0 with a 60s TTL, was served at T0 + 60"
+        );
+    }
+}
+
+#[test]
+fn shuttle_expiry_drain_races_a_merge() {
+    static COVERAGE: Coverage = Coverage::new();
+    static BOTH: AtomicUsize = AtomicUsize::new(0);
+    shuttle::check_pct(
+        || run_drain_vs_merge(&COVERAGE, &BOTH),
+        shuttle_iters(200),
+        3,
+    );
+    COVERAGE.require("drain vs merge");
+    let (both, n) = (
+        BOTH.load(StdOrdering::Relaxed),
+        COVERAGE.schedules.load(StdOrdering::Relaxed),
+    );
+    assert!(
+        both * 2 >= n,
+        "the old pair drained and a merge ran in only {both} of {n} schedules"
+    );
+}
