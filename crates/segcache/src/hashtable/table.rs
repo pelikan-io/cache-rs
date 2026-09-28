@@ -7,6 +7,7 @@
 //! - Storage-agnostic location handling via KeyVerifier
 //! - SIMD-accelerated bucket scanning on supported platforms
 
+use super::RelinkFreq;
 use crate::hashtable::bucket::Hashbucket;
 use crate::hashtable::location::Location;
 use crate::hashtable::traits::{Hashtable, Hit, Insert, KeyVerifier, Lookup, Verified};
@@ -964,7 +965,7 @@ impl MultiChoiceHashtable {
         tag: u16,
         old_location: Location,
         new_location: Location,
-        preserve_freq: bool,
+        relink: RelinkFreq,
     ) -> bool {
         let bucket = self.bucket(bucket_index);
 
@@ -980,10 +981,9 @@ impl MultiChoiceHashtable {
                     break; // not our entry (any more) — next slot
                 }
 
-                let freq = if preserve_freq {
-                    Hashbucket::freq(packed)
-                } else {
-                    1
+                let freq = match relink {
+                    RelinkFreq::Preserve => Hashbucket::freq(packed),
+                    RelinkFreq::Decrement => Hashbucket::freq(packed).saturating_sub(1),
                 };
                 let new_packed = Hashbucket::pack(tag, freq, new_location);
 
@@ -1355,13 +1355,12 @@ impl Hashtable for MultiChoiceHashtable {
         key: &[u8],
         old_location: Location,
         new_location: Location,
-        preserve_freq: bool,
+        freq: RelinkFreq,
     ) -> bool {
         let (tag, buckets) = self.probe(key);
 
         for &bucket_index in &buckets[..self.num_choices as usize] {
-            if self.try_cas_in_bucket(bucket_index, tag, old_location, new_location, preserve_freq)
-            {
+            if self.try_cas_in_bucket(bucket_index, tag, old_location, new_location, freq) {
                 return true;
             }
         }
@@ -1616,10 +1615,10 @@ mod tests {
         ht.insert(b"test", loc1, &verifier).unwrap();
 
         // CAS with wrong old location should fail
-        assert!(!ht.cas_location(b"test", Location::new(999), loc2, true));
+        assert!(!ht.cas_location(b"test", Location::new(999), loc2, RelinkFreq::Preserve));
 
         // CAS with correct old location should succeed
-        assert!(ht.cas_location(b"test", loc1, loc2, true));
+        assert!(ht.cas_location(b"test", loc1, loc2, RelinkFreq::Preserve));
 
         let hit = ht.lookup(b"test", &verifier).found().unwrap();
         assert_eq!(hit.location, loc2);
@@ -2009,8 +2008,12 @@ mod stale_location_tests {
                 // Mid-verify: the drain relocates the entry and recycles
                 // the source segment under us.
                 assert!(
-                    self.ht
-                        .cas_location(KEY, Location::new(OLD), Location::new(NEW), true),
+                    self.ht.cas_location(
+                        KEY,
+                        Location::new(OLD),
+                        Location::new(NEW),
+                        RelinkFreq::Preserve
+                    ),
                     "test setup: the relocation CAS must land"
                 );
                 self.live.store(NEW, Ordering::Release);
@@ -2502,13 +2505,13 @@ mod loom_tests {
             let ht1 = ht.clone();
             let t1 = thread::spawn(move || {
                 let loc2 = Location::new(2);
-                ht1.cas_location(b"key", loc1, loc2, true)
+                ht1.cas_location(b"key", loc1, loc2, RelinkFreq::Preserve)
             });
 
             let ht2 = ht.clone();
             let t2 = thread::spawn(move || {
                 let loc3 = Location::new(3);
-                ht2.cas_location(b"key", loc1, loc3, true)
+                ht2.cas_location(b"key", loc1, loc3, RelinkFreq::Preserve)
             });
 
             let r1 = t1.join().unwrap();
@@ -2572,17 +2575,17 @@ mod loom_tests {
 
             let t1 = thread::spawn(move || {
                 let loc_new = Location::new(10);
-                ht1.cas_location(b"key", loc_initial, loc_new, true)
+                ht1.cas_location(b"key", loc_initial, loc_new, RelinkFreq::Preserve)
             });
 
             let t2 = thread::spawn(move || {
                 let loc_new = Location::new(20);
-                ht2.cas_location(b"key", loc_initial, loc_new, true)
+                ht2.cas_location(b"key", loc_initial, loc_new, RelinkFreq::Preserve)
             });
 
             let t3 = thread::spawn(move || {
                 let loc_new = Location::new(30);
-                ht3.cas_location(b"key", loc_initial, loc_new, true)
+                ht3.cas_location(b"key", loc_initial, loc_new, RelinkFreq::Preserve)
             });
 
             let r1 = t1.join().unwrap();
@@ -2705,7 +2708,7 @@ mod loom_tests {
                 thread::spawn(move || {
                     // copy_into order: write bytes FIRST, then publish.
                     payload.store(SENTINEL, Ordering::Relaxed);
-                    ht.cas_location(b"key", old_loc, new_loc, true);
+                    ht.cas_location(b"key", old_loc, new_loc, RelinkFreq::Preserve);
                 })
             };
 
@@ -3438,7 +3441,7 @@ mod loom_tests {
                  ABSENT, or a merge relocates the next incarnation's item"
             );
             assert!(
-                !ht.cas_location(KEY, stale, KeyOracle::location(DST), true),
+                !ht.cas_location(KEY, stale, KeyOracle::location(DST), RelinkFreq::Preserve),
                 "a relink CAS against a stale location must lose"
             );
             assert!(
@@ -3610,7 +3613,7 @@ mod loom_tests {
                             b"key",
                             Location::new(CHAIN[i]),
                             Location::new(CHAIN[i + 1]),
-                            true
+                            RelinkFreq::Preserve
                         ),
                         "relink CAS must land: nothing else touches this entry"
                     );

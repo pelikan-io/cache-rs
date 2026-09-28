@@ -14,6 +14,7 @@ use memmap2::MmapOptions;
 // Deliberately aliased: `Instant` in this crate is the *coarse* (1-second)
 // clock, which is correct for segment expiry deadlines but cannot measure
 // the sub-millisecond duration of an eviction. Duration measurement uses this.
+use crate::hashtable::RelinkFreq;
 #[cfg(feature = "metrics")]
 use std::time::Instant as StdInstant;
 
@@ -1122,7 +1123,7 @@ impl Segments {
         dst_id: NonZeroU32,
         hashtable: &MultiChoiceHashtable,
     ) {
-        self.s3fifo_promote_from(src_id, dst_id, hashtable);
+        self.s3fifo_promote_from(src_id, dst_id, hashtable, RelinkFreq::Preserve);
     }
 
     /// Test-only shim exposing the private `finalize_drained` (sweep the
@@ -2091,7 +2092,7 @@ impl Segments {
             self.inherit_created(tid, seg_id);
             self.link_dest_before(tid, seg_id, ttl_bucket);
 
-            self.s3fifo_promote_from(seg_id, tid, hashtable);
+            self.s3fifo_promote_from(seg_id, tid, hashtable, RelinkFreq::Preserve);
 
             // Publish the filled target: Relinking -> Sealed, making it a legal
             // future eviction candidate (C1).
@@ -2129,6 +2130,7 @@ impl Segments {
         src_id: NonZeroU32,
         dst_id: NonZeroU32,
         hashtable: &MultiChoiceHashtable,
+        relink: RelinkFreq,
     ) {
         let seg_size = self.segment_size() as usize;
         let (src, dst) = match self.segment_pair(src_id, dst_id) {
@@ -2204,7 +2206,7 @@ impl Segments {
                     if let Some(guard) = &vguard {
                         guard.stamp_relocated_copy(&RawItem::from_ptr(d));
                     }
-                    let relinked = hashtable.cas_location(item.key(), old_loc, new_loc, true);
+                    let relinked = hashtable.cas_location(item.key(), old_loc, new_loc, relink);
                     // Unlock only AFTER the publish resolved (or failed), so
                     // a spinning numeric writer's in-lock re-validation sees
                     // the outcome.
@@ -2340,8 +2342,10 @@ impl Segments {
             self.inherit_created(tid, seg_id);
             self.link_dest_before(tid, seg_id, ttl_bucket);
 
-            // Copy freq > 0 items (same promote logic, but no ghost).
-            self.s3fifo_promote_from(seg_id, tid, hashtable);
+            // Copy freq > 0 items forward (no ghost), each spending a
+            // frequency step: FIFO-with-reinsertion, so an item that is not
+            // read again falls to zero and is dropped on a later pass.
+            self.s3fifo_promote_from(seg_id, tid, hashtable, RelinkFreq::Decrement);
 
             // Publish the filled target: Relinking -> Sealed (C1).
             self.publish_dest_sealed(tid);

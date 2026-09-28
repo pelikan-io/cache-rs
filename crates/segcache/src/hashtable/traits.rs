@@ -139,6 +139,19 @@ pub(crate) enum Insert {
     Unknown(Location),
 }
 
+/// What a relocation does to the entry's frequency.
+///
+/// Moving an item is not an access, so a relocation normally carries its
+/// frequency over. S3-FIFO's main-queue second chance is the exception: the
+/// item keeps its place by spending a step of it, so one that is not read
+/// again falls to zero and is dropped on a later pass. Carrying the
+/// frequency over there made a second chance permanent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelinkFreq {
+    Preserve,
+    Decrement,
+}
+
 /// Core trait for hashtable operations.
 ///
 /// A hashtable maps keys to `Location` values, tracking the physical
@@ -203,7 +216,7 @@ pub(crate) trait Hashtable: Send + Sync {
         key: &[u8],
         old_location: Location,
         new_location: Location,
-        preserve_freq: bool,
+        freq: RelinkFreq,
     ) -> bool;
 
     /// Get the frequency of an item by key.

@@ -30,6 +30,7 @@
 //!    `Exists`, its ordinary lost-the-race answer). None of them is an error
 //!    path.
 
+use crate::hashtable::RelinkFreq;
 use crate::*;
 use core::num::NonZeroU32;
 use std::time::Duration;
@@ -524,9 +525,12 @@ fn stale_location_is_rejected_by_every_consumer() {
     );
 
     assert!(
-        cache
-            .hashtable
-            .cas_location(key_of(fresh_key).as_bytes(), fresh, stale_fresh, true),
+        cache.hashtable.cas_location(
+            key_of(fresh_key).as_bytes(),
+            fresh,
+            stale_fresh,
+            RelinkFreq::Preserve
+        ),
         "planting the stale entry must succeed"
     );
     assert!(
@@ -614,9 +618,12 @@ fn stale_location_is_rejected_by_every_consumer() {
     // Restore the real entry; the key is readable again, proving the miss above
     // was the tag talking and nothing else.
     assert!(
-        cache
-            .hashtable
-            .cas_location(key_of(fresh_key).as_bytes(), stale_fresh, fresh, true),
+        cache.hashtable.cas_location(
+            key_of(fresh_key).as_bytes(),
+            stale_fresh,
+            fresh,
+            RelinkFreq::Preserve
+        ),
         "restoring the live entry must succeed"
     );
     assert!(

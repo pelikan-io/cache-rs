@@ -4,6 +4,7 @@
 //! metadata access to the atomic fields in [`SegmentHeader`].
 
 use super::{SegmentHeader, SegmentPool, SegmentsError};
+use crate::hashtable::RelinkFreq;
 use crate::*;
 use core::num::NonZeroU32;
 
@@ -457,9 +458,10 @@ impl<'a> Segment<'a> {
             }
             #[cfg(feature = "fault-injection")]
             let relinked = !fault::take_forced_relink_failure()
-                && hashtable.cas_location(item.key(), old_loc, new_loc, true);
+                && hashtable.cas_location(item.key(), old_loc, new_loc, RelinkFreq::Preserve);
             #[cfg(not(feature = "fault-injection"))]
-            let relinked = hashtable.cas_location(item.key(), old_loc, new_loc, true);
+            let relinked =
+                hashtable.cas_location(item.key(), old_loc, new_loc, RelinkFreq::Preserve);
 
             if relinked {
                 // Unlock only AFTER the publish resolved: a numeric writer

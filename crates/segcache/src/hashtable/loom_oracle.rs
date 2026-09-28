@@ -64,7 +64,7 @@
 use crate::hashtable::location::Location;
 use crate::hashtable::pack_location;
 use crate::hashtable::table::MultiChoiceHashtable;
-use crate::hashtable::traits::{Hashtable, KeyVerifier, Verified};
+use crate::hashtable::traits::{Hashtable, KeyVerifier, RelinkFreq, Verified};
 use crate::sync::{AtomicU64, Ordering};
 use core::num::NonZeroU32;
 
@@ -250,7 +250,12 @@ impl KeyOracle {
     /// touches the entry should assert `true`.
     pub(crate) fn drain_relocate(&self, ht: &MultiChoiceHashtable, src: usize, dst: usize) -> bool {
         self.place(dst, KEY);
-        let relinked = ht.cas_location(KEY, Self::location(src), Self::location(dst), true);
+        let relinked = ht.cas_location(
+            KEY,
+            Self::location(src),
+            Self::location(dst),
+            RelinkFreq::Preserve,
+        );
         self.recycle(src);
         self.place(src, OTHER);
         relinked

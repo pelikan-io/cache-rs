@@ -20,7 +20,7 @@ pub(crate) mod loom_oracle;
 
 pub use location::Location;
 pub(crate) use table::{MultiChoiceHashtable, SlotRef};
-pub(crate) use traits::{Hashtable, Hit, Insert, KeyVerifier, Lookup, Verified};
+pub(crate) use traits::{Hashtable, Hit, Insert, KeyVerifier, Lookup, RelinkFreq, Verified};
 
 use crate::segments::SegmentGuard;
 use core::num::NonZeroU32;
