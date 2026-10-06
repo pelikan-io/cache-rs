@@ -1,0 +1,23 @@
+[package]
+name = "ziplist"
+version = "0.1.0"
+description = "Compact byte-format collections codec for cache storage"
+
+edition = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+
+# `#[cfg(kani)]` (src/lib.rs, src/kani.rs) is set by the Kani compiler
+# itself, not by any feature or build script here; declare it so a normal
+# `cargo build`/`clippy` doesn't warn about an "unexpected cfg".
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[[bench]]
+name = "codec"
+path = "benches/codec.rs"
+harness = false
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = "1"

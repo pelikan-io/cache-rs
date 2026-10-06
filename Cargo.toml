@@ -6,6 +6,7 @@ members = [
     "crates/keyvalue",
     "crates/segcache",
     "benchmarks/segbench",
+    "crates/data-structure/ziplist",
 ]
 
 [workspace.package]
