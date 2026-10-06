@@ -570,7 +570,10 @@ impl Segments {
     /// consulted for a segment that is *currently readable* — `AwaitingRelease`
     /// is not readable (#63), so a condemned segment is refused by
     /// `try_acquire_reader` above and never reaches the comparison at all.
-    pub(crate) fn acquire_item_at(&self, location: Location) -> Option<(RawItem, SegmentGuard)> {
+    pub(crate) fn acquire_item_at(
+        &self,
+        location: Location,
+    ) -> Option<(RawItem, SegmentGuard<'_>)> {
         let (seg_id, offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id)?;
         assert!(seg_id.get() <= self.cap);
@@ -611,8 +614,9 @@ impl Segments {
         }
         // SAFETY: the acquire above succeeded, and both `headers` (a
         // boxed slice owned by `self`) and the boxed `FreeQueue` are owned
-        // by `self` and never moved; the guard must be dropped before
-        // `Segments`.
+        // by `self` and never moved. The guard borrows `self`
+        // (`SegmentGuard<'_>`), so borrowck rejects dropping or moving
+        // `Segments` while the guard is alive.
         let guard = unsafe { SegmentGuard::new(header, &*self.free_queue) };
 
         // Incarnation check UNDER the guard (see above). Returning here drops

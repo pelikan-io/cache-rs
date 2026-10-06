@@ -12,14 +12,43 @@ pub(crate) use reserved::ReservedItem;
 /// An `Item` pins the segment it points into: while it is alive, that
 /// segment cannot be recycled, merged, or compacted, so the key and
 /// value bytes it exposes remain stable.
-pub struct Item {
+///
+/// An `Item` borrows the [`Segcache`](crate::Segcache) it came from, so the
+/// cache cannot be dropped or moved while the item is alive. Using the item
+/// after the cache is dropped is rejected:
+///
+/// ```compile_fail,E0505
+/// use segcache::Segcache;
+/// use std::time::Duration;
+///
+/// let cache = Segcache::builder().build().unwrap();
+/// cache.insert(b"key", b"value", None, Duration::from_secs(60)).unwrap();
+/// let item = cache.get(b"key").unwrap();
+/// drop(cache);
+/// let _ = item.value();
+/// ```
+///
+/// So is dropping the item after the cache:
+///
+/// ```compile_fail,E0505
+/// use segcache::Segcache;
+/// use std::time::Duration;
+///
+/// let cache = Segcache::builder().build().unwrap();
+/// cache.insert(b"key", b"value", None, Duration::from_secs(60)).unwrap();
+/// let _item = cache.get(b"key").unwrap();
+/// drop(cache);
+/// ```
+pub struct Item<'a> {
     cas: u64,
     raw: RawItem,
-    _guard: SegmentGuard,
+    _guard: SegmentGuard<'a>,
 }
 
-impl Item {
-    pub(crate) fn new(raw: RawItem, cas: u64, guard: SegmentGuard) -> Self {
+impl<'a> Item<'a> {
+    /// `raw` must be the item `acquire_item_at` returned together with
+    /// `guard`.
+    pub(crate) fn new(raw: RawItem, cas: u64, guard: SegmentGuard<'a>) -> Self {
         Item {
             cas,
             raw,
@@ -61,7 +90,7 @@ impl Item {
     }
 }
 
-impl std::fmt::Debug for Item {
+impl std::fmt::Debug for Item<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.debug_struct("Item")
             .field("cas", &self.cas())

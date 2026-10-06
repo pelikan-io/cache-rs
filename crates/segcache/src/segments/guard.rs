@@ -16,15 +16,17 @@ use crate::segments::SegmentHeader;
 /// three claimants: a racing last-guard drop, the condemner's recheck, and
 /// the backout of an acquire that failed after its increment.
 ///
-/// Holds raw pointers rather than borrows so that the guard (and the
-/// [`crate::Item`] carrying it) is not lifetime-tied to the cache; this
-/// is the same contract `RawItem` already has with the segment data.
-pub(crate) struct SegmentGuard {
+/// Holds raw pointers and a `PhantomData<&'a Segments>`, so the guard, and
+/// an [`crate::Item`] carrying it, borrows `Segments` for `'a` and cannot
+/// outlive it. `RawItem` has no lifetime; it is valid only while the guard
+/// for its segment is alive, which `Item` ensures by holding both.
+pub(crate) struct SegmentGuard<'a> {
     header: *const SegmentHeader,
     free_queue: *const crate::segments::FreeQueue,
+    _segments: core::marker::PhantomData<&'a crate::segments::Segments>,
 }
 
-impl SegmentGuard {
+impl<'a> SegmentGuard<'a> {
     /// Create a guard for a successfully acquired reader pin.
     ///
     /// # Safety
@@ -39,11 +41,15 @@ impl SegmentGuard {
         header: *const SegmentHeader,
         free_queue: *const crate::segments::FreeQueue,
     ) -> Self {
-        Self { header, free_queue }
+        Self {
+            header,
+            free_queue,
+            _segments: core::marker::PhantomData,
+        }
     }
 }
 
-impl Drop for SegmentGuard {
+impl Drop for SegmentGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: per the constructor contract, the header and the free
         // queue outlive the guard, and the guard owns one pin.

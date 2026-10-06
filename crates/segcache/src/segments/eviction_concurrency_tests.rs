@@ -1,11 +1,9 @@
 //! Reader-vs-eviction tests for drain-safe merge (roadmap item 5b).
 //!
 //! This test is single-threaded by construction. `acquire_item_at(&self) ->
-//! Option<(RawItem, SegmentGuard)>` returns a guard holding raw pointers
-//! (segment header + free queue), NOT a borrow of `Segments`. Once it returns,
-//! the immutable borrow ends, so `evict(&mut self)` can run while the `RawItem`
-//! and `SegmentGuard` stay alive — the pin-across-eviction composition item 7
-//! will enable under real concurrency. No threads, no `RwLock`.
+//! Option<(RawItem, SegmentGuard<'_>)>` returns a guard that borrows
+//! `Segments`. `evict` takes `&self`, so it can run while the `RawItem` and
+//! `SegmentGuard` stay alive. No threads, no `RwLock`.
 //!
 //! SCOPE — what a single-threaded test can and cannot prove here. The
 //! copy-to-spare rework's headline safety property ("a merge never moves a
@@ -190,9 +188,8 @@ fn merge_halts_at_pinned_candidate_and_relocates_survivors() {
     }
 
     // ── Run one merge pass. It drains seg2/3/4 via copy-to-spare and STOPS at
-    //    the pinned seg5. raw_item_x / guard_x hold raw pointers, not a borrow
-    //    of cache.segments, so this call compiles while the pin is live (item
-    //    7c: evict() and its ttl_buckets argument are both &self now, too).
+    //    the pinned seg5. This call compiles while the pin is live because
+    //    `evict` and its `ttl_buckets` argument take `&self`.
     cache
         .segments
         .evict(&cache.ttl_buckets, &cache.hashtable)
@@ -248,8 +245,7 @@ fn merge_halts_at_pinned_candidate_and_relocates_survivors() {
 
     // ── (5) The drained candidates' survivors were published into the spare
     //    (copy-then-relink) and are reachable with their correct distinct
-    //    values. get() takes &mut self; guard_x/raw_item_x hold raw pointers,
-    //    not a borrow of cache, so this is fine while the pin is live.
+    //    values. `get` takes `&self`, so it can run while the pin is live.
     for &i in &survivor_idx {
         let item = cache
             .get(key_of(i).as_bytes())
@@ -1566,7 +1562,8 @@ fn concurrent_reader_vs_eviction_pin_safety() {
 
     // The hot key, if it still resolves post-storm, must carry a legal
     // value.
-    if let Some(item) = cache.get(b"hot") {
+    let hot = cache.get(b"hot");
+    if let Some(item) = hot {
         assert!(
             is_legal_hot_value(item.value()),
             "post-storm illegal hot value: {:?}",

@@ -8,8 +8,8 @@ use crate::segments::SegmentHeader;
 /// or reclaims — so the remove's decrement never races the drain's accounting
 /// and the segment is never recycled under a pending decrement (item 7f).
 ///
-/// Holds a raw pointer rather than a borrow (same contract as `WriterPin`/
-/// `SegmentGuard`) so it is not lifetime-tied to the cache.
+/// Holds a raw pointer rather than a borrow (same contract as `WriterPin`)
+/// so it is not lifetime-tied to the cache.
 #[derive(Debug)]
 pub(crate) struct RemoverPin {
     header: *const SegmentHeader,

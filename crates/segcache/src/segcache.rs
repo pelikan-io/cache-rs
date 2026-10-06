@@ -253,6 +253,9 @@ impl Segcache {
     /// pressure reclaims its segment. Items stored with `Duration::ZERO`
     /// never expire.
     ///
+    /// The returned `Item` borrows the cache and pins its segment until it
+    /// is dropped; see [`Item`].
+    ///
     /// ```
     /// use segcache::{Policy, Segcache};
     /// use std::time::Duration;
@@ -264,7 +267,7 @@ impl Segcache {
     /// let item = cache.get(b"coffee").expect("didn't get item back");
     /// assert_eq!(item.value(), b"strong");
     /// ```
-    pub fn get(&self, key: &[u8]) -> Option<Item> {
+    pub fn get(&self, key: &[u8]) -> Option<Item<'_>> {
         self.get_pinned(key, true)
     }
 
@@ -304,7 +307,7 @@ impl Segcache {
     // get benchmark until the call boundary was forced away. It also lets
     // the constant `update_freq` fold at each call site.
     #[inline(always)]
-    fn get_pinned(&self, key: &[u8], update_freq: bool) -> Option<Item> {
+    fn get_pinned(&self, key: &[u8], update_freq: bool) -> Option<Item<'_>> {
         let probe = self.probe_verifier();
         let verifier = self.verifier();
         let backoff = Backoff::new();
@@ -378,12 +381,12 @@ impl Segcache {
 
     /// Resolve `key` from scratch, honouring `update_freq`.
     #[inline(always)]
-    fn lookup_hit(
-        &self,
+    fn lookup_hit<'s>(
+        &'s self,
         key: &[u8],
-        verifier: &SegmentsVerifier<'_>,
+        verifier: &SegmentsVerifier<'s>,
         update_freq: bool,
-    ) -> Lookup<Hit<(RawItem, SegmentGuard)>> {
+    ) -> Lookup<Hit<(RawItem, SegmentGuard<'s>)>> {
         if update_freq {
             self.hashtable.lookup(key, verifier)
         } else {
@@ -398,7 +401,11 @@ impl Segcache {
     /// its segment deadline is treated as missing, matching memcached, even
     /// before the segment is reclaimed.
     #[inline]
-    fn item_from_pin(&self, location: Location, pin: (RawItem, SegmentGuard)) -> Option<Item> {
+    fn item_from_pin<'s>(
+        &'s self,
+        location: Location,
+        pin: (RawItem, SegmentGuard<'s>),
+    ) -> Option<Item<'s>> {
         let (raw, guard) = pin;
         let (seg_id, _offset) = unpack_location(location);
         let seg_id = NonZeroU32::new(seg_id)?;
@@ -569,13 +576,17 @@ impl Segcache {
     /// Get the item in the `Segcache` with the provided key without
     /// increasing the item frequency - useful for combined operations that
     /// check for presence - eg replace is a get + set
+    ///
+    /// The returned `Item` borrows the cache and pins its segment until it
+    /// is dropped; see [`Item`].
+    ///
     /// ```
     /// use segcache::{Policy, Segcache};
     ///
     /// let cache = Segcache::builder().build().expect("failed to create cache");
     /// assert!(cache.get_no_freq_incr(b"coffee").is_none());
     /// ```
-    pub fn get_no_freq_incr(&self, key: &[u8]) -> Option<Item> {
+    pub fn get_no_freq_incr(&self, key: &[u8]) -> Option<Item<'_>> {
         self.get_pinned(key, false)
     }
 

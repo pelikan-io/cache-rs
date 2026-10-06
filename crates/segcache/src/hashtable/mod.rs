@@ -160,11 +160,11 @@ impl<'a> SegmentsVerifier<'a> {
     }
 }
 
-impl KeyVerifier for SegmentsVerifier<'_> {
+impl<'a> KeyVerifier for SegmentsVerifier<'a> {
     /// The pinned item and the guard keeping its segment alive. `get` keeps
     /// both — the guard is what an [`crate::Item`] is built around; every other
     /// caller drops them the moment the compare is answered.
-    type Pin = (RawItem, SegmentGuard);
+    type Pin = (RawItem, SegmentGuard<'a>);
 
     fn verify(&self, key: &[u8], location: Location, _allow_deleted: bool) -> Verified<Self::Pin> {
         // Range-check ahead of the pin. `acquire_item_at` opens with

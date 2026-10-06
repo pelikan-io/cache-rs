@@ -11,9 +11,8 @@ use crate::segments::SegmentHeader;
 /// from under a not-yet-published write (spec H1/H2).
 ///
 /// Holds a raw pointer rather than a borrow so that the guard (and the
-/// `ReservedItem` carrying it) is not lifetime-tied to the cache — the same
-/// contract `SegmentGuard` and `RawItem` already have with the segment
-/// allocation.
+/// `ReservedItem` carrying it) is not lifetime-tied to the cache, the same
+/// contract `RawItem` has with the segment allocation.
 #[derive(Debug)]
 pub(crate) struct WriterPin {
     header: *const SegmentHeader,
